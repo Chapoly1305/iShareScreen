@@ -1,0 +1,476 @@
+"""Live-session screen. Renders reactive panels bound to the snapshot
+stream coming off the child's ControlServer, plus a tail of the child's
+stderr log. Footer keybindings drive force-IDR / reconnect / quit; the
+parent App owns the supervisor + control client (those are not screen
+state).
+
+Layout (full-screen):
+
+    ┌─ header ─────────────────────────────────────────────────────────┐
+    │ state · host · canvas · decoder · uptime                         │
+    ├─ tiles ──────────────────┬─ rates ──────────────────────────────┤
+    │ tile fps loss state      │ video / ctrl bandwidth bars          │
+    ├──────────────────────────┴─ health / queue / cursor ────────────┤
+    │ udp queue · drops · last publish · cursor age                    │
+    ├─ log ──────────────────────────────────────────────────────────────┤
+    │ stderr tail (level-coloured)                                     │
+    └──────────────────────── q quit · r reconnect · f force-IDR ──────┘
+"""
+from __future__ import annotations
+
+import re
+import time
+from dataclasses import dataclass
+from typing import Any, Optional
+
+from textual.app import ComposeResult
+from textual.binding import Binding
+from textual.containers import Container, Horizontal, Vertical
+from textual.message import Message
+from textual.reactive import reactive
+from textual.screen import Screen
+from textual.widgets import (
+    DataTable, Footer, Header, Label, RichLog, Static,
+)
+
+
+def _fmt_uptime(seconds: float) -> str:
+    if seconds < 0:
+        return "—"
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m{sec:02d}s"
+    if m:
+        return f"{m}m{sec:02d}s"
+    return f"{sec}s"
+
+
+def _fmt_bytes_rate(mbps: float, kbps: float | None = None) -> str:
+    """Pick the friendlier unit between Mbps and kbps for display."""
+    if mbps >= 1:
+        return f"{mbps:.1f} Mbps"
+    if kbps is not None and kbps >= 1:
+        return f"{kbps:.1f} kbps"
+    return f"{mbps * 1000:.0f} kbps"
+
+
+def _classify_loglevel(line: str) -> tuple[str, str]:
+    """Return (level, css-style) for one stderr line. The proxy logger
+    formats lines as `YYYY-MM-DD HH:MM:SS.mmm LEVEL  name | message`,
+    so we look for the LEVEL token."""
+    m = re.search(r"\b(DEBUG|INFO|WARNING|ERROR|CRITICAL|FATAL)\b", line[:60])
+    lvl = m.group(1) if m else "INFO"
+    style = {
+        "DEBUG":    "dim",
+        "INFO":     "white",
+        "WARNING":  "yellow",
+        "ERROR":    "bold red",
+        "CRITICAL": "bold red",
+        "FATAL":    "bold red",
+    }.get(lvl, "white")
+    return lvl, style
+
+
+# ── widgets ──────────────────────────────────────────────────────────
+
+
+class HeaderBar(Static):
+    """Top status line: connection state · host · canvas · decoder · uptime
+    · warnings counter (when > 0)."""
+
+    state: reactive[str] = reactive("CONNECTING")
+    host: reactive[str] = reactive("")
+    canvas: reactive[str] = reactive("")
+    decoder: reactive[str] = reactive("")
+    uptime: reactive[float] = reactive(-1.0)
+    warnings: reactive[int] = reactive(0)
+    errors: reactive[int] = reactive(0)
+
+    def render(self) -> str:
+        badge = {
+            "CONNECTING":   "[on yellow] CONNECTING [/]",
+            "LIVE":         "[on green] LIVE [/]",
+            "RECONNECTING": "[on yellow] RECONNECTING [/]",
+            "DISCONNECTED": "[on red] DISCONNECTED [/]",
+        }.get(self.state, f"[on grey] {self.state} [/]")
+        bits = [badge]
+        if self.host:
+            bits.append(f"host: [b]{self.host}[/]")
+        if self.canvas:
+            bits.append(f"canvas: [b]{self.canvas}[/]")
+        if self.decoder:
+            bits.append(f"decoder: [b]{self.decoder}[/]")
+        if self.uptime >= 0:
+            bits.append(f"up [b]{_fmt_uptime(self.uptime)}[/]")
+        if self.errors > 0:
+            bits.append(f"[on red] {self.errors} err [/]")
+        elif self.warnings > 0:
+            bits.append(f"[on yellow] {self.warnings} warn [/]")
+        return "  ·  ".join(bits)
+
+
+class TilesPanel(Container):
+    """Per-tile fps / loss / state table."""
+
+    def compose(self) -> ComposeResult:
+        yield Label("[b]Tiles[/]")
+        yield DataTable(id="tiles-table", zebra_stripes=False, cursor_type="none")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#tiles-table", DataTable)
+        t.add_columns("tile", "fps", "loss/s", "frames")
+
+    def apply(self, tiles: list[dict[str, Any]]) -> None:
+        t = self.query_one("#tiles-table", DataTable)
+        t.clear()
+        for i, tile in enumerate(tiles):
+            fps = tile.get("fps", 0.0)
+            loss = tile.get("loss_s", 0)
+            frames = tile.get("frames", 0)
+            fps_style = (
+                "green"  if fps >= 45 else
+                "yellow" if fps >= 20 else
+                "red"
+            )
+            loss_style = "red" if loss > 0 else "dim"
+            t.add_row(
+                f"t{i}",
+                f"[{fps_style}]{fps:.1f}[/]",
+                f"[{loss_style}]{loss}[/]",
+                str(frames),
+            )
+
+
+class RatesPanel(Container):
+    """Bandwidth + packets-per-second summary."""
+
+    def compose(self) -> ComposeResult:
+        yield Label("[b]Throughput[/]")
+        yield Static("", id="rates-text")
+
+    def apply(self, rx: dict[str, Any], tx: dict[str, Any]) -> None:
+        video_mbps = rx.get("video_mbps", 0.0)
+        ctrl_kbps = rx.get("ctrl_kbps", 0.0)
+        video_pps = rx.get("video_pps", 0.0)
+        tx_pps = tx.get("pps", 0.0)
+        lines = [
+            f"video  rx  [b]{video_pps:6.0f}[/] pps  [b]{video_mbps:5.1f}[/] Mbps",
+            f"ctrl   rx  [b]{rx.get('ctrl_pps', 0.0):6.0f}[/] pps  [b]{ctrl_kbps:5.1f}[/] kbps",
+            f"        tx  [b]{tx_pps:6.2f}[/] pps",
+        ]
+        self.query_one("#rates-text", Static).update("\n".join(lines))
+
+
+class HealthPanel(Container):
+    """UDP queue depth, drops, cursor age, last-publish age."""
+
+    def compose(self) -> ComposeResult:
+        yield Label("[b]Health[/]")
+        yield Static("", id="health-text")
+
+    def apply(
+        self,
+        udp_q: dict[str, Any],
+        cursor: dict[str, Any],
+        last_publish_age_s: float,
+        loss_total: int,
+        loss_unmapped: int,
+    ) -> None:
+        v = udp_q.get("video", {}); c = udp_q.get("ctrl", {})
+        v_drop = v.get("drop", 0); c_drop = c.get("drop", 0)
+        cur_age = cursor.get("age_ms", -1)
+        cur_age_s = "—" if cur_age < 0 else (
+            f"{cur_age/1000:.1f}s" if cur_age < 60000 else f"{cur_age//60000}m"
+        )
+        drop_style = "red" if (v_drop + c_drop) > 0 else "green"
+        loss_style = "red" if loss_total > 0 else "green"
+        lines = [
+            f"udp_q     video [b]{v.get('depth', 0):>4}/{v.get('cap', 0)}[/]  ctrl [b]{c.get('depth', 0):>4}/{c.get('cap', 0)}[/]",
+            f"drops     video [{drop_style}]{v_drop}[/]  ctrl [{drop_style}]{c_drop}[/]",
+            f"loss      total [{loss_style}]{loss_total}[/]  unmapped [{loss_style}]{loss_unmapped}[/]",
+            f"cursor    [b]{cur_age_s}[/] ago  (count {cursor.get('count', 0)})",
+            f"publish   {last_publish_age_s:.1f}s ago",
+        ]
+        self.query_one("#health-text", Static).update("\n".join(lines))
+
+
+_LEVEL_ORDER = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
+_LEVEL_LABEL = {"DEBUG": "DEBUG", "INFO": "INFO", "WARNING": "WARN", "ERROR": "ERROR"}
+
+
+class _AutoPauseRichLog(RichLog):
+    """`RichLog` with an explicit pause toggle (not an auto-detector).
+
+    Earlier versions tried to detect user scroll-up via mouse / key
+    handlers on the widget and auto-pause when scroll_y dropped below
+    max. Both approaches interfered with the terminal's own selection
+    behaviour (Textual receives any mouse event the widget claims, so
+    Shift+drag stops working) — so this widget intentionally adds NO
+    event handlers. Selection works exactly as it does on a stock
+    RichLog: hold Shift and drag.
+
+    The parent `SessionScreen` provides a screen-level key (default
+    `space`) that toggles `auto_scroll` directly. `_pending_while_paused`
+    is bumped by `LogPanel.append` on every write that lands while
+    paused so the title can surface "↓ N new" as a nudge."""
+
+    _pending_while_paused: int = 0
+
+
+class LogPanel(Container):
+    """Tail of the child's stderr, level-coloured + level-filtered.
+
+    The panel only displays lines at-or-above `min_level`, but the
+    parent screen keeps every line in its ring buffer (for bug-snapshot
+    dumps) regardless of this filter. Default = INFO. The underlying
+    RichLog auto-pauses scroll-to-bottom whenever you scroll up so you
+    can read / copy text without the stream yanking the viewport."""
+
+    min_level: reactive[str] = reactive("INFO")
+
+    def compose(self) -> ComposeResult:
+        yield Label("[b]Log[/] [dim](level: INFO — L to cycle)[/]", id="log-title")
+        yield _AutoPauseRichLog(
+            id="log-view", wrap=False, highlight=False, markup=True, max_lines=2000,
+        )
+
+    def append(self, line: str) -> bool:
+        """Render the line if it passes the level filter; return True if
+        it was rendered."""
+        lvl, style = _classify_loglevel(line)
+        if _LEVEL_ORDER.get(lvl, 20) < _LEVEL_ORDER.get(self.min_level, 20):
+            return False
+        from rich.markup import escape
+        view = self.query_one("#log-view", _AutoPauseRichLog)
+        view.write(f"[{style}]{escape(line)}[/]")
+        if not view.auto_scroll:
+            view._pending_while_paused += 1
+            self._refresh_title()
+        return True
+
+    def watch_min_level(self, _old: str, new: str) -> None:
+        self._refresh_title()
+
+    def _refresh_title(self) -> None:
+        try:
+            view = self.query_one("#log-view", _AutoPauseRichLog)
+        except Exception:
+            return
+        lvl = _LEVEL_LABEL.get(self.min_level, self.min_level)
+        pending = view._pending_while_paused
+        if not view.auto_scroll and pending > 0:
+            suffix = f"  [reverse yellow] {pending} new — End to jump [/]"
+        else:
+            suffix = ""
+        # Terminal apps capture the mouse, so in-app drag-select isn't
+        # possible. Most terminals (Windows Terminal, iTerm2, kitty,
+        # gnome-terminal) let you bypass capture with Shift+drag — that
+        # selects text in the terminal layer where the OS copy paths
+        # work. We also surface the P pause key so users with terminals
+        # that *do* let the app capture wheel/drag still have a way to
+        # freeze the stream while they read.
+        paused = not view.auto_scroll
+        state = "[reverse yellow] PAUSED [/]  " if paused else ""
+        self.query_one("#log-title", Label).update(
+            f"[b]Log[/] {state}[dim](level: {lvl} — L to cycle, "
+            f"P to pause, End to jump, Shift+drag to select)[/]{suffix}"
+        )
+
+    def jump_to_bottom(self) -> None:
+        """Scroll the underlying RichLog to the bottom and re-arm auto-
+        scroll. Bound to End in the parent SessionScreen."""
+        view = self.query_one("#log-view", _AutoPauseRichLog)
+        view.scroll_end(animate=False)
+        view.auto_scroll = True
+        view._pending_while_paused = 0
+        self._refresh_title()
+
+
+# ── screen ───────────────────────────────────────────────────────────
+
+
+class SessionScreen(Screen):
+    """The live-session view. Receives snapshots, events, and log lines
+    via methods the parent App calls."""
+
+    CSS = """
+    SessionScreen { layout: vertical; }
+    HeaderBar { dock: top; height: 1; padding: 0 1; background: $panel; color: $text; }
+    #middle { height: auto; }
+    TilesPanel, RatesPanel { width: 1fr; padding: 0 1; height: auto; }
+    HealthPanel { padding: 0 1; height: auto; border-top: solid $primary 30%; }
+    LogPanel { height: 1fr; padding: 0 1; border-top: solid $primary 30%; }
+    Label { padding: 0 0 1 0; }
+    """
+
+    BINDINGS = [
+        Binding("q", "quit", "Quit"),
+        Binding("r", "reconnect", "Reconnect"),
+        Binding("f", "force_idr", "Force IDR"),
+        Binding("d", "disconnect", "Disconnect"),
+        Binding("l", "cycle_log_level", "Log level"),
+        Binding("p", "toggle_log_pause", "Pause log"),
+        Binding("end", "log_bottom", "Log → bottom"),
+        Binding("ctrl+b", "bug_snapshot", "Bug snapshot"),
+    ]
+
+    # Cycle order for the `l` keybinding. Lands on INFO by default; one
+    # press → DEBUG (everything), another → WARNING (only problems),
+    # another → back to INFO.
+    _LOG_LEVEL_CYCLE = ("INFO", "DEBUG", "WARNING")
+
+    class Disconnect(Message):
+        """User asked to drop the current session."""
+
+    class Reconnect(Message):
+        """User asked to drop + restart with the same form values."""
+
+    class ForceIdr(Message):
+        """User asked for an immediate IDR refresh."""
+
+    class BugSnapshot(Message):
+        """User asked to dump the current state for a bug report. The
+        message carries the latest snapshot and a tail of recent log
+        lines; the App writes them to disk and surfaces the path."""
+
+        def __init__(
+            self,
+            latest_snapshot: Optional[dict],
+            log_tail: list[str],
+        ) -> None:
+            self.latest_snapshot = latest_snapshot
+            self.log_tail = log_tail
+            super().__init__()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._connect_started_at = time.monotonic()
+        self._latest_snapshot: Optional[dict[str, Any]] = None
+        # Ring buffer of recent log lines for the bug-snapshot dump.
+        # 1000 lines covers the most useful post-mortem window without
+        # bloating the snapshot file.
+        self._log_ring: list[str] = []
+        self._LOG_RING_MAX: int = 1000
+
+    def compose(self) -> ComposeResult:
+        yield HeaderBar(id="hdr")
+        with Horizontal(id="middle"):
+            yield TilesPanel(id="tiles")
+            yield RatesPanel(id="rates")
+        yield HealthPanel(id="health")
+        yield LogPanel(id="log")
+        yield Footer()
+
+    # ── App-facing API ────────────────────────────────────────────
+
+    def apply_hello(self, session: dict[str, Any]) -> None:
+        hdr = self.query_one("#hdr", HeaderBar)
+        hdr.host = session.get("host") or session.get("dest_host", "")
+        canvas = session.get("canvas") or {}
+        if canvas:
+            hdr.canvas = f"{canvas.get('w', '?')}x{canvas.get('h', '?')} ({canvas.get('tiles', '?')} tiles)"
+        hdr.decoder = session.get("decoder", "")
+        hdr.state = "LIVE"
+
+    def apply_snapshot(self, data: dict[str, Any]) -> None:
+        self._latest_snapshot = data
+        hdr = self.query_one("#hdr", HeaderBar)
+        hdr.uptime = float(data.get("uptime_s", -1))
+        hdr.decoder = data.get("decoder", hdr.decoder)
+        self.query_one("#tiles", TilesPanel).apply(data.get("tiles", []))
+        self.query_one("#rates", RatesPanel).apply(data.get("rx", {}), data.get("tx", {}))
+        self.query_one("#health", HealthPanel).apply(
+            data.get("udp_q", {}),
+            data.get("cursor", {}),
+            float(data.get("last_publish_age_s", -1)),
+            int(data.get("loss_total", 0)),
+            int(data.get("loss_unmapped", 0)),
+        )
+
+    def apply_event(self, kind: str, fields: dict[str, Any]) -> None:
+        hdr = self.query_one("#hdr", HeaderBar)
+        if kind == "connected":
+            hdr.state = "LIVE"
+        elif kind == "disconnected":
+            hdr.state = "DISCONNECTED"
+        self.append_log(f"event: {kind} {fields if fields else ''}")
+
+    def append_log(self, line: str) -> None:
+        # Always keep in the ring (for bug-snapshot completeness), even
+        # if the panel filter hides it visually.
+        self._log_ring.append(line)
+        if len(self._log_ring) > self._LOG_RING_MAX:
+            self._log_ring = self._log_ring[-self._LOG_RING_MAX:]
+        self.query_one("#log", LogPanel).append(line)
+        # Bump the header chips so a normal user sees that something
+        # warrants attention even if their eyes are on the wgpu window.
+        lvl, _ = _classify_loglevel(line)
+        if lvl in ("ERROR", "CRITICAL", "FATAL"):
+            hdr = self.query_one("#hdr", HeaderBar)
+            hdr.errors = hdr.errors + 1
+        elif lvl == "WARNING":
+            hdr = self.query_one("#hdr", HeaderBar)
+            hdr.warnings = hdr.warnings + 1
+
+    def set_state(self, state: str) -> None:
+        self.query_one("#hdr", HeaderBar).state = state
+
+    # ── bindings ────────────────────────────────────────────────
+
+    def action_quit(self) -> None:
+        self.app.exit()
+
+    def action_disconnect(self) -> None:
+        self.post_message(self.Disconnect())
+
+    def action_reconnect(self) -> None:
+        self.post_message(self.Reconnect())
+
+    def action_force_idr(self) -> None:
+        self.post_message(self.ForceIdr())
+
+    def action_bug_snapshot(self) -> None:
+        self.post_message(self.BugSnapshot(
+            latest_snapshot=self._latest_snapshot,
+            log_tail=list(self._log_ring),
+        ))
+
+    def action_log_bottom(self) -> None:
+        """End → jump the log panel back to the latest line and re-arm
+        auto-scroll. Used after you've paused + read / selected text and
+        want to resume following the live stream."""
+        self.query_one("#log", LogPanel).jump_to_bottom()
+
+    def action_toggle_log_pause(self) -> None:
+        """`P` → pause / resume the log panel's auto-scroll. Pausing
+        lets you scroll, read, and Shift+drag-select without the live
+        stream yanking you back to the bottom. Resume snaps to the end
+        and clears the pending counter."""
+        panel = self.query_one("#log", LogPanel)
+        view = panel.query_one("#log-view", _AutoPauseRichLog)
+        if view.auto_scroll:
+            view.auto_scroll = False
+            panel._refresh_title()
+            self.notify("log paused — P to resume, End to jump to bottom", timeout=2)
+        else:
+            panel.jump_to_bottom()
+            self.notify("log resumed", timeout=2)
+
+    def action_cycle_log_level(self) -> None:
+        """Cycle the log-panel display filter (INFO → DEBUG → WARNING →
+        back to INFO). Doesn't replay history; only future lines are
+        affected. The ring buffer + bug-snapshot stays comprehensive."""
+        panel = self.query_one("#log", LogPanel)
+        cur = panel.min_level
+        cycle = self._LOG_LEVEL_CYCLE
+        try:
+            nxt = cycle[(cycle.index(cur) + 1) % len(cycle)]
+        except ValueError:
+            nxt = cycle[0]
+        panel.min_level = nxt
+        self.notify(f"log level → {_LEVEL_LABEL.get(nxt, nxt)}", timeout=2)
+
+
+__all__ = ["SessionScreen"]
