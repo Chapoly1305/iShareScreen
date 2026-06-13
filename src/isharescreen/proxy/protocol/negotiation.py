@@ -100,6 +100,10 @@ class NegotiationResult:
     sock: socket.socket
     cipher: StreamCipher
     keys: NegotiationKeys
+    # 16-byte post-auth enc1103 master key (sha256(SRP_K)[:16]). This is the
+    # dissector's `--initial-key-hex`; the session persists it next to a
+    # `--record` pcap so captures decode without a wrapper.
+    ecb_key: bytes
     server_width: int
     server_height: int
     canvas_width: int
@@ -201,10 +205,19 @@ def build_0x1c(
 _AuthFunc = Callable[[socket.socket, str, str], bytes]
 
 
-def _open_socket_and_handshake(host: str, port: int) -> socket.socket:
+def _open_socket_and_handshake(
+    host: str, port: int, recorder=None,
+) -> socket.socket:
     """TCP connect + RFB version + security-types preamble. Leaves the socket
-    positioned right before c2s1."""
+    positioned right before c2s1.
+
+    When a `recorder` (util.pcap_recorder.PcapRecorder) is supplied, the
+    socket is wrapped in a capture tap *before* the version handshake so the
+    whole cleartext preamble — which the dissector keys its transport-key
+    derivation off — lands in the pcap."""
     sock = socket.create_connection((host, port), timeout=15)
+    if recorder is not None:
+        sock = recorder.wrap_tcp(sock)
     sock.settimeout(15)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     do_protocol_handshake(sock)
@@ -213,6 +226,7 @@ def _open_socket_and_handshake(host: str, port: int) -> socket.socket:
 
 def _phase_auth(
     host: str, port: int, username: str, password: str, mode: str,
+    recorder=None,
 ) -> tuple[socket.socket, bytes]:
     """Open TCP, run auth (with fallback on AuthError), return live socket
     and the 16-byte enc1103 master key."""
@@ -221,7 +235,7 @@ def _phase_auth(
         else (do_nonsrp_auth, do_srp_auth)
     )
 
-    sock = _open_socket_and_handshake(host, port)
+    sock = _open_socket_and_handshake(host, port, recorder)
     try:
         return sock, primary(sock, username, password)
     except AuthError as e:
@@ -231,7 +245,7 @@ def _phase_auth(
         )
         sock.close()
 
-    sock = _open_socket_and_handshake(host, port)
+    sock = _open_socket_and_handshake(host, port, recorder)
     return sock, fallback(sock, username, password)
 
 
@@ -578,10 +592,15 @@ def connect_and_negotiate(
     video_offer: Optional[bytes] = None,
     share_console: bool = False,
     alt_session: bool = False,
+    recorder=None,
 ) -> NegotiationResult:
     """Drive the full handshake. The returned socket is in encrypted-RFB
     mode; subsequent control-channel sends must wrap with
     `result.cipher.encrypt_message(...)`.
+
+    `recorder` (optional `util.pcap_recorder.PcapRecorder`) taps the TCP
+    control socket from creation so the full session — cleartext handshake
+    plus encrypted record layer — is written to a pcap.
 
     `share_console` and `alt_session` are mutually exclusive
     SessionSelect modes; both kick in when the auth user differs from
@@ -604,7 +623,8 @@ def connect_and_negotiate(
 
     advertise = advertise or AdvertiseDims()
 
-    sock, ecb_key = _phase_auth(host, port, username, password, auth_mode)
+    sock, ecb_key = _phase_auth(host, port, username, password, auth_mode,
+                                recorder)
     server_w, server_h = _phase_client_init(sock)
 
     if share_console or alt_session:
@@ -624,7 +644,8 @@ def connect_and_negotiate(
                 sock.close()
             except Exception:
                 pass
-            sock, ecb_key = _phase_auth(host, port, username, password, auth_mode)
+            sock, ecb_key = _phase_auth(host, port, username, password,
+                                        auth_mode, recorder)
             server_w, server_h = _phase_client_init(sock)
 
         # Read the (re-)issued SessionSelect prompt and send our cmd
@@ -680,6 +701,7 @@ def connect_and_negotiate(
         sock=sock,
         cipher=cipher,
         keys=keys,
+        ecb_key=ecb_key,
         server_width=server_w,
         server_height=server_h,
         canvas_width=canvas_w,
