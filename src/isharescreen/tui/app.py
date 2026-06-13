@@ -72,7 +72,7 @@ class IssTuiApp(App):
         else:
             base = last or ConnectFormValues(
                 host="", user="", password="",
-                advertise="1920x1080",
+                advertise="auto",
                 audio=True, curtain=True, hdr=False,
                 share_console=False, alt_session=False,
             )

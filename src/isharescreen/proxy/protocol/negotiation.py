@@ -461,8 +461,6 @@ def _phase_handshake_plaintext(
             width=advertise.width,
             height=advertise.height,
             hidpi_scale=advertise.hidpi_scale,
-            width_mm=advertise.width_mm,
-            height_mm=advertise.height_mm,
             hdr=hdr,
         ))
     else:
@@ -664,8 +662,6 @@ def connect_and_negotiate(
             width=advertise.width,
             height=advertise.height,
             hidpi_scale=advertise.hidpi_scale,
-            width_mm=advertise.width_mm,
-            height_mm=advertise.height_mm,
             hdr=hdr,
             alt_user_login=True,
         ))

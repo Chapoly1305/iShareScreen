@@ -112,6 +112,15 @@ class InputController:
         with self._lock:
             self._closed = True
 
+    def set_server_dims(self, w: int, h: int) -> None:
+        """Update the pointer clamp bounds after a mid-session resolution
+        change (dynamic resolution). These must track the canvas the
+        frontend maps clicks into (`Session.canvas_dims`); if they go stale
+        the host places the cursor in the wrong place after a resize."""
+        if w > 0 and h > 0:
+            self._w = w
+            self._h = h
+
     # ── public event API ──────────────────────────────────────────────
 
     def pointer_event(self, buttons: int, x: int, y: int) -> None:
@@ -193,7 +202,14 @@ class InputController:
                          payload[0] if payload else 0, len(payload), ctr,
                          payload.hex())
             try:
-                self._sock.sendall(self._cipher.encrypt_message(payload) if self._cipher else payload)
+                # encrypt_and_send holds the cipher lock across both the
+                # record-counter bump and the sendall, so input events
+                # can't interleave on the wire with the session's
+                # dynamic-resolution / post-layout sends on this socket.
+                if self._cipher:
+                    self._cipher.encrypt_and_send(self._sock, payload)
+                else:
+                    self._sock.sendall(payload)
                 self.tx_pkts += 1
             except OSError as e:
                 log.debug("input send dropped: %s", e)

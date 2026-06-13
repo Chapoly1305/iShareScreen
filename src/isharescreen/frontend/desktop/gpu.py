@@ -7,6 +7,16 @@ triangle. That's all.
 Each tile's planes get written into a horizontal slice of the textures
 via `upload_tile`; we don't allocate or compose a CPU-side full-canvas
 buffer. Apple's HEVC RExt 4:4:4 source stays 4:4:4 end-to-end.
+
+Letterboxing: `draw` scales the decoded content (`content_dims`) by a
+single uniform factor to fit the target surface, then centers it, so the
+on-screen aspect always matches the decoded aspect — the image is never
+stretched. Bars appear (centered, symmetric) whenever the window aspect
+differs from the content aspect; the window fills completely when they
+match. This covers both cases: (a) the window resized to an aspect the
+canvas doesn't share, and (b) the host fell back to a real frame smaller
+than the advertised canvas (encoded into the top-left with the rest left
+as unwritten black padding, which `uv_scale` also crops out of sampling).
 """
 from __future__ import annotations
 
@@ -24,6 +34,15 @@ struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
 };
+
+// uv_scale maps the viewport's [0,1] sampling range onto just the
+// decoded-content sub-region of the textures, cropping out any black
+// padding the encoder left when the real frame is smaller than the
+// allocated canvas. (1,1) = sample the whole texture.
+struct Uniforms {
+    uv_scale: vec2<f32>,
+};
+@group(0) @binding(4) var<uniform> U: Uniforms;
 
 @vertex
 fn vs(@builtin(vertex_index) i: u32) -> VsOut {
@@ -52,9 +71,10 @@ fn vs(@builtin(vertex_index) i: u32) -> VsOut {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    let y  = textureSample(y_tex, samp, in.uv).r;
-    let cb = textureSample(u_tex, samp, in.uv).r - 0.5;
-    let cr = textureSample(v_tex, samp, in.uv).r - 0.5;
+    let uv = in.uv * U.uv_scale;
+    let y  = textureSample(y_tex, samp, uv).r;
+    let cb = textureSample(u_tex, samp, uv).r - 0.5;
+    let cr = textureSample(v_tex, samp, uv).r - 0.5;
     let r = y + 1.5748   * cr;
     let g = y - 0.187324 * cb - 0.468124 * cr;
     let b = y + 1.8556   * cb;
@@ -73,6 +93,12 @@ class Renderer:
         self._device = device
         self._w = canvas_w
         self._h = canvas_h
+        # Real decoded-content extent within the canvas textures, grown
+        # as tiles upload. 0 until the first tile lands (content_dims
+        # then falls back to the full canvas). Lets draw() crop the
+        # black texture padding and letterbox the real frame.
+        self._content_w = 0
+        self._content_h = 0
 
         tex_kw = dict(
             format=wgpu.TextureFormat.r8unorm,
@@ -107,6 +133,16 @@ class Renderer:
             mag_filter=wgpu.FilterMode.linear,
             min_filter=wgpu.FilterMode.linear,
         )
+        # 16-byte uniform: vec2 uv_scale (+8 bytes std140 tail padding).
+        # Updated per-draw with the content/canvas ratio.
+        self._uniform_buf = device.create_buffer(
+            size=16,
+            usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+        )
+        device.queue.write_buffer(
+            self._uniform_buf, 0,
+            np.array([1.0, 1.0, 0.0, 0.0], dtype=np.float32).tobytes(),
+        )
         shader = device.create_shader_module(code=WGSL)
         tex_entry = {
             "visibility": wgpu.ShaderStage.FRAGMENT,
@@ -117,6 +153,8 @@ class Renderer:
             {"binding": 1, **tex_entry},
             {"binding": 2, **tex_entry},
             {"binding": 3, "visibility": wgpu.ShaderStage.FRAGMENT, "sampler": {}},
+            {"binding": 4, "visibility": wgpu.ShaderStage.FRAGMENT,
+             "buffer": {"type": wgpu.BufferBindingType.uniform}},
         ])
         self._pipeline = device.create_render_pipeline(
             layout=device.create_pipeline_layout(bind_group_layouts=[bind_layout]),
@@ -134,6 +172,8 @@ class Renderer:
                 {"binding": 1, "resource": self._u_tex.create_view()},
                 {"binding": 2, "resource": self._v_tex.create_view()},
                 {"binding": 3, "resource": sampler},
+                {"binding": 4, "resource": {"buffer": self._uniform_buf,
+                                            "offset": 0, "size": 16}},
             ],
         )
 
@@ -156,6 +196,14 @@ class Renderer:
         if rows <= 0:
             return
         origin = (0, origin_y, 0)
+        # Grow the real decoded-content extent so draw() can crop the
+        # texture's black padding and letterbox what the encoder
+        # actually filled (≤ canvas when the host fell back to a
+        # smaller resolution than we advertised).
+        if w > self._content_w:
+            self._content_w = w
+        if origin_y + rows > self._content_h:
+            self._content_h = origin_y + rows
 
         y = np.frombuffer(tile.y, dtype=np.uint8)
         if tile.y_stride == w:
@@ -199,14 +247,54 @@ class Renderer:
             (cw, chroma_rows, 1),
         )
 
+    def content_dims(self) -> tuple[int, int]:
+        """Real decoded-frame size in canvas-texel units. Equals the full
+        canvas once the encoder fills it; smaller (content pinned to the
+        top-left, black padding around) when the host fell back to a
+        resolution below what we advertised. Falls back to the full canvas
+        before the first tile arrives."""
+        cw = self._content_w or self._w
+        ch = self._content_h or self._h
+        return (min(cw, self._w), min(ch, self._h))
+
     def draw(
         self, target_view: wgpu.GPUTextureView,
-        viewport: tuple[float, float, float, float],
+        target_w: int, target_h: int,
     ) -> None:
-        """Render one frame into `target_view` clipped to `viewport`
-        (`(x, y, w, h)` in surface pixels). The viewport is normally
-        the full surface — the desktop frontend locks the window's
-        aspect ratio to the canvas, so no letterboxing is needed."""
+        """Render one frame into `target_view`, an attachment of size
+        `target_w × target_h` surface pixels.
+
+        The decoded content (`content_dims` — the top-left sub-rect of the
+        textures the encoder actually filled) is scaled *uniformly* to the
+        largest size that fits the target, then centered. Uniform scale
+        preserves the decoded aspect ratio, so the image is never stretched;
+        a window that matches the content aspect fills completely, and any
+        leftover shows as symmetric black bars — letterbox when the window
+        is taller than the content aspect, pillarbox when wider — matching
+        Apple's viewer. `uv_scale` separately crops sampling to the content
+        sub-rect, so black texture padding (host fell back to a frame
+        smaller than the advertised canvas) is never sampled."""
+        cw, ch = self.content_dims()
+        # uv_scale crops texture sampling to the decoded content sub-rect
+        # (top-left of the textures); padding outside content_dims is never
+        # sampled. Per-axis: the real frame can be smaller than the canvas
+        # on either axis independently.
+        ux = cw / self._w if self._w else 1.0
+        uy = ch / self._h if self._h else 1.0
+        self._device.queue.write_buffer(
+            self._uniform_buf, 0,
+            np.array([ux, uy, 0.0, 0.0], dtype=np.float32).tobytes(),
+        )
+        # Aspect-preserving fit: one uniform scale (same factor on both
+        # axes) sized to the largest content rect that fits the target,
+        # then centered. Preserves the decoded aspect — never stretched —
+        # and the leftover falls out as symmetric letter/pillarbox bars.
+        if cw > 0 and ch > 0 and target_w > 0 and target_h > 0:
+            scale = min(target_w / cw, target_h / ch)
+            vw, vh = cw * scale, ch * scale
+        else:
+            vw, vh = float(target_w), float(target_h)
+        viewport = ((target_w - vw) * 0.5, (target_h - vh) * 0.5, vw, vh)
         encoder = self._device.create_command_encoder()
         rpass = encoder.begin_render_pass(color_attachments=[{
             "view": target_view,
