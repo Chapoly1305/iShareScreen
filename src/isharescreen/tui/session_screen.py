@@ -25,6 +25,7 @@ from typing import Any, Optional
 
 from textual.app import ComposeResult
 from textual.binding import Binding
+from textual.css.query import NoMatches
 from textual.containers import Container, Horizontal, Vertical
 from textual.message import Message
 from textual.reactive import reactive
@@ -403,19 +404,30 @@ class SessionScreen(Screen):
         self._log_ring.append(line)
         if len(self._log_ring) > self._LOG_RING_MAX:
             self._log_ring = self._log_ring[-self._LOG_RING_MAX:]
-        self.query_one("#log", LogPanel).append(line)
-        # Bump the header chips so a normal user sees that something
-        # warrants attention even if their eyes are on the wgpu window.
-        lvl, _ = _classify_loglevel(line)
-        if lvl in ("ERROR", "CRITICAL", "FATAL"):
-            hdr = self.query_one("#hdr", HeaderBar)
-            hdr.errors = hdr.errors + 1
-        elif lvl == "WARNING":
-            hdr = self.query_one("#hdr", HeaderBar)
-            hdr.warnings = hdr.warnings + 1
+        # The viewer's exit / stderr callbacks can fire while this screen is
+        # still mounting or already being torn down, when #log / #hdr aren't
+        # in the DOM. The ring above already captured the line; the live
+        # panel + header chips are best-effort, so swallow NoMatches rather
+        # than let it escape the supervisor's on_exit handler.
+        try:
+            self.query_one("#log", LogPanel).append(line)
+            # Bump the header chips so a normal user sees that something
+            # warrants attention even if their eyes are on the wgpu window.
+            lvl, _ = _classify_loglevel(line)
+            if lvl in ("ERROR", "CRITICAL", "FATAL"):
+                hdr = self.query_one("#hdr", HeaderBar)
+                hdr.errors = hdr.errors + 1
+            elif lvl == "WARNING":
+                hdr = self.query_one("#hdr", HeaderBar)
+                hdr.warnings = hdr.warnings + 1
+        except NoMatches:
+            pass
 
     def set_state(self, state: str) -> None:
-        self.query_one("#hdr", HeaderBar).state = state
+        try:
+            self.query_one("#hdr", HeaderBar).state = state
+        except NoMatches:
+            pass
 
     # ── bindings ────────────────────────────────────────────────
 
