@@ -991,6 +991,11 @@ class Session:
             recorder=self._recorder,
         )
 
+        # Persist the post-auth transport key next to the pcap (sibling
+        # `.key` file) so the recorded session decodes without a wrapper.
+        if self._recorder is not None:
+            self._recorder.write_key(self._negotiation.ecb_key.hex())
+
         keys = self._negotiation.keys
         self._video_decryptor = self._negotiation.video_decryptor
         self._audio_decryptor = SRTPDecryptor.from_blob(keys.audio_key_s)
