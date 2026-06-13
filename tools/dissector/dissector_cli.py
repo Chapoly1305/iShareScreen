@@ -966,7 +966,7 @@ def latest_client_media_options(records: list[DecodedRecord]) -> dict[str, objec
         "timestamp_epoch": latest.timestamp_epoch,
         "plain_len": len(latest.body_bytes),
         "message_version_be16": parsed.get("message_version_be16"),
-        "message_flags_be32": parsed.get("message_flags_be32"),
+        "message_flags_le32": parsed.get("message_flags_le32"),
         "message_flag_names": parsed.get("message_flag_names"),
         "audio_offer_len_be16": parsed.get("audio_offer_len_be16"),
         "video1_offer_len_be16": parsed.get("video1_offer_len_be16"),

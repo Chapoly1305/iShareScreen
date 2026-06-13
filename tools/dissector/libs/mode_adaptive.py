@@ -28,6 +28,12 @@ def be_u32(data: bytes, off: int) -> int | None:
     return struct.unpack_from(">I", data, off)[0]
 
 
+def le_u32(data: bytes, off: int) -> int | None:
+    if off + 4 > len(data):
+        return None
+    return struct.unpack_from("<I", data, off)[0]
+
+
 def is_adaptive_encoding(enc: int | None) -> bool:
     return enc in ADAPTIVE_RECT_ENCODING_NAMES
 
@@ -102,7 +108,12 @@ def _summarize_plist_value(value: object) -> object:
 
 
 def parse_media_stream_options(body: bytes) -> dict[str, object]:
-    flags = be_u32(body, 6)
+    # The flags word at +0x06 is HOST/little-endian — screensharingd reads it
+    # with an un-byteswapped load and the agent tests the low bits, so the
+    # flag bits live in the byte at +0x06. (The size/version/offer-length
+    # fields around it are big-endian.) Reading this be32 would scramble a
+    # correctly-formed offer's bits into the high byte.
+    flags = le_u32(body, 6)
     offer_flag_names: list[str] = []
     if flags is not None:
         if flags & 0x1:
@@ -122,7 +133,7 @@ def parse_media_stream_options(body: bytes) -> dict[str, object]:
         "raw_len": len(body),
         "message_size_be16": declared_size,
         "message_version_be16": be_u16(body, 4),
-        "message_flags_be32": flags,
+        "message_flags_le32": flags,
         "message_flag_names": offer_flag_names,
         "audio_offer_len_be16": be_u16(body, 10),
         "video1_offer_len_be16": be_u16(body, 12),

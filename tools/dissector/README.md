@@ -230,7 +230,7 @@ Replay output:
 - adaptive/media sessions now decode `0x1c MediaStreamOptions` with the fixed header fields proven in native `ScreenSharing.framework`:
   - `message_size_be16`
   - `message_version_be16`
-  - `message_flags_be32`
+  - `message_flags_le32` (host/little-endian — flag bits in byte +0x06)
   - `audio_offer_len_be16`
   - `video1_offer_len_be16`
   - `video2_offer_len_be16`
