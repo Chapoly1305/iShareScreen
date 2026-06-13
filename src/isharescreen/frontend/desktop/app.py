@@ -163,7 +163,27 @@ def run(
     import sys as _sys
     _cursor_direct_apply = _sys.platform in ("linux", "win32")
 
+    # Cursor: by default we hide the local OS cursor and render the host's
+    # separately-sent cursor (enc 1104) ourselves as a wgpu overlay — the way
+    # the native viewer does. The pointer is never the local system cursor
+    # floating over the remote screen; it's a crisp client-rendered sprite at
+    # the pointer position. On the HP/curtain path the host *also* bakes a
+    # cursor into the video (Apple's AVCScreenCapture composites it on the
+    # SkyLight virtual display regardless of the do_not_send_cursor flag,
+    # confirmed in screensharingd/ScreensharingAgent); our rendered cursor
+    # sits on top of it, so you see one crisp cursor — a faint baked ghost
+    # may trail it only during fast motion. ISS_LOCAL_CURSOR=1 reverts to the
+    # legacy behaviour (reshape the local OS cursor; no overlay).
+    _canvas_cursor = os.environ.get("ISS_LOCAL_CURSOR") != "1"
+    _last_cursor_img: dict[str, object] = {"img": None}
+
     def _on_cursor(img):
+        if _canvas_cursor:
+            # Defer to the render thread — the overlay texture upload has to
+            # run on the thread that owns the wgpu device.
+            with _cursor_lock:
+                _pending_cursor["img"] = img
+            return
         if _cursor_direct_apply:
             _set_cursor_now(img)
         else:
@@ -190,6 +210,15 @@ def run(
     win_h = scaled_h or canvas_h
     window = RenderCanvas(title=title, size=(win_w, win_h), max_fps=120)
     glfw_window = window._window  # for raw glfw input callbacks only
+    # In canvas-cursor mode we render the host's cursor as a wgpu overlay and
+    # hide the local system pointer — but NOT yet. Hiding it now, before the
+    # overlay has both a shape (a cursor pixmap arrived) and a position (the
+    # pointer has moved over the window at least once), would leave the user
+    # with no visible pointer at all on a static / pre-first-pixmap screen.
+    # The render loop hides it the moment the overlay can actually draw (see
+    # the `_os_cursor_hidden` block below), so the OS cursor stays as a
+    # fallback until the host cursor is ready to take over.
+    _os_cursor_hidden = {"v": False}
     # Window resizes freely. When the host fell back to a frame smaller
     # than the advertised canvas, the renderer (see gpu.Renderer.draw)
     # centers that real frame in the window at its native on-screen size
@@ -211,9 +240,38 @@ def run(
 
     renderer = Renderer(device, surface_format, canvas_w, canvas_h)
 
+    def _cursor_render_scale() -> float:
+        """On-screen size factor for the cursor sprite.
+
+        Draw the cursor pixmap 1:1 by default. The host delivers it at its
+        *backing* (device-pixel) resolution — a 17x23 arrow is already the
+        Retina 2x arrow — and the wgpu surface is the logical (point) size,
+        so one sprite pixel maps to one logical point, i.e. the host's true
+        device-pixel arrow. Scaling it up by the Retina factor (as an earlier
+        revision did, via glfw content scale or the backing/scaled ratio)
+        double-counts that 2x and makes the cursor twice too large.
+
+        ISS_CURSOR_SCALE multiplies this for manual tuning."""
+        mult = 1.0
+        override = os.environ.get("ISS_CURSOR_SCALE")
+        if override:
+            try:
+                mult = max(0.1, float(override))
+            except ValueError:
+                pass
+        return mult
+
+    if _canvas_cursor:
+        renderer.set_cursor_scale(_cursor_render_scale())
+
     # ── input forwarding ───────────────────────────────────────────────
     button_mask = 0
     cursor: Optional[tuple[int, int]] = None
+    # Whether the local pointer is currently over the window content. When it
+    # leaves, GLFW stops firing cursor-pos events, so without this the overlay
+    # would freeze its last in-window sprite at the edge (a ghost cursor). The
+    # draw callback suppresses the overlay while the pointer is outside.
+    _pointer_in_window = {"v": True}
 
     def to_canvas(wx: float, wy: float) -> Optional[tuple[int, int]]:
         """Map glfw cursor (in glfw window coords) → canvas coords for
@@ -364,9 +422,17 @@ def run(
         session.input.key_event(True, codepoint)
         session.input.key_event(False, codepoint)
 
+    def on_cursor_enter(_w, entered):
+        # entered != 0 → pointer entered the content area; 0 → left it.
+        _pointer_in_window["v"] = bool(entered)
+        # Force one repaint so the overlay clears (on leave) or reappears (on
+        # enter) even over a static screen with no fresh video tile.
+        _cursor_dirty["v"] = True
+
     glfw.set_cursor_pos_callback(glfw_window, on_cursor_pos)
     glfw.set_mouse_button_callback(glfw_window, on_mouse_button)
     glfw.set_scroll_callback(glfw_window, on_scroll)
+    glfw.set_cursor_enter_callback(glfw_window, on_cursor_enter)
     glfw.set_key_callback(glfw_window, on_key)
     glfw.set_char_callback(glfw_window, on_char)
 
@@ -401,6 +467,9 @@ def run(
     # ── render loop ────────────────────────────────────────────────────
     first_seen: list[bool] = [False] * num_tiles
     slot_h_resolved = False
+    # Last cursor position we painted, so a pointer move over a static
+    # screen still repaints the overlay (the cursor isn't baked into video).
+    _last_drawn_cursor: "Optional[tuple[int, int]]" = None
     deadline = time.monotonic() + auto_quit_secs if auto_quit_secs > 0 else float("inf")
 
     # rendercanvas presents only from inside the draw callback (it owns
@@ -416,6 +485,11 @@ def run(
     def draw_callback():
         try:
             target = surface_ctx.get_current_texture()
+            if _canvas_cursor:
+                # Suppress the overlay while the pointer is outside the window
+                # (None hides it) so it doesn't freeze as a ghost at the edge.
+                renderer.set_cursor_pos(
+                    cursor if _pointer_in_window["v"] else None)
             renderer.draw(target.create_view(), target.width, target.height)
         except Exception as e:
             msg = str(e)
@@ -569,20 +643,42 @@ def run(
         except Exception as e:
             log.debug("cursor apply failed: %s", e)
 
-    def _apply_pending_cursor():
-        """macOS-only deferred path: pull from the pending slot on the
-        render thread. On Linux/Windows the proxy thread calls
-        `_set_cursor_now` directly so we skip this slot entirely.
+    # Set when the overlay cursor shape changes so the render loop repaints
+    # even with no fresh video tile. On a static screen (e.g. just after
+    # login) the host sends a new cursor pixmap (I-beam → arrow) but no
+    # pixel update — and since `do_not_send_cursor` keeps the cursor out of
+    # the video, the shape change would otherwise never reach the screen.
+    _cursor_dirty: dict[str, bool] = {"v": False}
 
-        `_pending_cursor["img"]` may legitimately be None (revert to
-        OS default) — distinguished from "no pending update" by a
-        sentinel object."""
+    def _apply_pending_cursor():
+        """Pull a pending cursor shape from the slot on the render thread and
+        apply it. In canvas-cursor mode this uploads the overlay texture
+        (which must happen on the device-owning thread); in legacy mode it
+        sets the local OS cursor. On Linux/Windows the legacy path also
+        applies directly from the proxy thread, so the slot is usually empty.
+
+        `_pending_cursor["img"]` may legitimately be None (revert to OS
+        default) — distinguished from "no pending update" by a sentinel."""
         with _cursor_lock:
             img = _pending_cursor["img"]
             _pending_cursor["img"] = _NO_PENDING
         if img is _NO_PENDING:
             return
-        _set_cursor_now(img)
+        if _canvas_cursor:
+            # img is None means the proxy hit a cursor cache-miss and asked
+            # us to "revert to the OS default". In canvas mode the local OS
+            # cursor is hidden, so clearing the overlay would make the
+            # pointer vanish entirely (no OS cursor underneath). Keep the
+            # last shape instead — a stale-but-visible cursor beats an
+            # invisible one, and it self-corrects on the next real pixmap.
+            # The native viewer likewise never shows an empty cursor.
+            if img is None:
+                return
+            _last_cursor_img["img"] = img  # re-applied after a canvas rebuild
+            renderer.set_cursor_image(img)
+            _cursor_dirty["v"] = True
+        else:
+            _set_cursor_now(img)
 
     # ── dynamic-resolution resize tracking ─────────────────────────────
     # Mid-session resolution change works on the existing TCP connection:
@@ -607,6 +703,12 @@ def run(
         slot_h_resolved = False
         first_seen = [False] * num_tiles
         renderer = Renderer(device, surface_format, canvas_w, canvas_h)
+        # The new renderer has no cursor texture/scale; re-apply both so the
+        # overlay doesn't vanish or mis-size across a resolution change.
+        if _canvas_cursor:
+            renderer.set_cursor_scale(_cursor_render_scale())
+            if _last_cursor_img["img"] is not None:
+                renderer.set_cursor_image(_last_cursor_img["img"])
         # Do NOT snap the window to the server's reply. Native keeps the
         # window where the user put it (including fullscreen) and centers
         # the remote frame inside it; when the remote can't fulfil the
@@ -667,6 +769,20 @@ def run(
     while time.monotonic() < deadline:
         glfw.poll_events()
         _apply_pending_cursor()
+        # Hide the local OS cursor only once the overlay can actually draw —
+        # a shape has been uploaded (_last_cursor_img) AND a pointer position
+        # is known (cursor, set on the first in-window move). Until then keep
+        # the OS cursor as a visible fallback so a static / pre-first-pixmap
+        # screen never shows an invisible pointer. One-shot.
+        if (_canvas_cursor and not _os_cursor_hidden["v"]
+                and _last_cursor_img["img"] is not None
+                and cursor is not None):
+            try:
+                glfw.set_input_mode(
+                    glfw_window, glfw.CURSOR, glfw.CURSOR_HIDDEN)
+                _os_cursor_hidden["v"] = True
+            except Exception as e:
+                log.debug("could not hide local cursor: %s", e)
         if window.get_closed() or glfw.window_should_close(glfw_window):
             break
         if _device_lost["v"]:
@@ -701,10 +817,15 @@ def run(
             renderer.upload_tile(ti, tf, slot_h)
             any_fresh = True
 
-        # Present after a fresh upload. No fresh content = skip the
-        # draw, swap chain holds the previous good frame.
-        if any_fresh and any(first_seen):
+        # Present after a fresh upload, OR when the overlay cursor moved or
+        # changed shape — otherwise a pointer that moves/reshapes over a
+        # static screen (no fresh tile) would never repaint, freezing the
+        # last-drawn cursor (e.g. an I-beam stuck after login).
+        cursor_moved = _canvas_cursor and cursor != _last_drawn_cursor
+        if (any_fresh or cursor_moved or _cursor_dirty["v"]) and any(first_seen):
             window.force_draw()
+            _last_drawn_cursor = cursor
+            _cursor_dirty["v"] = False
 
     log.info("desktop frontend closing")
     if kbd_grab is not None:
