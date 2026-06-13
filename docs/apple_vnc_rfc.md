@@ -725,7 +725,7 @@ The switch to compressed media is gated on completion of the `0x1c` MediaStreamO
 - **Not a protobuf.** The body is a **fixed-layout binary struct**, all multi-byte fields big-endian — there is no varint / field-number decoding. `screensharingd::sub_1000352ac` `case 0x1c` (`HandleServerMediaStreamConfiguration`) reads a 20-byte header, then forwards the whole body to ScreensharingAgent via the `SetMediaStreamConfiguration` MIG RPC; the byte-level parser is the Agent's `sub_10001c7e4`.
 - **Three streams, not two:** the message carries **audio + video1 + video2** offer blocks (a second video stream, tied to the second-60fps flag bit below). Each stream carries **two 46-byte SRTP key blobs** `key1` then `key2` (six `NSData …length:0x2e` reads in the Agent parser).
 - `key2` is the receive (server→client) key; `key1` is the client→server key. `-[SSUDPSender sendToRemoteAddress:]` sets `setSendMediaKey:` = the ServerToViewer (2nd) blob and `setReceiveMediaKey:` = the ViewerToServer (1st) blob (`0x100008bdc`/`0x100008be8`). Also independently: decrypting captured server→client media with the video `key2` authenticates every packet; `key1` does not.
-- **Flags** live in a `u32` at body **+0x0c**. Bit `0x01` = stream-1 60 fps supported; bit `0x02` = stream-2 60 fps supported (the second video stream); bit `0x04` = do-not-send-cursor; bit `0x08` = AVC client-name selector (`RemoteDesktopScreenSharing` vs `AppleRemoteDesktop`). A client that sends `messageVersion ≤ 1` has the server force bits `0x01|0x02` (legacy 60 fps). The interoperable client emits bits 0–2.
+- **Flags** live in a `u32` at body **+0x06**. Bit `0x01` = stream-1 60 fps supported; bit `0x02` = stream-2 60 fps supported (the second video stream); bit `0x04` = do-not-send-cursor; bit `0x08` = AVC client-name selector (`RemoteDesktopScreenSharing` vs `AppleRemoteDesktop`). A client that sends `messageVersion ≤ 1` has the server force bits `0x01|0x02` (legacy 60 fps). The interoperable client emits bits 0–2. The three offer-length `u16`s follow at **+0x0a** (`audio_offer_len`), **+0x0c** (`video1_offer_len`), and **+0x0e** (`video2_offer_len`). *(Offset corrected: an earlier revision placed `flags` at +0x0c — that position is `video1_offer_len`. The +0x06 placement is confirmed three independent ways: the reference client's `_buildOfferMessage` packs the config bitmask as a `u32` at +0x06 and the two offer sizes at +0x0a/+0x0c; the standalone decoder reads them there and decodes live sessions; and a captured offer carries `flags = 0x00000007` at +0x06 with `video1_offer_len = 552` at +0x0c, which closes the total message length exactly — `0x80 + audio_offer_len + 0x5c + video1_offer_len`. Whether the Agent parser `sub_10001c7e4` loads these from the same constants should be re-confirmed in Binary Ninja.)*
 - **One UUID, dual-purpose:** there is a single 16-byte UUID at body **+0x14**; it serves as **both** the session identifier and the CallID (the per-stream audio/video CallIDs are derived from it by the Agent, not carried separately). `NSUUID initWithUUIDBytes:` → `setMediaStreamSessionID:`.
 - **Top-level layout** (offsets from the body's first byte = message type):
 
@@ -733,19 +733,20 @@ The switch to compressed media is gated on completion of the `0x1c` MediaStreamO
 +0x00  u16  message_type   (= 0x1c)
 +0x02  u16  message_size
 +0x04  u16  message_version (≤1 → server force-sets flags |= 0x03)
-+0x06  u16  (parsed; role open)
-+0x08  u16  (parsed; role open)
++0x06  u32  flags          (bits per above)
 +0x0a  u16  audio_offer_len
-+0x0c  u32  flags          (bits per above)
++0x0c  u16  video1_offer_len
++0x0e  u16  video2_offer_len (0 when no second video stream)
++0x10  u32  reserved       (observed 0)
 +0x14  16B  session/CallID UUID
 +0x24  46B  audio  key1 (viewer→server / server-receive)
 +0x52  46B  audio  key2 (server→viewer / server-send)
 +0x80  N    audio_offer    (audio_offer_len bytes; opaque, handed to AVConference)
-       46B  video1 key1 ; 46B video1 key2 ; video1_offer (video1_offer_len, u16 @ +0x0c-region)
-       46B  video2 key1 ; 46B video2 key2 ; video2_offer (video2_offer_len; present only if non-zero)
+       46B  video1 key1 ; 46B video1 key2 ; video1_offer (video1_offer_len bytes)
+       46B  video2 key1 ; 46B video2 key2 ; video2_offer (video2_offer_len bytes; present only if non-zero)
 ```
 
-- **Offer/answer state**: client sends `0x1c` offer → server returns `0x1c` answer → media transport begins. The per-stream `*_offer` blobs are opaque to the screen-sharing code (passed to AVConference's `AVCMediaStreamNegotiator`); their internal format, the role of the two parsed `u16` words at body +0x06/+0x08, and the full answer layout remain a **revision gap**.
+- **Offer/answer state**: client sends `0x1c` offer → server returns `0x1c` answer → media transport begins. The per-stream `*_offer` blobs are opaque to the screen-sharing code (passed to AVConference's `AVCMediaStreamNegotiator`); their internal format and the full answer layout remain a **revision gap**. (The `u32` at +0x06 is the `flags` field above, not an unknown word; the `u32` at +0x10 is reserved/zero in every captured offer.)
 
 ### 10.4 UDP Flows and RTP Framing
 
@@ -1085,7 +1086,7 @@ Derived from packet captures, runtime traces, and static analysis of `screenshar
 
 - **Type 30/35/36 live captures.** The transcripts and key-derivations are established by static analysis (§4.2.3/§4.2.5/§4.2.6); only on-wire captures of those branches are still absent (the test host offers only type 33).
 - **Wrap-key rotation across ≥2 rekeys** and sequence-counter non-reset across a second rekey — the per-rekey install path is established (§6.2.1); multi-rekey behavior is unexercised (needs a ≥2-rekey session).
-- **`0x1c` per-stream offer-blob internals** (handed to AVConference), the `+0x06`/`+0x08` header words, and the server *answer* layout — top-level framing is recovered (§10.3).
+- **`0x1c` per-stream offer-blob internals** (handed to AVConference) and the server *answer* layout — top-level offer framing (including the `+0x06` `flags` `u32` and the `+0x0a`/`+0x0c`/`+0x0e` offer-length words) is recovered (§10.3).
 - **`0x3f3` 3-bit command-code → meaning mapping** — all other MVS framing is recovered (§8.9.4).
 - `0x3ea` rectangle body beyond pre-processing (§8.9.3).
 - **ViewerInfo bits 30/31/32/35/81** (§5.5) — viewer-internal: tested neither in `screensharingd` nor `ScreensharingAgent` (the Agent receives digested flags, not the raw bitmap).
