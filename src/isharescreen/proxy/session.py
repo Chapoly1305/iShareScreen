@@ -185,6 +185,19 @@ class SessionConfig:
     advertise: Optional[AdvertiseDims] = None
     hdr: bool = False
     audio: bool = True
+    # HiDPI mode for the host's virtual display, resolved to a backing:point
+    # ratio by the frontend (which knows the window size):
+    #   "on"   → always 2× (Retina): crisp, but ~4× the pixels = more
+    #            bandwidth, and UI renders half-size on a non-Retina client.
+    #   "off"  → always 1× (flat, backing == logical): far less bandwidth,
+    #            correctly-sized UI on non-Retina (Linux/Windows) clients.
+    #   "auto" → match the LOCAL display: 2× on a Retina client, 1× on a
+    #            non-Retina one (so the stream maps 1:1 to the client's pixels);
+    #            2× is downgraded to 1× when it wouldn't fit the host's
+    #            3840×2160 cap (window logical > 1920×1080).
+    # The frontend passes the resolved scale into send_dynamic_resolution and
+    # the initial AdvertiseDims; the proxy itself only carries the mode.
+    hidpi: str = "auto"
 
     # When auth user differs from the console user, ask the console user
     # to share their existing session (Apple's "Ask to share" choice in
@@ -565,7 +578,9 @@ class Session:
             gate.mark_decode_error(tile_idx)
             self._send_fir_for_tile(tile_idx)
 
-    def send_dynamic_resolution(self, width: int, height: int) -> None:
+    def send_dynamic_resolution(
+        self, width: int, height: int, hidpi_scale: int = 2,
+    ) -> None:
         """Request a mid-session display resize without reconnecting.
 
         Sends a runtime SetDisplayConfiguration (0x1d) on the existing
@@ -584,7 +599,7 @@ class Session:
             raise RuntimeError("Not connected")
         log.info("send_dynamic_resolution: requesting %dx%d", width, height)
         msg = build_virtual_display(
-            width=width, height=height, hidpi_scale=1, hdr=False,
+            width=width, height=height, hidpi_scale=hidpi_scale, hdr=False,
         )
         neg.cipher.encrypt_and_send(neg.sock, msg)
         # Re-arm TCP and nudge encoder with FIRs for fresh IDRs.

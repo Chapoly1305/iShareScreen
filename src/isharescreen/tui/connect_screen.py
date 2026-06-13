@@ -70,6 +70,7 @@ class ConnectFormValues:
     audio: bool
     curtain: bool
     hdr: bool
+    hidpi: str          # "auto" | "on" | "off"
     share_console: bool
     alt_session: bool
 
@@ -118,7 +119,7 @@ class ConnectScreen(Screen):
         self._prefill = prefill or ConnectFormValues(
             host="", user="", password="",
             advertise=_DEFAULT_RESOLUTION,
-            audio=True, curtain=True, hdr=False,
+            audio=True, curtain=True, hdr=False, hidpi="auto",
             share_console=False, alt_session=False,
         )
         self._probe_task: Optional[asyncio.Task] = None
@@ -141,6 +142,17 @@ class ConnectScreen(Screen):
                 options=[(label, key) for label, key in _RESOLUTION_PRESETS],
                 value=self._prefill.advertise,
                 id="resolution",
+                allow_blank=False,
+            )
+            yield Label("HiDPI")
+            yield Select(
+                options=[
+                    ("Auto — match this display (Retina→2×, else 1×)", "auto"),
+                    ("On — Retina 2× (crisp, high bandwidth)", "on"),
+                    ("Off — flat 1× (low bandwidth, bigger UI)", "off"),
+                ],
+                value=self._prefill.hidpi,
+                id="hidpi",
                 allow_blank=False,
             )
             with Horizontal(classes="switch-row"):
@@ -248,6 +260,7 @@ class ConnectScreen(Screen):
             audio=self.query_one("#audio", Switch).value,
             curtain=self.query_one("#curtain", Switch).value,
             hdr=self.query_one("#hdr", Switch).value,
+            hidpi=str(self.query_one("#hidpi", Select).value),
             share_console=self.query_one("#share-console", Switch).value,
             alt_session=self.query_one("#alt-session", Switch).value,
         )

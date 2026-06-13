@@ -77,7 +77,7 @@ class AdvertiseDims:
     """
     width: int = 1920
     height: int = 1200
-    hidpi_scale: int = 1
+    hidpi_scale: int = 2   # 2 = Retina (backing 2× points); 1 = flat (backing == points)
     width_mm: float = 300.0
     height_mm: float = 200.0
 

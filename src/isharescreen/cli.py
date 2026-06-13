@@ -23,6 +23,7 @@ shows up in ``ps`` and shell history.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import signal
 import sys
@@ -102,6 +103,16 @@ def _make_parser() -> argparse.ArgumentParser:
         help="advertise HDR-capable viewer to the host",
     )
     g.add_argument(
+        "--hidpi", choices=("auto", "on", "off"), default="auto",
+        help=(
+            "HiDPI (Retina) rendering of the host display. 'on' = always 2x "
+            "(crisp, high bandwidth); 'off' = flat 1x (low bandwidth, larger "
+            "UI on non-Retina clients); 'auto' (default) = match the local "
+            "display (2x on a Retina client, 1x otherwise; downgrades to 1x "
+            "when 2x wouldn't fit the host backing cap)"
+        ),
+    )
+    g.add_argument(
         "--curtain", action=argparse.BooleanOptionalAction, default=True,
         help=(
             "blank the host's physical screen via a SkyLight virtual "
@@ -177,7 +188,7 @@ def _parse_advertise(spec: Optional[str]) -> Optional[AdvertiseDims]:
     try:
         w_str, h_str = geom_part.lower().split("x", 1)
         width, height = int(w_str), int(h_str)
-        hidpi = int(hidpi_part) if hidpi_part else 1
+        hidpi = int(hidpi_part) if hidpi_part else 2
     except ValueError as e:
         raise SystemExit(
             f"invalid --advertise value {spec!r}: expected 'WxH' or 'WxH@HIDPI' ({e})"
@@ -226,6 +237,19 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
     use goes through `isharescreen.tui` instead."""
     cli_password = _password_from_args(args)
     cli_advertise = _parse_advertise(args.advertise)
+    # For a fixed --advertise WxH, the --hidpi mode determines the backing
+    # scale (the auto/dynamic path resolves this in the frontend instead).
+    # 'on' → 2×, 'off' → 1×, 'auto' → 2× when the 2× backing fits the host's
+    # 3840×2160 cap (logical ≤ 1920×1080), else 1×.
+    if cli_advertise is not None:
+        w, h = cli_advertise.width, cli_advertise.height
+        if args.hidpi == "off":
+            scale = 1
+        elif args.hidpi == "on":
+            scale = 2
+        else:  # auto
+            scale = 2 if (w * 2 <= 3840 and h * 2 <= 2160) else 1
+        cli_advertise = dataclasses.replace(cli_advertise, hidpi_scale=scale)
     # Dynamic resolution: explicit --dynamic/--no-dynamic wins; otherwise
     # default it on exactly when no fixed geometry was given (advertise is
     # 'auto'/omitted ⇒ cli_advertise is None).
@@ -250,6 +274,7 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
         advertise=cli_advertise,
         dynamic_resolution=dynamic_resolution,
         hdr=args.hdr,
+        hidpi=args.hidpi,
         curtain=args.curtain,
         audio=args.audio,
         share_console=args.share_console, alt_session=args.alt_session,

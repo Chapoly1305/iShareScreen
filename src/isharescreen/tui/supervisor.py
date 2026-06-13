@@ -50,6 +50,7 @@ class ViewerArgs:
     audio: bool = True
     curtain: bool = True
     hdr: bool = False
+    hidpi: str = "auto"        # "auto" | "on" | "off"
     share_console: bool = False
     alt_session: bool = False
     port: int = 5900
@@ -189,6 +190,7 @@ class Supervisor:
         ]
         argv += ["--audio"] if args.audio else ["--no-audio"]
         argv += ["--curtain"] if args.curtain else ["--no-curtain"]
+        argv += ["--hidpi", args.hidpi]
         if args.hdr:
             argv.append("--hdr")
         if args.share_console:

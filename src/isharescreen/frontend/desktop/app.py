@@ -99,6 +99,75 @@ def _auto_advertise_dims() -> tuple[int, int]:
     return w, h
 
 
+# The host caps the virtual display's backing (pixel) canvas at this size; a
+# request whose backing would exceed it is rejected/degraded by the host (so
+# we must never ask for more — same as the native viewer, which clamps the
+# window to what the remote supports).
+_HOST_MAX_BACKING_W = 3840
+_HOST_MAX_BACKING_H = 2160
+
+
+def _display_scale(glfw_window=None) -> int:
+    """The LOCAL display's backing-scale factor: 2 = Retina/HiDPI, 1 = standard.
+
+    HiDPI 'auto' matches the host render to this so the stream maps 1:1 to the
+    client's pixels — crisp on Retina (2×) and on non-Retina (1×, e.g. most
+    Linux/Windows displays) alike, with the right bandwidth for each. Reads
+    GLFW's content scale (per-window once the window exists, else the primary
+    monitor for the pre-window initial advertise). Falls back to 2 (the
+    macOS-Retina common case) if detection fails.
+    """
+    try:
+        if glfw_window is not None:
+            sx, _sy = glfw.get_window_content_scale(glfw_window)
+        else:
+            glfw.init()  # idempotent
+            mon = glfw.get_primary_monitor()
+            sx, _sy = glfw.get_monitor_content_scale(mon) if mon else (2.0, 2.0)
+        return 2 if int(round(sx)) >= 2 else 1
+    except Exception as e:
+        log.debug("display-scale detect failed (%s); assuming 2× Retina", e)
+        return 2
+
+
+def _resolve_hidpi_request(
+    mode: str, win_w: int, win_h: int, client_scale: int = 2,
+) -> tuple[int, int, int]:
+    """Map (HiDPI mode, window logical size, client display scale) →
+    (req_w, req_h, hidpi_scale).
+
+    The request preserves the window's aspect and is clamped so the resulting
+    backing (= request × scale) never exceeds the host's 3840×2160 ceiling —
+    so we never over-stretch past what the remote can render.
+
+      mode 'on'   → always 2× (Retina); logical ceiling 1920×1080.
+      mode 'off'  → always 1× (flat);    logical ceiling 3840×2160.
+      mode 'auto' → match the LOCAL display: 2× on a Retina client (host
+                    backing maps 1:1 to the client's Retina pixels), 1× on a
+                    non-Retina client (1:1 to the client's pixels — crisp and
+                    low-bandwidth). 2× is downgraded to 1× when it wouldn't fit
+                    the host backing cap (window logical > 1920×1080), so a
+                    fullscreen Retina client still gets the true large desktop
+                    rather than an upscaled small one.
+    """
+    win_w = max(1, win_w)
+    win_h = max(1, win_h)
+    if mode == "off":
+        scale = 1
+    elif mode == "on":
+        scale = 2
+    else:  # auto: match the client display scale, but only 2× when it fits
+        scale = 2 if (client_scale >= 2
+                      and win_w * 2 <= _HOST_MAX_BACKING_W
+                      and win_h * 2 <= _HOST_MAX_BACKING_H) else 1
+    max_w = _HOST_MAX_BACKING_W // scale
+    max_h = _HOST_MAX_BACKING_H // scale
+    fit = min(max_w / win_w, max_h / win_h, 1.0)  # shrink-only, keep aspect
+    req_w = max(_MIN_ADVERTISE_W, _even(int(win_w * fit)))
+    req_h = max(_MIN_ADVERTISE_H, _even(int(win_h * fit)))
+    return req_w, req_h, scale
+
+
 def run(
     config: SessionConfig,
     *,
@@ -115,11 +184,15 @@ def run(
     dynamic = config.dynamic_resolution
     if config.advertise is None:
         aw, ah = _auto_advertise_dims()
+        rw, rh, scale = _resolve_hidpi_request(
+            config.hidpi, aw, ah, _display_scale())
         config = dataclasses.replace(
-            config, advertise=AdvertiseDims(width=aw, height=ah, hidpi_scale=1),
+            config, advertise=AdvertiseDims(
+                width=rw, height=rh, hidpi_scale=scale),
         )
-        log.info("auto-detected initial viewer size %dx%d (dynamic=%s)",
-                 aw, ah, dynamic)
+        log.info("auto-detected initial viewer %dx%d → request %dx%d @%dx "
+                 "(hidpi=%s dynamic=%s)",
+                 aw, ah, rw, rh, scale, config.hidpi, dynamic)
     session = Session(config)
     session.connect()
 
@@ -745,10 +818,15 @@ def run(
         if (pending_size is not None
                 and now - pending_since >= _RESIZE_DEBOUNCE_S
                 and now - last_resize_t >= _RESIZE_MIN_INTERVAL_S):
-            nw = max(_MIN_ADVERTISE_W, min(pending_size[0], server_w,
-                                           _MAX_ADVERTISE_W))
-            nh = max(_MIN_ADVERTISE_H, min(pending_size[1], server_h,
-                                           _MAX_ADVERTISE_H))
+            # Resolve the window's logical size + the HiDPI mode into the
+            # request resolution AND the backing scale, preserving the window
+            # aspect and clamping so backing never exceeds the host's
+            # 3840×2160 cap (see _resolve_hidpi_request). The request IS the
+            # viewport: when the host satisfies it the remote fills the window
+            # 1:1; the renderer letterboxes only a genuine shortfall.
+            nw, nh, scale = _resolve_hidpi_request(
+                config.hidpi, pending_size[0], pending_size[1],
+                _display_scale(glfw_window))
             # Advance the guard to the WINDOW size we acted on (tw,th),
             # NOT the clamped request (nw,nh). If the window is larger
             # than the cap, the request is clamped but the window stays
@@ -759,9 +837,10 @@ def run(
             cur_adv_w, cur_adv_h = tw, th
             pending_size = None
             last_resize_t = now
-            log.info("resize → requesting %dx%d", nw, nh)
+            log.info("resize → requesting %dx%d @%dx (hidpi=%s)",
+                     nw, nh, scale, config.hidpi)
             try:
-                session.send_dynamic_resolution(nw, nh)
+                session.send_dynamic_resolution(nw, nh, hidpi_scale=scale)
             except Exception as e:
                 log.error("send_dynamic_resolution failed: %s", e)
                 return

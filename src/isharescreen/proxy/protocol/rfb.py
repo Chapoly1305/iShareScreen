@@ -216,8 +216,15 @@ def build_virtual_display(
     the byte level — kept for call-site intent and in case the reserved
     value ever changes.
     """
-    pts_w = width * hidpi_scale
-    pts_h = height * hidpi_scale
+    # `width`/`height` are the LOGICAL (point / scaled) target. `hidpi_scale`
+    # is the backing:point ratio the mode table advertises: 2 => Retina
+    # (backing = 2× points), 1 => flat (backing = points, ~1/4 the pixels =
+    # much less bandwidth; the right choice on non-Retina clients where a 2×
+    # stream renders the UI half-size). The host honors whichever ratio the
+    # mode table carries (verified against 24G231: a 1× mode table returns
+    # backing == scaled).
+    pts_w = width
+    pts_h = height
     di_size = 0x9C + 28 * mode_count
 
     di = bytearray(di_size)
@@ -255,10 +262,13 @@ def build_virtual_display(
 
     for i in range(mode_count):
         base = _NATIVE_MODES[i % len(_NATIVE_MODES)]
-        mw = int(base[0] * sx + 0.5)
-        mh = int(base[1] * sy + 0.5)
+        # point (scaled) dims from the native template, scaled to the target;
+        # pixel (backing) dims = point × hidpi_scale, so the mode table
+        # advertises a 2× (Retina) or 1× (flat) backing per the caller.
         msw = int(base[2] * sx + 0.5)
         msh = int(base[3] * sy + 0.5)
+        mw = msw * hidpi_scale
+        mh = msh * hidpi_scale
         m = 0x9C + 28 * i
         struct.pack_into(">IIII", di, m + 0x00, mw, mh, msw, msh)
         struct.pack_into(">d", di, m + 0x10, 60.0)

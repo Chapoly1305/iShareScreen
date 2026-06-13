@@ -196,6 +196,7 @@ class IssTuiApp(App):
             audio=form.audio,
             curtain=form.curtain,
             hdr=form.hdr,
+            hidpi=form.hidpi,
             share_console=form.share_console,
             alt_session=form.alt_session,
             verbose=int(self._cli_viewer_flags.get("verbose", 0) or 0),
