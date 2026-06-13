@@ -33,6 +33,7 @@ pays nothing because the taps are only installed when recording is armed.
 from __future__ import annotations
 
 import logging
+import os
 import socket
 import struct
 import threading
@@ -230,6 +231,35 @@ class PcapRecorder:
     def path(self) -> Optional[str]:
         return self._file.path if self._file is not None else None
 
+    @property
+    def key_path(self) -> str:
+        """Sibling key file: same dir and filename prefix as the pcap, with
+        the extension swapped to `.key` (e.g. `session.pcap` -> `session.key`).
+        Derived from the path the recorder was opened with so reconnect
+        suffixes (`-1`, `-2`, …) stay matched per capture."""
+        return str(Path(self._base_path).with_suffix(".key"))
+
+    def write_key(self, key_hex: str) -> Optional[str]:
+        """Persist the post-auth enc1103 transport key (hex) next to the pcap
+        so the dissector's `--initial-key-hex` is recoverable without a
+        wrapper. Best effort — a write failure never disturbs the capture.
+        Returns the path written, or None on failure / when not recording."""
+        if self._file is None:
+            return None
+        try:
+            kp = self.key_path
+            with open(kp, "w", encoding="ascii") as fh:
+                fh.write(key_hex + "\n")
+            try:
+                os.chmod(kp, 0o600)  # session secret — keep it owner-only
+            except OSError:
+                pass
+            log.info("transport key -> %s", kp)
+            return kp
+        except OSError as e:
+            log.warning("could not write key file: %s", e)
+            return None
+
     # ── framing helpers (called holding _cond) ───────────────────────
 
     def _next_ident(self) -> int:
@@ -367,17 +397,18 @@ class PcapRecorder:
     # ── reporting ────────────────────────────────────────────────────
 
     def dissector_hint(self) -> str:
-        """Dissector command lines for the captured session. `decode` needs
-        the post-auth transport key, which the capture alone doesn't carry —
-        it's shown as a placeholder. `list-streams` is runnable as-is, and
-        the file opens in Wireshark with no key for the cleartext handshake."""
+        """Dissector command lines for the captured session. The post-auth
+        transport key is written alongside the pcap as a sibling `.key` file,
+        which the dissector auto-loads — so no key argument is needed.
+        (`list-streams` needs no key; the file also opens in Wireshark with no
+        key for the cleartext handshake.)"""
         port = self.last_tcp_client_port
         port_arg = f" --client-port {port}" if port else ""
         return (
             "dissector_cli.py list-streams --pcap %s\n"
             "dissector_cli.py decode --pcap %s "
             "--client-ip %s --server-ip %s --server-port 5900%s "
-            "--initial-key-hex <TRANSPORT_KEY_HEX> --output records.jsonl"
+            "--output records.jsonl"
             % (self._base_path, self._base_path,
                self._client_ip, self._server_ip, port_arg)
         )
