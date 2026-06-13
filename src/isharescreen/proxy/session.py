@@ -237,6 +237,14 @@ class SessionConfig:
     # commands. None = no control server.
     control_socket: Optional[str] = None
 
+    # Packet capture: when set, every byte that crosses the TCP control
+    # socket and the two UDP media sockets is written — exactly as it goes
+    # on the wire (still enc1103/SRTP encrypted) — to a classic `.pcap` at
+    # this path, with synthetic Ethernet/IPv4/TCP|UDP framing. The result is
+    # byte-identical to a tcpdump capture and feeds straight into the
+    # workspace Python dissector (which derives the keys from the cleartext
+    # handshake it sees) or Wireshark. None ⇒ no capture; zero overhead.
+    record_pcap: Optional[str] = None
 
 # ── internal RTP packet group ────────────────────────────────────────
 
@@ -300,6 +308,12 @@ class Session:
         self._dest_host: str = self._config.host
         # Optional control server (TUI subscribers); see `control.py`.
         self._control: Optional[ControlServer] = None
+        # Optional packet capture; see `util/pcap_recorder.py`. Created on
+        # connect when cfg.record_pcap is set, finalised on teardown.
+        # `_record_cycle` counts connect() cycles so a reconnect writes a
+        # fresh file instead of truncating the previous session's capture.
+        self._recorder = None  # Optional[PcapRecorder]
+        self._record_cycle = 0
         # Wall-clock instant the current session went LIVE (post-burst).
         # Used to compute uptime for control-snapshot consumers.
         self._connect_wall_ts: float = 0.0
@@ -687,6 +701,31 @@ class Session:
             log.info("resolved %s -> %s (IPv4 for HP UDP transport)",
                      cfg.host, self._dest_host)
 
+        # Packet capture: open the recorder now that the server IPv4 is
+        # known, so the TCP/UDP socket taps below can stamp real endpoints.
+        # On a reconnect cycle (_recorder kept across handshake retries) we
+        # keep the existing one; a full close() finalises it.
+        if cfg.record_pcap and self._recorder is None:
+            from pathlib import Path
+            from ..util.pcap_recorder import PcapRecorder, local_ip_towards
+            # First connect uses the path verbatim (matching the CLI's
+            # expectation, truncating any stale file like tcpdump -w). Each
+            # subsequent connect() in this Session — i.e. a reconnect — adds
+            # a "-N" suffix so the prior session's capture (often the one
+            # holding the failure that triggered the reconnect) is preserved.
+            path = cfg.record_pcap
+            if self._record_cycle > 0:
+                p = Path(path)
+                path = str(p.with_name(
+                    f"{p.stem}-{self._record_cycle}{p.suffix}"))
+            try:
+                client_ip = local_ip_towards(self._dest_host)
+                self._recorder = PcapRecorder(path, client_ip, self._dest_host)
+            except Exception as e:
+                log.warning("pcap recording disabled (setup failed: %s)", e)
+                self._recorder = None
+            self._record_cycle += 1
+
         # 1) Bind UDP sockets BEFORE the handshake — the session-start
         # burst lands within ~100 ms of the 0x1c answer, and the kernel
         # would drop early packets if the sockets aren't ready. Apple
@@ -703,6 +742,13 @@ class Session:
         bind_host = cfg.udp_bind_host or os.environ.get("ISS_UDP_BIND_HOST", "")
         self._sock_ctrl = self._bind_udp(bind_host, ctrl_port)
         self._sock_video = self._bind_udp(bind_host, video_port)
+        # Tap the media sockets so SRTP RTP/RTCP (and our heartbeats /
+        # firewall punches) land in the capture alongside the TCP control
+        # stream. The tap is a transparent proxy — every other socket call
+        # delegates to the real socket.
+        if self._recorder is not None:
+            self._sock_ctrl = self._recorder.wrap_udp(self._sock_ctrl)
+            self._sock_video = self._recorder.wrap_udp(self._sock_video)
         # NAT diagnostic: log the bound local address pair so a user behind
         # NAT can confirm iss is listening where they expect, and we can
         # compare with the src-address-of-first-packet log later.
@@ -1018,6 +1064,7 @@ class Session:
             video_offer=video_offer,
             share_console=cfg.share_console,
             alt_session=cfg.alt_session,
+            recorder=self._recorder,
         )
 
         keys = self._negotiation.keys
@@ -1222,6 +1269,21 @@ class Session:
             except OSError:
                 pass
             self._negotiation = None
+
+        # Finalise the packet capture (flush + close the file) and print a
+        # ready-to-run dissector command. Done after the sockets are shut so
+        # any last bytes (RST teardown excluded — that's below the socket
+        # API) are already recorded.
+        if self._recorder is not None:
+            path = self._recorder.path
+            hint = self._recorder.dissector_hint()
+            pkts, nbytes = self._recorder.close()  # drains queue, returns counts
+            if path:
+                log.info(
+                    "pcap saved: %s (%d packets, %d bytes)\ndecode with:\n%s",
+                    path, pkts, nbytes, hint,
+                )
+            self._recorder = None
 
         self._video_decryptor = None
         self._audio_decryptor = None
