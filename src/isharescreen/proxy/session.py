@@ -2125,23 +2125,38 @@ class Session:
         #   then n_rects × { rect_header (12B) + encoding_payload }
         n_rects = struct.unpack(">H", msg[2:4])[0]
         offset = 4
+        _dbg_cursor = os.environ.get("ISS_CURSOR_DEBUG") == "1"
+        _dbg_encs: list[str] = []
         for _ in range(n_rects):
             if offset + 12 > len(msg):
                 log.debug("FBU truncated at rect header (offset=%d)", offset)
+                if _dbg_cursor:
+                    log.info("FBU n_rects=%d encs=[%s] TRUNCATED len=%d",
+                             n_rects, ",".join(_dbg_encs), len(msg))
                 return
             f0, f1, f2, f3, encoding = struct.unpack(
                 ">HHHHi", msg[offset:offset + 12],
             )
             offset += 12
+            if _dbg_cursor:
+                _dbg_encs.append("0x%x@(%d,%d,%d,%d)" % (
+                    encoding & 0xffffffff, f0, f1, f2, f3))
             if encoding == 1104:
                 consumed = self._handle_cursor_rect(msg, offset, f0, f1, f2, f3)
                 if consumed < 0:
                     return
                 offset += consumed
-            elif encoding in (1010, 1011):
-                # Apple-private config blobs: u16 BE size + payload.
-                # We don't decode them but need to skip past so any
-                # cursor rect that follows in the same FBU is reached.
+            elif encoding in (1010, 1011, 0x3f2, 0x3f3, 0x3ea,
+                              0x453, 0x455, 0x456):
+                # Apple-private control-plane pseudo-encodings that all
+                # share one wire format: u16 BE payload_len + payload.
+                # These include the media-stream reconfig rects (0x453/
+                # 0x455/0x456) the daemon emits at a login/session switch.
+                # We don't decode them, but we MUST skip past them rather
+                # than abort the walk — otherwise a cursor rect (0x450/
+                # 1104) that follows in the SAME FBU is lost, which froze
+                # the cursor shape right after login. The reference C
+                # client (applehpdebug.c) skips this same set uniformly.
                 if offset + 2 > len(msg):
                     return
                 sz = struct.unpack(">H", msg[offset:offset + 2])[0]
@@ -2156,6 +2171,17 @@ class Session:
                 # fields (revision gap). Consume the rect and update
                 # the runtime canvas dimensions so the frontend can
                 # resize its framebuffer.
+                #
+                # A layout event marks a display/session transition — the
+                # point at which the daemon's cursor sender otherwise goes
+                # silent (the post-login/lock freeze). We re-arm the
+                # free-running TCP update sender (AutoFrameBufferUpdate 0x09 +
+                # non-incremental FBU request, like applehpdebug.c::
+                # apple_hp_request_full_refresh_now) at the END of this branch,
+                # AFTER the new backing dims are parsed below, so the 0x09
+                # region matches the geometry this layout announces rather than
+                # the previous (stale) one. Done on EVERY 0x451 so cursor
+                # (enc 1104) SELECTs keep flowing across a login/lock switch.
                 if offset + 2 > len(msg):
                     return
                 prefix_len = struct.unpack(">H", msg[offset:offset + 2])[0]
@@ -2164,6 +2190,7 @@ class Session:
                 # the RX thread (mirrors the 1010/1011 branch).
                 if offset + 2 + prefix_len > len(msg):
                     return
+                needs_post_layout_arm = False
                 if prefix_len >= 10:
                     sw = struct.unpack(">H", msg[offset + 4:offset + 6])[0]
                     sh = struct.unpack(">H", msg[offset + 6:offset + 8])[0]
@@ -2212,47 +2239,70 @@ class Session:
                             self._harvest_sps = None
                             self._harvest_pps = {}
                             log.info("AppleDisplayLayout: flagged param harvest for new canvas")
-                            # Re-arm: the server is waiting for a
-                            # full-refresh request at the new geometry
-                            # before it resumes the HEVC encoder.
-                            self._schedule_post_layout_arm()
+                            # The server is waiting for a full-refresh request
+                            # at the new geometry before it resumes the HEVC
+                            # encoder; do the media re-offer below, after the
+                            # cursor re-arm has sent the non-incremental FBUR.
+                            needs_post_layout_arm = True
+                # Re-arm the free-running TCP sender now that _runtime_canvas_w/h
+                # reflect THIS layout (0x09 + non-incremental FBUR). Always, so
+                # the cursor keeps flowing even on no-geometry-change layouts.
+                self._send_cursor_rearm()
+                if needs_post_layout_arm:
+                    # Geometry actually changed — additionally re-offer the
+                    # media session (0x1c) so the encoder restarts at the new
+                    # canvas. The FBUR it needs was just sent by the re-arm.
+                    self._schedule_post_layout_arm()
                 offset += 2 + prefix_len
             else:
                 # Unknown pseudo-encoding on the control channel — we
                 # can't tell its payload size, so we have to give up
-                # parsing the rest of this FBU. The next msg starts
-                # with a fresh type byte so this isn't fatal.
-                log.debug("FBU rect with unknown encoding=%d; aborting walk",
-                          encoding)
+                # parsing the rest of this FBU (dropping any cursor rect
+                # that follows). The next msg starts with a fresh type
+                # byte so this isn't fatal. Surface it under the cursor
+                # debug flag so a still-dropped cursor command is visible.
+                if _dbg_cursor:
+                    log.info("FBU walk ABORT at unknown encoding=0x%x (%d); "
+                             "encs so far=[%s] — rects after this are dropped",
+                             encoding & 0xffffffff, encoding,
+                             ",".join(_dbg_encs))
+                else:
+                    log.debug("FBU rect with unknown encoding=%d; aborting walk",
+                              encoding)
                 return
-        # Note: no re-arm. The daemon's cursor sender is a free-running
-        # pthread (SendFrameBuffer) that calls EncodeCursorImageWithAlpha
-        # whenever the host's cursor changes, gated by a single flag
-        # that's set once when SetEncodings advertises encoding 1104.
-        # msg 0x03 (FBU req) does NOT touch any cursor state and
-        # cannot trigger or accelerate cursor sends.
+        if _dbg_cursor and (n_rects != 1 or any("0x450" in e for e in _dbg_encs)):
+            # Log multi-rect FBUs and any FBU carrying a cursor (0x450/1104)
+            # rect, so we can see whether a cursor command is present but
+            # mis-framed vs genuinely absent during a post-login freeze.
+            log.info("FBU n_rects=%d encs=[%s]", n_rects, ",".join(_dbg_encs))
+        # No per-FBU re-arm. The daemon's TCP update sender free-runs once
+        # armed by AutoFrameBufferUpdate (0x09) — it does NOT need a fresh
+        # FramebufferUpdateRequest per rect. The native client confirms this:
+        # in the captured session it sends only a handful of non-incremental
+        # FBU requests total (at startup and at each AppleDisplayLayout), each
+        # paired with a 0x09, and never one-per-update. The re-arm that keeps
+        # the cursor flowing across a login/lock/agent switch is sent from the
+        # 0x451 handler below (AutoFrameBufferUpdate + non-incremental FBUR),
+        # mirroring applehpdebug.c::apple_hp_request_full_refresh_now.
 
     def _schedule_post_layout_arm(self) -> None:
-        """Called from TCP rx when 0x451 arrives. Re-arm with FBU request
-        AND re-offer the media session (0x1c) with the same SRTP keys so
-        the server restarts the HEVC encoder at the new canvas dimensions.
-        Without the 0x1c re-offer the server stops encoding — it won't
-        resize the media canvas without a fresh media-stream configuration.
+        """Called from the 0x451 handler on a geometry CHANGE. Re-offers the
+        media session (0x1c) with the same SRTP keys so the server restarts
+        the HEVC encoder at the new canvas dimensions. Without the 0x1c
+        re-offer the server stops encoding — it won't resize the media canvas
+        without a fresh media-stream configuration.
+
+        The non-incremental FBU request the encoder restart needs is already
+        sent by `_send_cursor_rearm()` immediately before this call (see the
+        0x451 handler), so this method no longer sends its own FBUR — that
+        avoided a duplicate full-refresh request per resize.
         """
         neg = self._negotiation
         if neg is None:
             return
-        from .protocol.negotiation import build_fbu_request, build_0x1c
+        from .protocol.negotiation import build_0x1c
 
-        # 1) FBU request at the new dimensions to re-arm TCP.
-        try:
-            neg.cipher.encrypt_and_send(
-                neg.sock, build_fbu_request(incremental=False)
-            )
-        except OSError:
-            pass
-
-        # 2) Re-offer the media session. We reuse the same SRTP keys —
+        # Re-offer the media session. We reuse the same SRTP keys —
         #    the server accepts this and restarts the encoder at the new
         #    canvas size. (The native app generates new keys for each
         #    round; we may revisit this once the full round-trip key
@@ -2273,6 +2323,39 @@ class Session:
 
         # 3) Defer FIR to the TX thread.
         self._needs_post_layout_fir = True
+
+    def _send_cursor_rearm(self) -> None:
+        """Re-arm the daemon's free-running TCP update sender so the cursor
+        pseudo-encoding (enc 1104) keeps flowing across a display/session
+        transition.
+
+        Mirrors applehpdebug.c::apple_hp_request_full_refresh_now: send
+        AutoFrameBufferUpdate (0x09) followed by a non-incremental
+        FramebufferUpdateRequest, using the backing (pixel) canvas dims for
+        the 0x09 region (the native uses apple_hp_backing_width/height). This
+        is lightweight — unlike _schedule_post_layout_arm it does NOT re-offer
+        the media session — so it's safe to call at every 0x451, including the
+        no-geometry-change layout events emitted at a login/lock/agent switch
+        (the case that froze the cursor before).
+        """
+        neg = self._negotiation
+        if neg is None:
+            return
+        from .protocol.negotiation import (
+            build_auto_framebuffer_update,
+            build_fbu_request,
+        )
+        # Backing/pixel dims for the AutoFrameBufferUpdate region. Fall back
+        # to full (0xFFFF) only if we don't yet have a runtime canvas.
+        rw = self._runtime_canvas_w or 0xFFFF
+        rh = self._runtime_canvas_h or 0xFFFF
+        try:
+            neg.cipher.encrypt_and_send(
+                neg.sock, build_auto_framebuffer_update(rw, rh))
+            neg.cipher.encrypt_and_send(
+                neg.sock, build_fbu_request(incremental=False))
+        except OSError as e:
+            log.debug("cursor re-arm (0x09 + FBUR) failed: %s", e)
 
     def _handle_cursor_rect(
         self, msg: bytes, offset: int,
@@ -2296,6 +2379,9 @@ class Session:
         payload_off = offset + 8
         if payload_off + comp_size > len(msg):
             return -1
+        if os.environ.get("ISS_CURSOR_DEBUG") == "1":
+            log.info("cursor-rect: dims=%dx%d hot=(%d,%d) cache_id=%d comp_size=%d",
+                     cursor_w, cursor_h, hotspot_x, hotspot_y, cache_id, comp_size)
         if comp_size == 0:
             # Cache hit: server sent just the cache_id. Pull our cached
             # cursor for this id and re-apply. Cache IDs are arbitrary
@@ -2376,6 +2462,12 @@ class Session:
     def _notify_cursor(self, img: Optional[_CursorImage]) -> None:
         self._cursor_msgs_processed += 1
         self._cursor_last_t = time.monotonic()
+        if os.environ.get("ISS_CURSOR_DEBUG") == "1":
+            if img is None:
+                log.info("cursor-notify: None (cache-miss / revert-to-default)")
+            else:
+                log.info("cursor-notify: %dx%d hotspot=(%d,%d)",
+                         img.width, img.height, img.hotspot_x, img.hotspot_y)
         cb = self._cursor_callback
         if cb is None:
             return

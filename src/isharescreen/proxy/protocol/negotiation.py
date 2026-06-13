@@ -182,6 +182,18 @@ def build_0x1c(
         # cursor instead. Set ISS_LEGACY_CURSOR=1 to disable and revert
         # to the old "cursor baked into framebuffer" behaviour.
         config_flags |= 4
+    # BIG-endian u32. DO NOT "correct" this to little-endian on the strength of
+    # screensharingd's disassembly alone — that is a trap. screensharingd loads
+    # this word at body+0x06 with an un-byteswapped `ldur w3, [body+6]`
+    # (sub_1000352ac @0x10003ce84) and forwards it to ScreensharingAgent as a
+    # SetMediaStreamConfiguration MIG argument. The do_not_send_cursor (bit
+    # 0x04) decision is made by the AGENT (sub_10001c7e4, `& 4`) AFTER the
+    # scalar crosses the MIG/NDR boundary, where it is byte-swapped — so the
+    # effective byte order at the test is the INVERSE of screensharingd's raw
+    # load. Empirically (test host 192.168.1.180): big-endian `00 00 00 07`
+    # makes the host honor do_not_send_cursor; little-endian `07 00 00 00`
+    # leaves it clear and the host bakes the cursor into the video → the
+    # double-cursor regression returns. The runtime behavior is authoritative.
     struct.pack_into(">I", buf, 6, config_flags)
     struct.pack_into(">H", buf, 10, AS)
     struct.pack_into(">H", buf, 12, VS)
@@ -505,6 +517,38 @@ def build_fbu_request(
     )
 
 
+# RFB client→server message type for Apple's AutoFrameBufferUpdate.
+APPLE_HP_MSG_AUTO_FRAMEBUFFER_UPDATE = 0x09
+
+
+def build_auto_framebuffer_update(width: int, height: int) -> bytes:
+    """Apple HP AutoFrameBufferUpdate (msg 0x09) — a 16-byte fixed record.
+
+    This is the message that arms the daemon's `SendFrameBuffer` loop to
+    *free-run* TCP-side updates (including the cursor pseudo-encoding 1104
+    SELECTs) without a fresh FramebufferUpdateRequest per frame. The native
+    client (applehpdebug.c::send_auto_framebuffer_update) re-sends it — paired
+    with a non-incremental FramebufferUpdateRequest — at startup and at every
+    AppleDisplayLayout (0x451) transition, which is what keeps the cursor
+    shape updating after a login/lock/agent switch.
+
+    Wire format (mirrors the native byte-for-byte):
+        [0]      0x09 message type
+        [1..2]   0x0000 padding
+        [3]      0x01  (enable)
+        [4..7]   0xffffffff
+        [8..11]  0x00000000
+        [12..13] u16 BE region width (backing/pixel dims)
+        [14..15] u16 BE region height
+    """
+    buf = bytearray(16)
+    buf[0] = APPLE_HP_MSG_AUTO_FRAMEBUFFER_UPDATE
+    buf[3] = 0x01
+    buf[4:8] = b"\xff\xff\xff\xff"
+    struct.pack_into(">HH", buf, 12, width & 0xFFFF, height & 0xFFFF)
+    return bytes(buf)
+
+
 def _phase_media_offer(
     sock: socket.socket, cipher: StreamCipher,
     audio_offer: bytes, video_offer: bytes,
@@ -541,8 +585,29 @@ def _phase_media_offer(
         except OSError as e:
             log.warning("msg 0x03 send failed: %s", e)
 
+    def _arm_auto_fbu(cv: tuple[int, int, int]) -> None:
+        # Arm the daemon's free-running TCP update sender once we know the
+        # canvas. The native client pairs a non-incremental FBU request
+        # (sent above) with AutoFrameBufferUpdate (0x09) so the cursor
+        # pseudo-encoding (enc 1104) SELECTs free-run without a per-frame
+        # request. Use backing/pixel dims for the region, like the native
+        # (applehpdebug.c uses apple_hp_backing_width/height).
+        if os.environ.get("ISS_LEGACY_CURSOR") == "1":
+            return
+        if not (cv[0] and cv[1]):
+            return
+        try:
+            sock.sendall(cipher.encrypt_message(
+                build_auto_framebuffer_update(cv[0], cv[1])
+            ))
+            log.info("msg 0x09 AutoFrameBufferUpdate sent (%dx%d, cursor re-arm)",
+                     cv[0], cv[1])
+        except OSError as e:
+            log.warning("msg 0x09 send failed: %s", e)
+
     canvas = _read_video_answer(sock, cipher, leftover_msgs)
     if canvas[0] and canvas[1]:
+        _arm_auto_fbu(canvas)
         return keys, canvas
 
     for attempt in range(_DEGENERATE_RETRY_LIMIT):
@@ -559,6 +624,7 @@ def _phase_media_offer(
         canvas = _read_video_answer(sock, cipher, leftover_msgs)
         if canvas[0] and canvas[1]:
             break
+    _arm_auto_fbu(canvas)
     return keys, canvas
 
 

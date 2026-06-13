@@ -21,9 +21,14 @@ as unwritten black padding, which `uv_scale` also crops out of sampling).
 from __future__ import annotations
 
 import logging
+import os
 
 import numpy as np
 import wgpu
+
+# Opt-in cursor-overlay diagnostics. Set ISS_CURSOR_DEBUG=1 to log, on a
+# throttle, why the overlay did or didn't draw each frame.
+_CURSOR_DEBUG = os.environ.get("ISS_CURSOR_DEBUG") == "1"
 
 
 log = logging.getLogger(__name__)
@@ -79,6 +84,42 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let g = y - 0.187324 * cb - 0.468124 * cr;
     let b = y + 1.8556   * cb;
     return vec4<f32>(r, g, b, 1.0);
+}
+"""
+
+
+# Cursor overlay: a single alpha-blended quad sampling an RGBA cursor
+# pixmap, positioned in NDC by a uniform rect. Drawn over the video in the
+# same pass so the host's separately-sent (enc 1104) cursor is rendered
+# crisp on the client instead of relying on the local OS cursor.
+WGSL_CURSOR = """
+struct CurU { rect: vec4<f32>, };   // (x0, y0, x1, y1) in NDC; y0=top
+@group(0) @binding(0) var<uniform> C: CurU;
+@group(0) @binding(1) var cur_tex: texture_2d<f32>;
+@group(0) @binding(2) var cur_samp: sampler;
+
+struct VOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> VOut {
+    // Triangle strip: TL, BL, TR, BR.
+    let xs = array<f32, 4>(C.rect.x, C.rect.x, C.rect.z, C.rect.z);
+    let ys = array<f32, 4>(C.rect.y, C.rect.w, C.rect.y, C.rect.w);
+    let us = array<f32, 4>(0.0, 0.0, 1.0, 1.0);
+    let vs_ = array<f32, 4>(0.0, 1.0, 0.0, 1.0);
+    var o: VOut;
+    o.pos = vec4<f32>(xs[i], ys[i], 0.0, 1.0);
+    o.uv = vec2<f32>(us[i], vs_[i]);
+    return o;
+}
+
+@fragment
+fn fs(in: VOut) -> @location(0) vec4<f32> {
+    // Straight alpha; the pipeline blend state composites over the video.
+    return textureSample(cur_tex, cur_samp, in.uv);
 }
 """
 
@@ -177,6 +218,65 @@ class Renderer:
             ],
         )
 
+        # ── cursor overlay ──────────────────────────────────────────────
+        # The host sends the cursor separately (enc 1104) and we render it
+        # here as a small alpha-blended quad over the video, so it stays
+        # crisp and the local OS cursor can be hidden. Texture + bind group
+        # are (re)built each time the shape changes; position/size come from
+        # a per-draw uniform. Until the first cursor pixmap arrives,
+        # `_cursor_tex` is None and the overlay draw is skipped.
+        self._cursor_tex = None
+        self._cursor_bind_group = None
+        self._cur_w = self._cur_h = 0
+        self._cur_hx = self._cur_hy = 0
+        self._cursor_pos: "tuple[int, int] | None" = None  # pointer, canvas texels
+        # Render scale for the cursor sprite = the local display's content
+        # scale (Retina factor). A cursor is a UI element drawn at the local
+        # display resolution, so its size must NOT scale with the video
+        # letterbox (which shrinks the remote canvas into the window).
+        self._cursor_scale = 1.0
+        self._cursor_sampler = device.create_sampler(
+            mag_filter=wgpu.FilterMode.nearest,
+            min_filter=wgpu.FilterMode.linear,
+        )
+        self._cursor_uniform_buf = device.create_buffer(
+            size=16,  # vec4 NDC rect
+            usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+        )
+        cur_shader = device.create_shader_module(code=WGSL_CURSOR)
+        self._cursor_bind_layout = device.create_bind_group_layout(entries=[
+            {"binding": 0, "visibility": wgpu.ShaderStage.VERTEX,
+             "buffer": {"type": wgpu.BufferBindingType.uniform}},
+            {"binding": 1, "visibility": wgpu.ShaderStage.FRAGMENT,
+             "texture": {"sample_type": wgpu.TextureSampleType.float,
+                         "view_dimension": "2d"}},
+            {"binding": 2, "visibility": wgpu.ShaderStage.FRAGMENT, "sampler": {}},
+        ])
+        self._cursor_pipeline = device.create_render_pipeline(
+            layout=device.create_pipeline_layout(
+                bind_group_layouts=[self._cursor_bind_layout]),
+            vertex={"module": cur_shader, "entry_point": "vs"},
+            fragment={
+                "module": cur_shader, "entry_point": "fs",
+                "targets": [{
+                    "format": surface_format,
+                    "blend": {
+                        "color": {
+                            "src_factor": wgpu.BlendFactor.src_alpha,
+                            "dst_factor": wgpu.BlendFactor.one_minus_src_alpha,
+                            "operation": wgpu.BlendOperation.add,
+                        },
+                        "alpha": {
+                            "src_factor": wgpu.BlendFactor.one,
+                            "dst_factor": wgpu.BlendFactor.one_minus_src_alpha,
+                            "operation": wgpu.BlendOperation.add,
+                        },
+                    },
+                }],
+            },
+            primitive={"topology": wgpu.PrimitiveTopology.triangle_strip},
+        )
+
     def upload_tile(self, tile_index: int, tile, slot_height: int) -> None:
         """Write tile's Y/U/V into the canvas-tile slice at row
         `tile_index * slot_height`.
@@ -257,6 +357,55 @@ class Renderer:
         ch = self._content_h or self._h
         return (min(cw, self._w), min(ch, self._h))
 
+    def set_cursor_image(self, img) -> None:
+        """Upload a new cursor pixmap (`_CursorImage`: RGBA8888 + hotspot) as
+        the overlay texture. `img is None` clears the overlay. MUST be called
+        on the render thread (creates a GPU texture)."""
+        if img is None:
+            self._cursor_tex = None
+            self._cursor_bind_group = None
+            return
+        w, h = int(img.width), int(img.height)
+        if w <= 0 or h <= 0:
+            self._cursor_tex = None
+            self._cursor_bind_group = None
+            return
+        tex = self._device.create_texture(
+            format=wgpu.TextureFormat.rgba8unorm,
+            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
+            size=(w, h, 1),
+        )
+        rgba = np.frombuffer(img.rgba, dtype=np.uint8)[: w * h * 4].reshape(h, w, 4)
+        self._device.queue.write_texture(
+            {"texture": tex, "origin": (0, 0, 0)},
+            np.ascontiguousarray(rgba),
+            {"offset": 0, "bytes_per_row": w * 4},
+            (w, h, 1),
+        )
+        self._cursor_tex = tex
+        self._cur_w, self._cur_h = w, h
+        self._cur_hx, self._cur_hy = int(img.hotspot_x), int(img.hotspot_y)
+        self._cursor_bind_group = self._device.create_bind_group(
+            layout=self._cursor_bind_layout,
+            entries=[
+                {"binding": 0, "resource": {"buffer": self._cursor_uniform_buf,
+                                            "offset": 0, "size": 16}},
+                {"binding": 1, "resource": tex.create_view()},
+                {"binding": 2, "resource": self._cursor_sampler},
+            ],
+        )
+
+    def set_cursor_pos(self, pos: "tuple[int, int] | None") -> None:
+        """Current pointer position in canvas-texel coords (same space as the
+        decoded content), or None when the pointer is off the content."""
+        self._cursor_pos = pos
+
+    def set_cursor_scale(self, scale: float) -> None:
+        """Local display content scale (Retina factor) — the cursor sprite is
+        drawn at `pixmap_size * scale` surface pixels, matching the size the
+        OS would show it, independent of the video letterbox."""
+        self._cursor_scale = max(0.1, float(scale))
+
     def draw(
         self, target_view: wgpu.GPUTextureView,
         target_w: int, target_h: int,
@@ -293,6 +442,7 @@ class Renderer:
             scale = min(target_w / cw, target_h / ch)
             vw, vh = cw * scale, ch * scale
         else:
+            scale = 1.0
             vw, vh = float(target_w), float(target_h)
         viewport = ((target_w - vw) * 0.5, (target_h - vh) * 0.5, vw, vh)
         encoder = self._device.create_command_encoder()
@@ -306,6 +456,50 @@ class Renderer:
         rpass.set_bind_group(0, self._bind_group)
         rpass.set_viewport(*viewport, 0.0, 1.0)
         rpass.draw(3)
+
+        # Cursor overlay: place the pixmap at the pointer (canvas texels),
+        # mapped through the same letterbox transform as the video. The
+        # content sub-rect maps onto `viewport` at uniform `scale`, so a
+        # canvas coord c → screen px = viewport_offset + c * scale.
+        _overlay_ok = (
+            self._cursor_tex is not None and self._cursor_bind_group is not None
+            and self._cursor_pos is not None and target_w > 0 and target_h > 0)
+        if _CURSOR_DEBUG:
+            self._dbg_n = getattr(self, "_dbg_n", 0) + 1
+            if self._dbg_n % 30 == 0:
+                log.info(
+                    "cursor-overlay draw=%s tex=%s bind=%s pos=%s size=%dx%d "
+                    "sprite=%dx%d scale=%.2f",
+                    _overlay_ok, self._cursor_tex is not None,
+                    self._cursor_bind_group is not None, self._cursor_pos,
+                    target_w, target_h, self._cur_w, self._cur_h,
+                    self._cursor_scale,
+                )
+        if _overlay_ok:
+            cx, cy = self._cursor_pos
+            vx, vy = viewport[0], viewport[1]
+            d = self._cursor_scale
+            # Pointer maps through the letterbox; the sprite is sized to the
+            # local display (a cursor must not shrink with the video zoom).
+            px = vx + cx * scale
+            py = vy + cy * scale
+            sw = self._cur_w * d
+            sh = self._cur_h * d
+            sx = px - self._cur_hx * d
+            sy = py - self._cur_hy * d
+            x0 = sx / target_w * 2.0 - 1.0
+            x1 = (sx + sw) / target_w * 2.0 - 1.0
+            y0 = 1.0 - sy / target_h * 2.0
+            y1 = 1.0 - (sy + sh) / target_h * 2.0
+            self._device.queue.write_buffer(
+                self._cursor_uniform_buf, 0,
+                np.array([x0, y0, x1, y1], dtype=np.float32).tobytes(),
+            )
+            rpass.set_pipeline(self._cursor_pipeline)
+            rpass.set_bind_group(0, self._cursor_bind_group)
+            rpass.set_viewport(0.0, 0.0, float(target_w), float(target_h), 0.0, 1.0)
+            rpass.draw(4)
+
         rpass.end()
         self._device.queue.submit([encoder.finish()])
 
