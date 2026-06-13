@@ -100,6 +100,10 @@ class NegotiationResult:
     sock: socket.socket
     cipher: StreamCipher
     keys: NegotiationKeys
+    # 16-byte post-auth enc1103 master key (sha256(SRP_K)[:16]). This is the
+    # dissector's `--initial-key-hex`; the session persists it next to a
+    # `--record` pcap so captures decode without a wrapper.
+    ecb_key: bytes
     server_width: int
     server_height: int
     canvas_width: int
@@ -701,6 +705,7 @@ def connect_and_negotiate(
         sock=sock,
         cipher=cipher,
         keys=keys,
+        ecb_key=ecb_key,
         server_width=server_w,
         server_height=server_h,
         canvas_width=canvas_w,

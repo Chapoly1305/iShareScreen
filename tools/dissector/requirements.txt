@@ -1,0 +1,5 @@
+scapy==2.7.0
+pycryptodome==3.23.0
+pylibsrtp==1.0.0
+av==17.1.0
+numpy>=1.26
