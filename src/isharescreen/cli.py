@@ -78,12 +78,23 @@ def _make_parser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("display")
     g.add_argument(
-        "--advertise", metavar="WxH[@HIDPI]", default=None,
+        "--advertise", metavar="WxH[@HIDPI]|auto", default=None,
         help=(
             "virtual display geometry advertised to the host "
-            "(e.g. '2560x1440' or '1920x1200@2'). When omitted, the "
-            "interactive prompt asks for a resolution preset "
-            "(default 1920x1200)."
+            "(e.g. '2560x1440' or '1920x1200@2'). 'auto' (the default "
+            "when omitted) sizes the virtual display to the local viewer "
+            "window/monitor and tracks resizes (see --dynamic)."
+        ),
+    )
+    g.add_argument(
+        "--dynamic", action=argparse.BooleanOptionalAction, default=None,
+        help=(
+            "re-advertise the host's virtual display to match the viewer "
+            "window whenever it's resized, so the remote re-renders sharp "
+            "instead of stretching. Each change is a brief media-session "
+            "restart. Defaults on when --advertise is 'auto'/omitted, off "
+            "for an explicit WxH (use --dynamic to force-enable, "
+            "--no-dynamic to pin a fixed canvas)."
         ),
     )
     g.add_argument(
@@ -158,7 +169,9 @@ def _make_parser() -> argparse.ArgumentParser:
 # ── value parsing ────────────────────────────────────────────────────
 
 def _parse_advertise(spec: Optional[str]) -> Optional[AdvertiseDims]:
-    if not spec:
+    # None / "" / "auto" all mean "no fixed geometry" — the desktop viewer
+    # auto-detects from the local monitor and (by default) tracks resizes.
+    if not spec or spec.strip().lower() == "auto":
         return None
     geom_part, _, hidpi_part = spec.partition("@")
     try:
@@ -213,6 +226,12 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
     use goes through `isharescreen.tui` instead."""
     cli_password = _password_from_args(args)
     cli_advertise = _parse_advertise(args.advertise)
+    # Dynamic resolution: explicit --dynamic/--no-dynamic wins; otherwise
+    # default it on exactly when no fixed geometry was given (advertise is
+    # 'auto'/omitted ⇒ cli_advertise is None).
+    dynamic_resolution = (
+        args.dynamic if args.dynamic is not None else cli_advertise is None
+    )
     missing = [
         label for label, value in
         (("--host", args.host), ("-u/--user", args.user),
@@ -229,6 +248,7 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
         username=args.user, password=cli_password or "",
         auth_mode=args.auth,
         advertise=cli_advertise,
+        dynamic_resolution=dynamic_resolution,
         hdr=args.hdr,
         curtain=args.curtain,
         audio=args.audio,

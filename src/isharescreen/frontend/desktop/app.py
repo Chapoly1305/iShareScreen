@@ -8,6 +8,7 @@ on the render thread.
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import threading
@@ -18,6 +19,7 @@ import glfw
 import wgpu
 from rendercanvas.glfw import RenderCanvas
 
+from ...proxy.protocol.negotiation import AdvertiseDims
 from ...proxy.session import Session, SessionConfig
 from .audio_sink import make_audio_sink
 from .gpu import Renderer
@@ -43,6 +45,60 @@ log = logging.getLogger(__name__)
 _FRESH_TILE_WAIT_S = 0.005
 
 
+# ── dynamic resolution ───────────────────────────────────────────────
+# When the viewer window is resized we re-advertise the host's virtual
+# display to match (Session.send_dynamic_resolution), so the remote
+# re-renders sharp at the new size instead of stretching a fixed canvas.
+# This is an IN-BAND request on the live connection (no reconnect), but
+# the server still has to restart the HEVC encoder, so we debounce +
+# threshold the requests so a click-drag resize doesn't fire one per pixel.
+_RESIZE_DEBOUNCE_S = 0.5        # window must hold a new size this long
+_RESIZE_MIN_DELTA_PX = 32       # ignore sub-threshold jitter on either axis
+_RESIZE_MIN_INTERVAL_S = 2.5    # floor between consecutive resize requests
+_MIN_ADVERTISE_W = 640
+_MIN_ADVERTISE_H = 480
+_MAX_ADVERTISE_W = 1920  # server backing 3840 / mode-table ratio 2
+_MAX_ADVERTISE_H = 1080
+
+
+def _even(n: int) -> int:
+    """Round down to an even number. HEVC tile geometry prefers even
+    dimensions; odd sizes can confuse the encoder's CTU padding."""
+    return n - (n & 1)
+
+
+def _auto_advertise_dims() -> tuple[int, int]:
+    """Initial virtual-display size when no fixed --advertise was given:
+    ~85% of the primary monitor's work area (its usable region, minus
+    menu bar / dock / taskbar) so the viewer opens clearly windowed and
+    resizable. Returns logical screen-coordinate units — the same space
+    glfw.get_window_size() reports, which the input mapper and the
+    resize tracker both use. Falls back to 1280x800 when no monitor can
+    be enumerated (headless / unusual WM)."""
+    ww = wh = 0
+    try:
+        glfw.init()  # idempotent; rendercanvas re-inits when it builds the window
+        mon = glfw.get_primary_monitor()
+        if mon:
+            area = glfw.get_monitor_workarea(mon)
+            if area and area[2] > 0 and area[3] > 0:
+                ww, wh = area[2], area[3]
+            else:
+                vm = glfw.get_video_mode(mon)
+                ww, wh = vm.size.width, vm.size.height
+    except Exception as e:
+        log.warning("monitor auto-detect failed (%s); falling back to 1280x800", e)
+    if ww <= 0 or wh <= 0:
+        ww, wh = 1280, 800
+    # Clamp to the same cap the resize path uses (_MAX_ADVERTISE). On a
+    # large monitor an un-clamped 0.85×work-area would build a 0x1d whose
+    # scaled mode-table rows exceed the advertised max_width/height, which
+    # the server answers with a degenerate fallback canvas.
+    w = max(_MIN_ADVERTISE_W, min(_even(int(ww * 0.85)), _MAX_ADVERTISE_W))
+    h = max(_MIN_ADVERTISE_H, min(_even(int(wh * 0.85)), _MAX_ADVERTISE_H))
+    return w, h
+
+
 def run(
     config: SessionConfig,
     *,
@@ -53,6 +109,17 @@ def run(
     """Open the window streaming `config`. Blocks until close (or
     `auto_quit_secs` elapses; 0 = forever)."""
     log.info("opening desktop frontend → %s", config.host)
+    # Dynamic resolution: with no fixed --advertise, size the host's
+    # virtual display to the local monitor before connecting; if dynamic
+    # tracking is on, the render loop re-advertises on window resize.
+    dynamic = config.dynamic_resolution
+    if config.advertise is None:
+        aw, ah = _auto_advertise_dims()
+        config = dataclasses.replace(
+            config, advertise=AdvertiseDims(width=aw, height=ah, hidpi_scale=1),
+        )
+        log.info("auto-detected initial viewer size %dx%d (dynamic=%s)",
+                 aw, ah, dynamic)
     session = Session(config)
     session.connect()
 
@@ -105,7 +172,8 @@ def run(
 
     session.set_cursor_callback(_on_cursor)
 
-    canvas_w, canvas_h = session.canvas_dims
+    canvas_w, canvas_h = session.canvas_dims  # backing/pixel size for GPU
+    scaled_w, scaled_h = session.scaled_dims  # logical size for window
     server_w, server_h = session.server_dims
     num_tiles = session.num_tiles
     # Apple's HEVC encodes each tile padded up to a CTU boundary —
@@ -113,20 +181,21 @@ def run(
     # you'd get from canvas_h//num_tiles. Refined to tile.height on the
     # first tile that arrives.
     slot_h = canvas_h // num_tiles
-    log.info("session ready: canvas=%dx%d server=%dx%d tiles=%d hw=%s",
-             canvas_w, canvas_h, server_w, server_h, num_tiles,
-             session.hw_accel)
+    log.info("session ready: canvas=%dx%d scaled=%dx%d server=%dx%d tiles=%d hw=%s",
+             canvas_w, canvas_h, scaled_w, scaled_h, server_w, server_h,
+             num_tiles, session.hw_accel)
 
     # ── window + wgpu surface ──────────────────────────────────────────
-    window = RenderCanvas(title=title, size=(canvas_w, canvas_h), max_fps=120)
+    win_w = scaled_w or canvas_w
+    win_h = scaled_h or canvas_h
+    window = RenderCanvas(title=title, size=(win_w, win_h), max_fps=120)
     glfw_window = window._window  # for raw glfw input callbacks only
-    # Window resizes freely. The viewport always fills the window, so
-    # the decoded video stretches to whatever aspect the user picks.
-    # That's deliberate: when the advertised resolution doesn't match
-    # the host's panel aspect, Apple's encoder bakes black bars into
-    # the video; stretching to fill hides those bars at the cost of
-    # mild aspect distortion when the user resizes off-aspect. No GPU
-    # cost — it's the same shader pass either way.
+    # Window resizes freely. When the host fell back to a frame smaller
+    # than the advertised canvas, the renderer (see gpu.Renderer.draw)
+    # centers that real frame in the window at its native on-screen size
+    # so the leftover shows as symmetric black bars on all four sides,
+    # rather than pinning the image to the top-left corner. Matches
+    # Apple's native viewer.
 
     adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
     device = adapter.request_device_sync()
@@ -150,11 +219,16 @@ def run(
         """Map glfw cursor (in glfw window coords) → canvas coords for
         `InputController.pointer_event`.
 
-        glfw's cursor callback delivers coords in the same coordinate
-        space as `glfw.get_window_size()`. With the aspect-lock above,
-        the window dimensions are always the canvas scaled by some
-        positive factor on both axes, so a single proportional rescale
-        on each axis maps cursor → canvas exactly.
+        This MUST invert the exact transform in `gpu.Renderer.draw`: the
+        decoded content (`content_dims()`, pinned to the top-left of the
+        canvas textures) is scaled by ONE uniform factor — the largest that
+        fits the window — then centered, with black bars filling the rest.
+        So here: undo the centering offset, divide into the centered content
+        rect, then map onto the content's texels. A cursor over a black bar
+        clamps to the nearest content edge. The window→content fractions are
+        identical whether measured in logical points (this function) or
+        physical surface pixels (draw's target), so `glfw.get_window_size`
+        points are the right space.
 
         Maps to canvas dims, NOT server-init dims: the daemon's
         composite ServerInit (e.g. 2940×1912 when a SkyLight virtual
@@ -164,8 +238,22 @@ def run(
         win_w, win_h = glfw.get_window_size(glfw_window)
         if win_w == 0 or win_h == 0:
             return None
-        sx = int(wx * canvas_w / win_w)
-        sy = int(wy * canvas_h / win_h)
+        cw, ch = renderer.content_dims()  # real frame size, canvas texels
+        if cw <= 0 or ch <= 0 or canvas_w <= 0 or canvas_h <= 0:
+            return None
+        # Mirror draw()'s uniform-scale fit: one factor on both axes (so the
+        # mapping never skews), sized to the largest content rect that fits
+        # the window, then centered.
+        scale = min(win_w / cw, win_h / ch)
+        rect_w = cw * scale
+        rect_h = ch * scale
+        ox, oy = (win_w - rect_w) / 2.0, (win_h - rect_h) / 2.0
+        u = (wx - ox) / rect_w if rect_w else 0.0
+        v = (wy - oy) / rect_h if rect_h else 0.0
+        u = min(1.0, max(0.0, u))
+        v = min(1.0, max(0.0, v))
+        sx = int(u * cw)
+        sy = int(v * ch)
         return (max(0, min(canvas_w - 1, sx)),
                 max(0, min(canvas_h - 1, sy)))
 
@@ -328,10 +416,7 @@ def run(
     def draw_callback():
         try:
             target = surface_ctx.get_current_texture()
-            renderer.draw(
-                target.create_view(),
-                (0.0, 0.0, float(target.width), float(target.height)),
-            )
+            renderer.draw(target.create_view(), target.width, target.height)
         except Exception as e:
             msg = str(e)
             if "device is lost" in msg.lower() or "Validation Error" in msg:
@@ -499,6 +584,86 @@ def run(
             return
         _set_cursor_now(img)
 
+    # ── dynamic-resolution resize tracking ─────────────────────────────
+    # Mid-session resolution change works on the existing TCP connection:
+    # send_dynamic_resolution() → 0x1d → server sends 0x451 → client
+    # re-offers 0x1c with same keys → server restarts HEVC encoder at
+    # new resolution → param sets harvested → decoder restarted → video
+    # resumes sharp. No reconnect, no re-auth. The canvas change is
+    # visible to the render loop via `canvas_dims` which checks
+    # `_runtime_canvas_w/h` updated by the 0x451 handler.
+    cur_adv_w, cur_adv_h = glfw.get_window_size(glfw_window)
+    pending_size: Optional[tuple[int, int]] = None
+    pending_since = 0.0
+    last_resize_t = 0.0
+
+    def _apply_new_canvas() -> None:
+        nonlocal canvas_w, canvas_h, num_tiles, slot_h, slot_h_resolved
+        nonlocal first_seen, renderer, cur_adv_w, cur_adv_h
+        canvas_w, canvas_h = session.canvas_dims
+        scaled_w, scaled_h = session.scaled_dims
+        num_tiles = session.num_tiles
+        slot_h = canvas_h // num_tiles if num_tiles else canvas_h
+        slot_h_resolved = False
+        first_seen = [False] * num_tiles
+        renderer = Renderer(device, surface_format, canvas_w, canvas_h)
+        # Do NOT snap the window to the server's reply. Native keeps the
+        # window where the user put it (including fullscreen) and centers
+        # the remote frame inside it; when the remote can't fulfil the
+        # request it returns a smaller / different-aspect canvas and the
+        # renderer letter/pillarboxes it (see gpu.Renderer.draw). Snapping
+        # here would instead shrink a fullscreen window down to the remote's
+        # reply — the opposite of the native behaviour we're matching.
+        #
+        # Re-sync the resize guard to the ACTUAL window size (not the
+        # server's reply). The window hasn't moved, so a reply smaller than
+        # the window must NOT read as a fresh resize — otherwise _poll_resize
+        # would re-fire every interval forever.
+        ww, wh = glfw.get_window_size(glfw_window)
+        cur_adv_w, cur_adv_h = _even(ww), _even(wh)
+        log.info("dynamic resize: canvas=%dx%d scaled=%dx%d window=%dx%d "
+                 "tiles=%d hw=%s",
+                 canvas_w, canvas_h, scaled_w, scaled_h, cur_adv_w, cur_adv_h,
+                 num_tiles, session.hw_accel)
+
+    def _poll_resize() -> None:
+        nonlocal pending_size, pending_since, last_resize_t, cur_adv_w, cur_adv_h
+        now = time.monotonic()
+        win_w, win_h = glfw.get_window_size(glfw_window)
+        if win_w <= 0 or win_h <= 0:
+            return
+        tw, th = _even(win_w), _even(win_h)
+        if (abs(tw - cur_adv_w) >= _RESIZE_MIN_DELTA_PX
+                or abs(th - cur_adv_h) >= _RESIZE_MIN_DELTA_PX):
+            if pending_size != (tw, th):
+                pending_size = (tw, th)
+                pending_since = now
+        else:
+            pending_size = None
+        if (pending_size is not None
+                and now - pending_since >= _RESIZE_DEBOUNCE_S
+                and now - last_resize_t >= _RESIZE_MIN_INTERVAL_S):
+            nw = max(_MIN_ADVERTISE_W, min(pending_size[0], server_w,
+                                           _MAX_ADVERTISE_W))
+            nh = max(_MIN_ADVERTISE_H, min(pending_size[1], server_h,
+                                           _MAX_ADVERTISE_H))
+            # Advance the guard to the WINDOW size we acted on (tw,th),
+            # NOT the clamped request (nw,nh). If the window is larger
+            # than the cap, the request is clamped but the window stays
+            # big; comparing future polls against the clamped value would
+            # leave abs(window - cur_adv) above threshold forever and
+            # re-fire a resize every interval. Tracking the window size
+            # means a stable (if oversized) window never re-fires.
+            cur_adv_w, cur_adv_h = tw, th
+            pending_size = None
+            last_resize_t = now
+            log.info("resize → requesting %dx%d", nw, nh)
+            try:
+                session.send_dynamic_resolution(nw, nh)
+            except Exception as e:
+                log.error("send_dynamic_resolution failed: %s", e)
+                return
+
     while time.monotonic() < deadline:
         glfw.poll_events()
         _apply_pending_cursor()
@@ -506,9 +671,18 @@ def run(
             break
         if _device_lost["v"]:
             break
+
+        if dynamic:
+            _poll_resize()
         if not session.is_connected:
             log.error("connection lost — closing viewer")
             break
+
+        # Detect canvas changes from 0x451 handler.
+        new_cw, new_ch = session.canvas_dims
+        if (new_cw, new_ch) != (canvas_w, canvas_h) and new_cw and new_ch:
+            _apply_new_canvas()
+
         session.wait_for_fresh_tile(timeout=_FRESH_TILE_WAIT_S)
 
         # Drain fresh decoded frames + upload.

@@ -2,11 +2,12 @@
 options and posts a `Connect` message when the user submits. Replaces the
 old stdin/stdout `connect_prompt.py`.
 
-Resolution presets mirror the ones the old prompt offered, so users with
-muscle memory for "1920×1080 (FHD)" find the same picks here. The
-default is the same too (`1600 × 900`); the form is laid out so Enter
-on a freshly opened screen connects with sensible defaults the moment
-the host field is filled in.
+The Resolution field defaults to "Auto" — the host's virtual display is
+sized to the local viewer window/monitor and tracks resizes, so users no
+longer have to pick a number to get a good fit. The fixed presets remain
+for anyone who wants to pin one. The form is laid out so Enter on a
+freshly opened screen connects with sensible defaults the moment the host
+field is filled in.
 """
 from __future__ import annotations
 
@@ -37,9 +38,12 @@ _PROBE_DEBOUNCE_S: float = 0.5
 _PROBE_TIMEOUT_S: float = 1.5
 
 
-# (label, "WxH", optional hidpi). Keep in sync with the old
-# `connect_prompt._RESOLUTION_PRESETS`.
+# (label, value). The "auto" value means: size the host's virtual
+# display to the local viewer window/monitor and track resizes (dynamic
+# resolution) — the friendly default, so users no longer have to guess a
+# fixed number. The fixed presets remain for anyone who wants to pin one.
 _RESOLUTION_PRESETS: list[tuple[str, str]] = [
+    ("Auto — match window (dynamic)", "auto"),
     ("3840 × 2160 (4K UHD)",   "3840x2160"),
     ("3440 × 1440 (UWQHD)",    "3440x1440"),
     ("2560 × 1600 (WQXGA)",    "2560x1600"),
@@ -53,7 +57,7 @@ _RESOLUTION_PRESETS: list[tuple[str, str]] = [
     ("1024 ×  768 (XGA)",      "1024x768"),
     (" 800 ×  600 (SVGA)",     "800x600"),
 ]
-_DEFAULT_RESOLUTION = "1920x1080"  # native-FHD = the safest pick
+_DEFAULT_RESOLUTION = "auto"  # auto-detect + dynamic = the friendly default
 
 
 @dataclass(slots=True)
