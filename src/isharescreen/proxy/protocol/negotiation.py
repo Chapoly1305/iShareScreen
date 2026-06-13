@@ -143,7 +143,7 @@ def build_0x1c(
         +0x00   u8           msg type = 0x1c
         +0x02   u16 BE       MS = audio_size + video_size + 0xd8
         +0x04   u16 BE       version = 3
-        +0x06   u32 BE       reserved = 3
+        +0x06   u32 LE       flags = 3 (host-endian; see note below)
         +0x0a   u16 BE       audio_size
         +0x0c   u16 BE       video_size
         +0x14   16 bytes     CallID UUID
@@ -186,7 +186,14 @@ def build_0x1c(
         # cursor instead. Set ISS_LEGACY_CURSOR=1 to disable and revert
         # to the old "cursor baked into framebuffer" behaviour.
         config_flags |= 4
-    struct.pack_into(">I", buf, 6, config_flags)
+    # Host (little-endian) u32 — NOT big-endian like the size/version/offer
+    # fields around it. screensharingd reads this word with an un-byteswapped
+    # load (`ldur w3,[body+6]`) and the agent tests the low bits (& 1/2/4/8),
+    # so the flag bits must sit in the byte at +0x06. Packing this big-endian
+    # (`>I`) puts them in the high byte instead, where the server sees nothing
+    # — i.e. the 60fps / no-cursor flags were silently dropped. Verified
+    # against the 24G231 screensharingd::sub_1000352ac.
+    struct.pack_into("<I", buf, 6, config_flags)
     struct.pack_into(">H", buf, 10, AS)
     struct.pack_into(">H", buf, 12, VS)
     buf[0x14:0x24] = uuid.uuid4().bytes
