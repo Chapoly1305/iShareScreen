@@ -1379,6 +1379,50 @@ class Session:
         except OSError as e:
             log.debug("LTR ack send failed: %s", e)
 
+    def _dpb_trace(self, msg: str) -> None:
+        """ISS_DPB_TRACE=1 diagnostic. Classify a libav 'Could not find
+        ref with POC N' as EVICTED (we fed POC N but libav dropped it
+        from its DPB → the decoder retains too few frames) vs GAP (we
+        never fed N → transport loss / pre-IDR drop / reorder). The RPS
+        tracker's `_seen_pocs` never evicts, so membership == 'we fed
+        this exact POC at least once'. `lsb_hit` guards against an
+        MSB-derivation mismatch between libav and our tracker: a POC we
+        fed under a different MSB still shows the same poc_lsb."""
+        dec = self._decoder
+        if dec is None:
+            return
+        low = msg.lower()
+        i = low.rfind("poc")
+        if i < 0:
+            return
+        digits = ""
+        for ch in msg[i + 3:]:
+            if ch.isdigit() or (ch == "-" and not digits):
+                digits += ch
+            elif digits:
+                break
+        try:
+            poc = int(digits)
+        except ValueError:
+            return
+        try:
+            seen = frozenset(dec._rps_tracker._seen_pocs)
+        except Exception:
+            return
+        in_seen = poc in seen
+        lsb = poc % 2048
+        lsb_hit = in_seen or any((p % 2048) == lsb for p in seen)
+        mx = max(seen) if seen else -1
+        mn = min(seen) if seen else -1
+        log.warning(
+            "DPBTRACE poc=%d %s dist_from_max=%d lsb_hit=%s "
+            "seen_count=%d seen_range=[%d..%d]",
+            poc,
+            "EVICTED(fed-then-dropped)" if in_seen else "GAP(never-fed)",
+            (mx - poc) if mx >= 0 else -1,
+            lsb_hit, len(seen), mn, mx,
+        )
+
     # ── libav log → decoder-concealment hook ──────────────────────────
     # PyAV forwards libav log messages into the Python `logging`
     # module under loggers named like `libav.h265`, `libav.hevc`,
@@ -1574,6 +1618,8 @@ class Session:
             if now - self._last_dpb_error_t > self._DPB_STORM_RESET_S:
                 self._dpb_fir_count = 0
             self._last_dpb_error_t = now
+            if os.environ.get("ISS_DPB_TRACE") == "1":
+                self._dpb_trace(msg)
             events = self._dpb_error_window
             events.append(now)
             cutoff = now - self._DPB_ERR_WINDOW_S
