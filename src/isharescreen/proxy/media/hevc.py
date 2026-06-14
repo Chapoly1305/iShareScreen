@@ -59,6 +59,15 @@ log = logging.getLogger(__name__)
 
 _NAL_START_CODE = b"\x00\x00\x00\x01"
 
+# nv24 (Apple's HW VideoToolbox 4:4:4 biplanar output) is delivered to the GPU
+# as a passthrough TileFrame (raw interleaved UV, `v is None`) and deinterleaved
+# in the fragment shader from an rg8unorm texture. Set ISS_LEGACY_CHROMA=1 to
+# fall back to the old CPU-side strided deinterleave (one full UV gather per
+# tile per frame — ~half a core at 4-tile/60fps; the passthrough path is ~49×
+# cheaper). The escape hatch exists in case the rg8 sampling misbehaves on a
+# given GPU; both the decoder and renderer honour it.
+_LEGACY_CHROMA = os.environ.get("ISS_LEGACY_CHROMA") == "1"
+
 # libavcodec flags. AV_CODEC_FLAG_LOW_DELAY = 0x80000 disables frame
 # reordering buffers. AV_CODEC_FLAG2_FAST = 0x400000 enables non-bitexact
 # but faster decode paths (acceptable for live screen-share).
@@ -201,13 +210,36 @@ def _av_frame_to_tile(
             chroma_height=chroma_h,
         ), had_error
 
-    if fmt in ("nv24", "nv42"):
+    if fmt == "nv24" and not _LEGACY_CHROMA:
         # Biplanar 4:4:4: Y plane + full-resolution interleaved UV. This is
         # what VideoToolbox delivers for HEVC RExt 4:4:4 8-bit streams (the
         # libavcodec name for the CV format `444f`/`kCVPixelFormatType_
-        # 444YpCbCr8BiPlanarFullRange`). Apple's screen-share is the
-        # canonical example. Same deinterleave as NV12 but at full chroma
-        # resolution.
+        # 444YpCbCr8BiPlanarFullRange`). Apple's screen-share is the canonical
+        # example and the perf-critical hot path.
+        #
+        # Fast path: hand the interleaved UV plane to the GPU verbatim
+        # (`v is None` passthrough) and let the fragment shader read Cb/Cr
+        # from an rg8unorm texture's .r/.g. This skips the per-tile strided
+        # deinterleave entirely — the single biggest CPU cost in the live
+        # pipeline (~half a core at 4-tile/60fps under the GIL). nv24 byte
+        # order is Cb,Cr → texel .r=Cb (U), .g=Cr (V), matching the planar
+        # path below. The two `bytes()` calls own the data for the deferred
+        # render-thread upload (the av frame is recycled after we return).
+        yp = frame.planes[0]
+        uvp = frame.planes[1]
+        return TileFrame(
+            y=bytes(yp), u=bytes(uvp), v=None,
+            width=width, height=height,
+            y_stride=yp.line_size,
+            uv_stride=uvp.line_size,   # interleaved row pitch (≥ 2*width bytes)
+            chroma_width=width,        # rg8 texels per row
+            chroma_height=height,
+        ), had_error
+
+    if fmt in ("nv24", "nv42"):
+        # Biplanar 4:4:4 CPU deinterleave — the universal fallback (nv42, or
+        # nv24 under ISS_LEGACY_CHROMA). Same deinterleave as NV12 but at full
+        # chroma resolution.
         yp = frame.planes[0]
         uvp = frame.planes[1]
         uv_view = (
