@@ -196,13 +196,29 @@ def build_virtual_display(
     `hidpi_scale=1` flat-encodes at the requested resolution.
 
     `alt_user_login=True` flips a single byte at displayInfo+0x99 to 0x07.
-    Captured Apple Screen Sharing traffic for the cmd=2 alt-user path
-    sets this byte; with it clear, the daemon's `createLoginWindow=1`
-    branch leaves `virtualDisplayCount=0` and the encoder targets the
-    *console* user's screen instead of the alt-user vdisplay we just
-    spawned. Other deltas in Apple's captured cmd=2 SDC (specific name
-    string, MBP-shaped width_mm/height_mm, heterogeneous 5-mode list)
-    appear to be informational; this one byte is the magic bit.
+    That byte is the low byte of the displayInfo `rotations` u32 at +0x96.
+
+    CAUTION: an earlier reading (below) treated this byte as the "magic
+    bit" that makes the daemon target the alt-user vdisplay instead of the
+    *console* screen. Decompiling screensharingd + ScreensharingAgent
+    (a recent macOS build) contradicts that: +0x96 is logged as `rotations` and forwarded
+    verbatim to `SLVirtualDisplaySettings ...rotations:`, and *neither
+    binary branches on +0x96/+0x99*. The console-vs-login-window choice is
+    actually driven by a runtime session probe plus the `BlankScreen`
+    CFPreference, not this descriptor field. A live re-test confirmed this:
+    running the alt-session path with this byte = 0 vs = 0x07 produced
+    byte-identical protocol behavior (same conn1/conn2 auth, ServerInit
+    geometry, enc1103, and cmd=2 dance) — no observable effect, matching
+    the decompilation. (Caveat: on the test host the connecting user was
+    the console user, so alt-session streamed 0 frames either way and the
+    feature itself was not exercised end-to-end.) The write is retained out
+    of caution; drop it once alt-session is validated on a true
+    non-console-user host.
+
+    Earlier (unverified) note: "captured cmd=2 alt-user traffic sets this
+    byte; with it clear the daemon's createLoginWindow=1 branch leaves
+    virtualDisplayCount=0 and targets the console screen." Believed to be a
+    misattribution given the decompilation above.
     """
     pts_w = width * hidpi_scale
     pts_h = height * hidpi_scale
@@ -212,7 +228,10 @@ def build_virtual_display(
 
     di = bytearray(di_size)
     struct.pack_into(">H", di, 0x00, di_size)
-    name_bytes = display_name.encode("utf-8")[:121]  # leave 1 byte for NUL at +0x79
+    # Region is D+0x02..+0x79 (120 bytes). Cap at 119 so a NUL fits at +0x79
+    # and the write cannot overrun display_flags at +0x7a. (Was [:121], which
+    # could write through +0x7a for names >119 bytes.)
+    name_bytes = display_name.encode("utf-8")[:119]
     di[0x02:0x02 + len(name_bytes)] = name_bytes
     struct.pack_into(">f", di, 0x82, width_mm)
     struct.pack_into(">f", di, 0x86, height_mm)
