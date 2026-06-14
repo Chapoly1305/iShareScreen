@@ -56,6 +56,7 @@ from .protocol.rfb import warmup_tcp
 from .protocol.rtcp import (
     build_empty_sr,
     build_fir,
+    build_fir_legacy,
     build_nack,
     build_pli,
     build_rr,
@@ -2873,13 +2874,16 @@ class Session:
         enc = self._srtcp_enc
         if sock is None or enc is None:
             return False
-        # Combine PLI (lighter, lower-priority) with FIR via the compound
-        # builder — server processes whichever it honors first.
+        # Combine the AVPF FIR (PT=206) + PLI with the LEGACY FIR (PT=192,
+        # RFC 2032) the native viewer uses — screensharingd often ignores the
+        # AVPF FIR but answers the legacy one with a fresh IDR. The server
+        # processes whichever it honors first; recovery latency is gated on it.
         seq = (self._tx_tick & 0xFF)
         compound = compound_with_rr(
             self._our_video_ssrc,
             build_fir(self._our_video_ssrc, target_ssrc, seq)
-            + build_pli(self._our_video_ssrc, target_ssrc),
+            + build_pli(self._our_video_ssrc, target_ssrc)
+            + build_fir_legacy(target_ssrc),
         )
         try:
             sock.sendto(enc.protect(compound), (self._dest_host, self._ctrl_dest_port))
