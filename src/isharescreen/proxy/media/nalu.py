@@ -11,7 +11,7 @@ Apple deviates from RFC 7798 in two places:
 from __future__ import annotations
 
 import struct
-from typing import Iterable
+from typing import Iterable, Optional
 
 
 # HEVC NAL unit types we care about.
@@ -80,6 +80,29 @@ def reassemble_group(payloads: Iterable[bytes]) -> list[bytes]:
     return out
 
 
+def first_donl(payloads: Iterable[bytes]) -> Optional[int]:
+    """Extract the DONL (HEVC Decoding Order Number, 16-bit) carried in the
+    first packet of a timestamp group. The host stamps every access unit with
+    a DONL that increments +1 per frame in decoding order, and its encoder
+    keys the long-term-reference ring on exactly this value — so the LTRP ack
+    must echo this DONL for the host to map the ack to a valid encoder
+    reference token; see Session._send_ltr_ack.
+
+    Returns None if no packet carries a usable DONL. Per Apple's RFC 7798
+    deviation the DONL sits after the 2-byte NAL header (AP / single NAL) or
+    after the 1-byte FU header (FU), so at payload offset 2 or 3 respectively."""
+    for pay in payloads:
+        if len(pay) < 2:
+            continue
+        nt = (pay[0] >> 1) & 0x3F
+        if nt == NAL_FRAGMENTATION:
+            if len(pay) >= 5:
+                return struct.unpack(">H", pay[3:5])[0]
+        elif len(pay) >= 4:
+            return struct.unpack(">H", pay[2:4])[0]
+    return None
+
+
 __all__ = [
     "IDR_RANGE",
     "NAL_AGGREGATION",
@@ -87,5 +110,6 @@ __all__ = [
     "NAL_PPS",
     "NAL_SPS",
     "NAL_VPS",
+    "first_donl",
     "reassemble_group",
 ]

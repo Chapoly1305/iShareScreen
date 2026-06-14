@@ -41,7 +41,7 @@ from .media.tiles import TileFrame
 from .input import InputController
 from .media.aac_eld import AacEldDecoder, make_aac_eld_decoder
 from .media.hevc import HevcDecoder
-from .media.nalu import reassemble_group
+from .media.nalu import first_donl, reassemble_group
 from .media.quality_gate import TileVisState
 from .. import __version__ as _iss_version
 from .control import ControlServer
@@ -365,18 +365,13 @@ class Session:
         self._last_publish_t = 0.0
         self._tx_tick = 0
 
-        # LTRP fast-recovery — measurably better recovery under packet loss
-        # (~4× more frames decoded over a stress test). Default on; disable
-        # with `ISS_LTRP=0` if you hit decoder artifacts attributable to it.
-        #
-        # The LTR-ID we advertise is `min(per-tile decoded counts)` — i.e.
-        # we only claim "I have frame N" once every tile has decoded ≥ N
-        # frames. Acking a global counter the moment any tile publishes
-        # was the original bug: the server would pick an LTR ref that
-        # tiles other than the publisher hadn't actually decoded, and the
-        # next P-frame would error on those tiles, forcing repeated FIRs.
+        # LTRP fast-recovery: ack each cleanly-decoded base-tile frame by its
+        # DONL (decoding-order number) so the host's encoder can use it as a
+        # long-term reference. The DONL acks resolve to real encoder reference
+        # tokens, keeping the encoder's references near (within our decoder's
+        # picture buffer) instead of reaching far back and forcing a full IDR.
+        # ON by default; set ISS_LTRP=0 to disable.
         self._ltr_enabled = os.environ.get("ISS_LTRP", "1") != "0"
-        self._ltr_tile_counts: dict[int, int] = {}
         self._ltr_last_acked: int = 0
 
         # DPB-break detection state. `_dpb_error_window` is a sliding
@@ -388,6 +383,14 @@ class Session:
         # during the burst tail.
         self._dpb_error_window: deque[float] = deque()
         self._last_decoder_restart_t: float = 0.0
+        # Gray-out event aggregator. Multiple paths (per-tile gate FIR,
+        # batched DPB-break FIR) can emit FIRs within a few ms. Buffer
+        # the tile indices and the most recent libav concealment message
+        # so a single INFO summary line lands per event instead of 4
+        # DEBUG lines the user can't see at default verbosity.
+        self._grayout_window_t: float = 0.0
+        self._grayout_window_tiles: set[int] = set()
+        self._last_concealment_msg: str = ""
 
         # Per-tile FIR rate limit, applied at the wire layer in
         # `_send_fir_for_tile` so it coalesces requests from every
@@ -1183,21 +1186,37 @@ class Session:
         self._send_ltr_ack(tile_idx)
 
     def _send_ltr_ack(self, tile_idx: int) -> None:
-        if not self._ltr_enabled:
+        """Acknowledge the last cleanly-decoded base-tile frame so Apple's
+        encoder can use it as a long-term reference (single-RTT recovery
+        instead of a full IDR on loss).
+
+        The ack must carry the frame's **DONL** (HEVC Decoding Order Number).
+        The host reads a big-endian u32 at the APP packet's offset 12 and
+        scans a fixed-size ring for an *exact* match, mapping it to an encoder
+        reference token. That ring is keyed on the per-frame DONL the encoder
+        stamps — which is exactly the DONL carried in every payload header
+        (same value space, +1 per frame). A value from any other counter
+        (e.g. the HEVC POC) misses the ring entirely and is a silent no-op,
+        leaving the encoder to fall back to full-IDR recovery (the persistent
+        gray). See nalu.first_donl.
+
+        We ack tile 0 only: it's the anchor SSRC that carries IDRs, and one
+        stream's ack rate matches the host's own observed rate.
+        """
+        if not self._ltr_enabled or tile_idx != 0:
             return
-        counts = self._ltr_tile_counts
-        counts[tile_idx] = counts.get(tile_idx, 0) + 1
-        # Don't ack until every tile we expect has published at least once;
-        # otherwise the min() includes a 0 and we never make forward progress
-        # for the tiles that have published, OR we'd ack low IDs while some
-        # tiles silently haven't started yet.
-        n_tiles = self.num_tiles
-        if len(counts) < n_tiles:
+        dec = self._decoder
+        if dec is None:
             return
-        ltr_id = min(counts.values())
-        if ltr_id <= self._ltr_last_acked:
+        donl = dec.last_clean_donl[0] if dec.last_clean_donl else None
+        if donl is None:
             return
-        self._ltr_last_acked = ltr_id
+        # DONL is monotonic per tile but 16-bit (wraps ~every 18 min at
+        # 60 fps); ack on any change rather than strict ">" so acks resume
+        # after a wrap instead of stalling until the counter climbs back.
+        if donl == self._ltr_last_acked:
+            return
+        self._ltr_last_acked = donl
         enc = self._srtcp_enc
         ssrc = self._our_video_ssrc
         # PT=204 LTR-acks go on the video RTCP-mux port, not the ctrl port.
@@ -1205,8 +1224,9 @@ class Session:
         if enc is None or ssrc is None or sock is None:
             return
         try:
-            pkt = build_rtcp_app_ltrp(ssrc, ltr_id)
+            pkt = build_rtcp_app_ltrp(ssrc, donl)
             sock.sendto(enc.protect(pkt), (self._dest_host, self._video_dest_port))
+            log.debug("LTR ack sent: DONL=%d (tile 0)", donl)
         except OSError as e:
             log.debug("LTR ack send failed: %s", e)
 
@@ -1376,6 +1396,7 @@ class Session:
         # means real corruption that won't self-heal before the next
         # natural IDR cycle.
         if "could not find ref" in msg.lower():
+            self._last_concealment_msg = msg
             events = self._dpb_error_window
             events.append(now)
             cutoff = now - self._DPB_ERR_WINDOW_S
@@ -1448,6 +1469,14 @@ class Session:
         testing of the recovery paths; defaults to 0 (no synthetic drop)."""
         import random
         drop_pct = float(os.environ.get("ISS_DROP_PCT", "0"))
+        # Burst-loss injector (0 = off): drop one frame's worth of packets
+        # every N seconds — see the burst block below.
+        self._burst_every_s = float(os.environ.get("ISS_DROP_BURST_EVERY_S", "0"))
+        # Hold off synthetic loss until the stream has established, so the
+        # initial burst + first IDR aren't dropped (which just stalls
+        # startup and tells us nothing about steady-state recovery).
+        drop_after_s = float(os.environ.get("ISS_DROP_AFTER_S", "8"))
+        loop_start = time.monotonic()
         sock = self._sock_video
         if sock is None:
             return
@@ -1473,11 +1502,27 @@ class Session:
             src_seen[_addr] = prev + 1
             if prev == 0:
                 log.info("video UDP: first packet from src=%s:%d", _addr[0], _addr[1])
-            if drop_pct > 0 and random.random() * 100 < drop_pct:
+            if (drop_pct > 0
+                    and time.monotonic() - loop_start > drop_after_s
+                    and random.random() * 100 < drop_pct):
                 loss_count += 1
                 if loss_count % 100 == 1:
                     log.info("ISS_DROP_PCT=%.1f%% — synthetic loss count=%d", drop_pct, loss_count)
                 continue
+            # Burst-loss model: every `_burst_every_s` seconds, drop ALL video
+            # packets for a short window (~one frame). This is the loss
+            # pattern LTR-anchored recovery is meant to fix — a clean single
+            # missing frame — unlike continuous random loss which shreds the
+            # whole reference chain. Recovery quality = does the stream resume
+            # without a fresh IDR (LTR-P) or stall until FIR→IDR?
+            if self._burst_every_s > 0:
+                now_b = time.monotonic()
+                since = now_b - loop_start
+                if since > drop_after_s:
+                    phase = since % self._burst_every_s
+                    if phase < 0.020:  # ~20 ms ≈ one frame at 60 fps
+                        loss_count += 1
+                        continue
             try:
                 q.put_nowait(pkt)
             except queue.Full:
@@ -1541,8 +1586,12 @@ class Session:
         else:
             packets = sorted(grp, key=lambda x: x[0])
 
-        for nalu in reassemble_group([p for _, _, p in packets]):
-            self._decoder.feed_nalu(nalu, ti)
+        ordered = [p for _, _, p in packets]
+        # The access unit's DONL (decoding-order number) — the LTR ring key
+        # the LTRP ack must echo. Same for every NALU in the group.
+        donl = first_donl(ordered) if self._ltr_enabled else None
+        for nalu in reassemble_group(ordered):
+            self._decoder.feed_nalu(nalu, ti, donl=donl)
 
     def _evict_stale_groups(self) -> None:
         """Drop incomplete groups whose marker never arrived, and expire
@@ -1905,10 +1954,17 @@ class Session:
                 if consumed < 0:
                     return
                 offset += consumed
-            elif encoding in (1010, 1011):
-                # Apple-private config blobs: u16 BE size + payload.
-                # We don't decode them but need to skip past so any
-                # cursor rect that follows in the same FBU is reached.
+            elif encoding in (1010, 1011, 1105, 1107, 1109, 1110):
+                # Apple-private config blobs: u16 BE size + payload. We don't
+                # decode them but need to skip past so any 1104 cursor rect
+                # that follows in the same FBU is still reached.
+                # Known content (from prior RE, none of it required to render):
+                #   1010 — bplist (media-stream negotiation blob)
+                #   1011 — sibling of 1010 in some sessions
+                #   1105 — display info struct (dims, "main" sentinel, scale)
+                #   1107 — VendorKeysyms
+                #   1109 — keyboard input source string (e.g. com.apple.keylayout.US)
+                #   1110 — device info (host model identifier string)
                 if offset + 2 > len(msg):
                     return
                 sz = struct.unpack(">H", msg[offset:offset + 2])[0]
@@ -2320,6 +2376,13 @@ class Session:
                 sent.append(ti)
         if sent:
             log.debug("FIR/PLI sent for tiles %s", sorted(sent))
+        # Flush any pending gray-out aggregation that's older than the
+        # debounce window so a single-tile event still surfaces if no
+        # follow-up FIR fires.
+        if (self._grayout_window_tiles
+                and time.monotonic() - self._grayout_window_t
+                >= self._GRAYOUT_WINDOW_S):
+            self._flush_grayout_event()
 
     def _send_fir_for_tile(self, tile_idx: int, log_per_tile: bool = True) -> bool:
         """Returns True if a FIR was actually emitted (False if rate-
@@ -2343,7 +2406,10 @@ class Session:
         if sock is None or enc is None:
             return False
         # Combine PLI (lighter, lower-priority) with FIR via the compound
-        # builder — server processes whichever it honors first.
+        # builder — server processes whichever it honors first. (Tried
+        # PLI-only under LTRP to coax an LTR-anchored recovery instead of a
+        # full IDR: it was a net regression under burst loss — the server
+        # doesn't fast-path PLI for iss, just recovers slower. Keep FIR+PLI.)
         seq = (self._tx_tick & 0xFF)
         compound = compound_with_rr(
             self._our_video_ssrc,
@@ -2354,10 +2420,36 @@ class Session:
             sock.sendto(enc.protect(compound), (self._dest_host, self._ctrl_dest_port))
             if log_per_tile:
                 log.debug("FIR/PLI sent for tile %d (ssrc=0x%08x)", tile_idx, target_ssrc)
+            self._record_grayout_tile(tile_idx, now)
             return True
         except OSError as e:
             log.debug("FIR send failed: %s", e)
             return False
+
+    # Gray-out aggregator -------------------------------------------------
+    # Coalesce per-tile FIR emissions inside a short window into one
+    # session-level INFO line. The libav concealment message captured at
+    # detection time is appended so we can tell LTRP-ack poisoning (same
+    # ref/POC across tiles) from natural encoder DPB blips (different
+    # refs per tile) without enabling -vv.
+    _GRAYOUT_WINDOW_S: float = 0.25
+
+    def _record_grayout_tile(self, tile_idx: int, now: float) -> None:
+        if (not self._grayout_window_tiles
+                or now - self._grayout_window_t >= self._GRAYOUT_WINDOW_S):
+            if self._grayout_window_tiles:
+                self._flush_grayout_event()
+            self._grayout_window_t = now
+        self._grayout_window_tiles.add(tile_idx)
+
+    def _flush_grayout_event(self) -> None:
+        if not self._grayout_window_tiles:
+            return
+        tiles = sorted(self._grayout_window_tiles)
+        msg = self._last_concealment_msg or "no libav concealment captured"
+        log.info("gray-out: tiles %s recovering via FIR (libav: %s)", tiles, msg)
+        self._grayout_window_tiles.clear()
+        self._last_concealment_msg = ""
 
     def _drain_pending_nack(self) -> None:
         sock = self._sock_ctrl

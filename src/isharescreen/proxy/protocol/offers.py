@@ -89,9 +89,18 @@ _APPLE_AUDIO_F9 = b"".join(_build_audio_f9_entry(*t) for t in _AUDIO_F9_TIERS)
 
 # ── HEVC + AVC parameter strings ──────────────────────────────────────
 
+# `LTR;` advertises the long-term-reference capability. LTRP is now ON by
+# default (set ISS_LTRP=0 to disable). The full path is verified working:
+# the encoder creates LTRs, and iss acks them by DONL so they resolve to
+# real encoder tokens (see session._send_ltr_ack). `LTR;` here + the
+# structured ltrpEnabled field7 + allowRTCPFB together enable it.
+import os as _os
 _HEVC_PARAMS = (
-    b"FLS;MS:-1;LF:-1;LTR;CABAC;POS:0;EOD:1;HTS:2;RR:3;"
-    b"AR:16/9,5/8;XR:16/9,5/8;"
+    (b"FLS;MS:-1;LF:-1;LTR;CABAC;POS:0;EOD:1;HTS:2;RR:3;"
+     b"AR:16/9,5/8;XR:16/9,5/8;")
+    if _os.environ.get("ISS_LTRP", "1") != "0" else
+    (b"FLS;MS:-1;LF:-1;CABAC;POS:0;EOD:1;HTS:2;RR:3;"
+     b"AR:16/9,5/8;XR:16/9,5/8;")
 )
 _AVC_PARAMS = (
     b"FLS;LF:-1;POS:5;EOD:1;HTS:2;RR:3;POSE:4;"
@@ -161,10 +170,17 @@ def _build_mediablob(mode: int, session_id: int, timestamp: int) -> bytes:
             + _field_bytes(3, _AVC_PARAMS)
             + _field_varint(4, 14)
         )
+        # VideoSettings fields: 2 = allowRTCPFB (host ANDs both sides to
+        # enable RTCP feedback), 7 = ltrpEnabled. Both are tied to LTRP:
+        # on by default, gated off together by ISS_LTRP=0 so disabling is a
+        # clean kill switch (no half-advertised LTRP the host might honour
+        # while we send no acks).
+        ltrp_on = _os.environ.get("ISS_LTRP", "1") != "0"
         desc = (
-            _field_varint(1, session_id) + _field_varint(2, 0)
+            _field_varint(1, session_id) + _field_varint(2, 1 if ltrp_on else 0)
             + _field_bytes(3, hevc_bank) + _field_bytes(3, avc_bank)
-            + _field_varint(6, 4) + _field_varint(7, 1) + _field_varint(8, 63)
+            + _field_varint(6, 4) + _field_varint(7, 1 if ltrp_on else 0)
+            + _field_varint(8, 63)
             + _field_varint(9, 1) + _field_varint(12, 1)
         )
         desc_field = _field_bytes(5, desc)
@@ -305,6 +321,10 @@ def extract_canvas_dims(answer_msg: bytes) -> tuple[int, int, int]:
                                 ch = v
                             elif sf == 6:
                                 ct = v
+                            elif sf == 7:
+                                # field 7 = ltrpEnabled (negotiated result).
+                                # Diagnostic: did the server accept LTRP?
+                                log.info("negotiated ltrpEnabled (answer F5.f7) = %d", v)
                         elif sw == 2:
                             sl, sp = _read_varint(sub, sp)
                             sp += sl

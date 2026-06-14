@@ -336,6 +336,12 @@ class HevcDecoder:
         # decoder will conceal and we mark the tile as needing FIR.
         from .hevc_rps import HevcRpsTracker  # local to avoid cycles
         self._rps_tracker = HevcRpsTracker()
+        # Per-tile DONL (decoding-order number) of the last cleanly-decoded
+        # frame (one whose reference picture set is fully present). The host's
+        # encoder keys its long-term-reference ring on this per-frame id, and
+        # only honours an LTR ack whose value is in that ring — so it's the
+        # value the ack must carry. See nalu.first_donl / Session._send_ltr_ack.
+        self.last_clean_donl: list[Optional[int]] = [None] * num_tiles
 
         # Codec parameter sets, set by `set_params`.
         self._vps: Optional[bytes] = None
@@ -501,7 +507,7 @@ class HevcDecoder:
             )
             self._fallback_to_software(tile_nalu_cache)
 
-    def feed_nalu(self, nalu: bytes, tile_idx: int) -> None:
+    def feed_nalu(self, nalu: bytes, tile_idx: int, donl: Optional[int] = None) -> None:
         """Send one NALU to the shared decoder. During `feed_burst` this
         runs synchronously; otherwise it enqueues to the decoder worker
         (libavcodec releases the GIL inside `decode()`).
@@ -537,6 +543,12 @@ class HevcDecoder:
                 # post-decode `decode_error_flags` path is the
                 # authoritative concealment signal anyway.
                 self._rps_tracker.commit_decoded()
+                # Record this frame's DONL for the LTRP ack when the slice's
+                # references are all present (best available pre-decode "this
+                # frame is good" signal). Post-decode concealment is still
+                # caught by decode_error_flags.
+                if not missing and donl is not None and 0 <= tile_idx < len(self.last_clean_donl):
+                    self.last_clean_donl[tile_idx] = donl
                 if missing:
                     # Mark for FIR but DO feed the slice. Feeding a
                     # slice with truly-missing refs produces a
@@ -1048,6 +1060,7 @@ class HevcDecoder:
         self._dpb_has_idr = False
         self._pre_idr_drops = 0
         self._rps_tracker.reset()
+        self.last_clean_donl = [None] * self.num_tiles
         if self._sps and len(self._sps) > 2:
             self._rps_tracker.feed_sps(self._sps[2:])
 
