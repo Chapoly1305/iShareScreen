@@ -1396,6 +1396,29 @@ class Session:
     # back-to-back retries still wait long enough to see whether the
     # first FIR worked.
     _FIR_MIN_INTERVAL_S: float = 0.25
+    # How long the link must be loss-FREE before a decoder wedge is treated
+    # as a genuine (lossless) VideoToolbox saturation wedge eligible for a
+    # codec restart. A loss event takes up to ~4 s to surface as a
+    # `gap > threshold` wedge (loss → broken ref → stuck → staleness), so a
+    # short window misclassifies loss-rooted broken-ref wedges as "lossless"
+    # and restarts them — which wipes the shared DPB, orphans the cross-tile
+    # IDR refs, and turns one wedge into a multi-second restart cascade
+    # (observed on lossy 58 Mbps streams). 8 s keeps loss-rooted wedges on
+    # the no-flush FIR path (native-aligned); on a truly lossless link the
+    # loss counter never grows, so genuine VT-saturation wedges still
+    # restart. The 15 s last-resort restart below remains the dead-decoder
+    # backstop either way.
+    _SATURATION_LOSS_FREE_WINDOW_S: float = 8.0
+    # Minimum publish-gap before a lossless wedge earns a codec restart. The
+    # no-flush + FIR path (hevc._try_recovery + the gap>3 FIR storm below)
+    # recovers the common periodic no-loss wedge (an LTR/ref aged out of
+    # libav's DPB; see the ltrp notes) in ~3-6 s via Apple's FIR->IDR. A 2.5 s
+    # restart fired *during* that natural recovery — wiping the shared DPB and
+    # orphaning tiles 1-3 (IDRs are tile-0-only) — turned a ~3 s blip into a
+    # ~9 s restart cascade (observed in two 50-58 Mbps GUI captures, loss=0).
+    # 8 s lets the native-aligned FIR path finish first; restart then only
+    # fires for a decoder that is GENUINELY stuck (no recovery in 8 s).
+    _SATURATION_RESTART_GAP_S: float = 8.0
 
     def _on_libav_concealment(self, msg: str) -> None:
         """Two response modes for libav's "Could not find ref" log:
@@ -2483,17 +2506,19 @@ class Session:
         # rebuild does. Gated on NO recent loss so a broken-ref (loss) stall
         # never restarts here (it stays no-flush). Catches it at ~4 s instead
         # of the 15 s last resort.
-        recent_loss = (now - getattr(self, "_last_loss_growth_t", 0.0)) < 3.0
+        recent_loss = (now - getattr(self, "_last_loss_growth_t", 0.0)
+                       < self._SATURATION_LOSS_FREE_WINDOW_S)
         pkts_flowing = (self._last_video_pkt_t > 0.0
                         and now - self._last_video_pkt_t < 0.5)
-        if (gap > 2.5 and self._decoder is not None
+        if (gap > self._SATURATION_RESTART_GAP_S and self._decoder is not None
                 and not recent_loss and pkts_flowing):
             last_restart = getattr(self, "_last_decoder_restart_t", 0.0)
             if now - last_restart >= 3.0:
                 self._last_decoder_restart_t = now
                 log.warning(
-                    "decoder stuck %.1fs, packets flowing, no loss — VT "
-                    "saturation wedge; restart decoder + FIR", gap,
+                    "decoder stuck %.1fs, packets flowing, no loss for %.0fs — "
+                    "no-flush FIR didn't recover; restart decoder + FIR",
+                    gap, self._SATURATION_LOSS_FREE_WINDOW_S,
                 )
                 try:
                     self._decoder.restart()
@@ -2569,7 +2594,8 @@ class Session:
             return
         worst = max((s.bad_streak for s in states), default=0)
         if worst >= STUCK_TILE_ERRORS:
-            recent_loss = (now - getattr(self, "_last_loss_growth_t", 0.0)) < 3.0
+            recent_loss = (now - getattr(self, "_last_loss_growth_t", 0.0)
+                           < self._SATURATION_LOSS_FREE_WINDOW_S)
             stuck = [i for i in range(self.num_tiles)
                      if states[i].bad_streak >= STUCK_TILE_ERRORS]
             if recent_loss:

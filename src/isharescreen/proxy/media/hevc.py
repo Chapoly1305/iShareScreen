@@ -566,10 +566,14 @@ class HevcDecoder:
         try:
             q.put_nowait((nalu, tile_idx))
         except queue.Full:
-            # Queue overflow — drop. The IDR cache is already loaded so
-            # losing a TRAIL_R rarely matters; the gate will request a
-            # fresh IDR if the lost slice causes a visible artefact.
-            pass
+            # Queue overflow — drop. DIAGNOSTIC: a dropped slice that a
+            # later P-frame references (Apple uses refs ≤8 back) is a
+            # silent wedge trigger, so count + surface it.
+            self._queue_full_drops = getattr(self, "_queue_full_drops", 0) + 1
+            n = self._queue_full_drops
+            if n in (1, 10, 100, 1000) or n % 1000 == 0:
+                log.warning("decoder queue FULL — dropped slice for tile %d "
+                            "(drop count=%d) — worker not keeping up", tile_idx, n)
 
     # -- consumer API --------------------------------------------------
 

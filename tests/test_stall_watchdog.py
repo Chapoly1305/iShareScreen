@@ -50,16 +50,41 @@ def _make_session(*, gap, lost_pkts=0, loss_growing=False,
 
 
 def test_lossless_saturation_wedge_restarts():
-    s = _make_session(gap=3.0, lost_pkts=500, loss_growing=False, video_pkt_age=0.1)
+    # gap > 8.0 (the genuine-freeze restart threshold) and the link has been
+    # loss-free the whole window (_last_loss_growth_t left at 0.0): the
+    # no-flush FIR path didn't recover in 8 s → restart as the backstop.
+    s = _make_session(gap=9.0, lost_pkts=500, loss_growing=False, video_pkt_age=0.1)
     s._check_stall()
     assert s._decoder.restart_calls == 1
     assert s.fir_calls >= 1
 
 
+def test_lossless_recoverable_wedge_fir_only_no_restart():
+    """A lossless wedge that's only been stuck ~4 s must NOT restart — give the
+    native-aligned no-flush FIR path time to recover (the common periodic
+    LTR-eviction wedge heals in ~3-6 s). Restarting here orphans tiles 1-3."""
+    s = _make_session(gap=4.0, lost_pkts=0, loss_growing=False, video_pkt_age=0.1)
+    s._check_stall()
+    assert s._decoder.restart_calls == 0
+    assert s.fir_calls >= 1
+
+
 def test_loss_driven_stall_fir_only_no_restart():
-    s = _make_session(gap=4.0, lost_pkts=500, loss_growing=True, video_pkt_age=0.1)
+    s = _make_session(gap=5.0, lost_pkts=500, loss_growing=True, video_pkt_age=0.1)
     s._check_stall()
     assert s._decoder.restart_calls == 0      # broken-ref must NOT flush
+    assert s.fir_calls >= 1
+
+
+def test_loss_within_window_suppresses_restart():
+    """Regression: a wedge ≤8 s after the last loss is loss-rooted (broken
+    refs), NOT lossless saturation. Restarting would wipe the shared DPB and
+    cascade. Must stay no-flush + FIR even though gap > 4 s and packets flow."""
+    s = _make_session(gap=6.0, lost_pkts=500, loss_growing=False, video_pkt_age=0.1)
+    # Loss last grew 5 s ago — inside the 8 s loss-free window.
+    s._last_loss_growth_t = time.monotonic() - 5.0
+    s._check_stall()
+    assert s._decoder.restart_calls == 0
     assert s.fir_calls >= 1
 
 
