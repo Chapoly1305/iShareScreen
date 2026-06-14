@@ -28,6 +28,7 @@ escalation) lives in `quality_gate.py`.
 """
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import queue
@@ -867,9 +868,25 @@ class HevcDecoder:
             tile_idx, err_no, len(nalu), (nalu[0] >> 1) & 0x3F if nalu else -1, exc,
         )
 
-        # Always FIR — re-rooting a broken reference chain needs a fresh
-        # IDR whether or not we flush.
-        self._gate.mark_decode_error(tile_idx)
+        # `errno=35` (EAGAIN) from `avcodec_send_packet()` is pure
+        # BACKPRESSURE — the decoder's input queue is full because it hasn't
+        # produced output yet (it is simply slower than real time on this
+        # content, e.g. incompressible 4:4:4 above the HW decoder's
+        # throughput). It is NOT a broken reference chain, so FIR-ing on it
+        # is actively harmful: a FIR pulls a fresh IDR, the single heaviest
+        # NALU to decode, which deepens the backlog → a death spiral that
+        # locks the stream at 0 fps (observed: ~7500 EAGAINs in 45 s under a
+        # 60 Mbps noise load, each spawning a giant-IDR FIR). So on EAGAIN we
+        # do NOT FIR and do NOT pollute `bad_streak`/the gate; we only bump
+        # `_eagain_streak` so a *genuine* wedge — sustained EAGAIN with ZERO
+        # output, since any publish resets the streak in `_decode_one` —
+        # still escalates to the no-flush recovery below.
+        is_backpressure = err_no == errno.EAGAIN
+        if not is_backpressure:
+            # Genuine decode error (bad data / VT malfunction such as
+            # -17694 / -12909): re-root the broken reference chain with a
+            # fresh IDR.
+            self._gate.mark_decode_error(tile_idx)
         self._eagain_streak += 1
 
         # Only a sustained wedge (no output for a full source frame's
@@ -877,10 +894,16 @@ class HevcDecoder:
         if (not self._recovery_in_progress
                 and self._eagain_streak >= _HWACCEL_SILENT_NALU_LIMIT):
             self._recovery_in_progress = True
+            # A genuine wedge (sustained EAGAIN, zero output) needs a fresh
+            # IDR to re-root. We deliberately did NOT FIR on the individual
+            # EAGAINs above (that storms giant IDRs), so request exactly ONE
+            # here on wedge-entry — otherwise nothing pulls a recovery IDR
+            # until the 15 s session watchdog, leaving a ~14 s freeze.
+            self._gate.mark_decode_error(tile_idx)
             log.warning(
                 "%s wedged (errno=%d, %d consecutive decode errors, no "
-                "output) — keeping session, dropping P-frames until fresh "
-                "IDRs arrive (no flush)",
+                "output) — draining backlog + one FIR for a fresh IDR "
+                "(no flush)",
                 self._hw_name or "software", err_no, self._eagain_streak,
             )
             self._try_recovery()
@@ -903,17 +926,32 @@ class HevcDecoder:
         `errno=35` flushes that even a full `restart()` couldn't break).
 
         Instead we just stop feeding P-frames until the next IDR re-roots
-        the DPB (`_dpb_has_idr = False`) and let the FIRs already queued
-        by `_handle_decode_error` pull a fresh keyframe. The codec's
-        existing reference frames survive, so the tiles that weren't hit
-        resume from their own intact history once the keyframe lands.
-        (No `flush_buffers()`, so the RPS tracker still mirrors the live
-        DPB and must NOT be reset here.)"""
+        the DPB (`_dpb_has_idr = False`); the caller has requested a fresh
+        keyframe (FIR) on wedge-entry. The codec's existing reference
+        frames survive, so the tiles that weren't hit resume from their own
+        intact history once the keyframe lands. (No `flush_buffers()`, so
+        the RPS tracker still mirrors the live DPB and must NOT be reset
+        here.)
+
+        We also DRAIN the worker queue: at high bitrate the wedge is a
+        backlog of hundreds of stale P-frames (each re-EAGAIN-ing), and
+        grinding through them all before the incoming IDR is reached is
+        what stretches recovery to ~15 s. Dropping the backlog lets the
+        worker reach the recovery IDR in ~1 RTT. Safe to empty here: this
+        runs on the decode worker thread (via `_decode_one`), the queue's
+        only consumer."""
         self._dpb_has_idr = False
         for slot in self._tiles:
             with slot.lock:
                 slot.saw_idr_since_reset = False
         self._eagain_streak = 0
+        q = self._queue
+        if q is not None:
+            try:
+                while True:
+                    q.get_nowait()
+            except queue.Empty:
+                pass
 
     def _drain_codec_to_slots(self) -> None:
         """Pull any frames libavcodec has buffered (None packet flush)."""
