@@ -60,6 +60,30 @@ log = logging.getLogger(__name__)
 
 _NAL_START_CODE = b"\x00\x00\x00\x01"
 
+# nv24 (Apple's HW VideoToolbox 4:4:4 biplanar output) is delivered to the GPU
+# as a passthrough TileFrame (raw interleaved UV, `v is None`) and deinterleaved
+# in the fragment shader from an rg8unorm texture. Set ISS_LEGACY_CHROMA=1 to
+# fall back to the old CPU-side strided deinterleave (one full UV gather per
+# tile per frame — ~half a core at 4-tile/60fps; the passthrough path is ~49×
+# cheaper). The escape hatch exists in case the rg8 sampling misbehaves on a
+# given GPU; both the decoder and renderer honour it.
+_LEGACY_CHROMA = os.environ.get("ISS_LEGACY_CHROMA") == "1"
+
+# Mid-stream wedge recovery granularity. Default (unset): a wedge drops to
+# the session-wide `_dpb_has_idr = False` gate — ALL four tiles' P-frames
+# are dropped and every tile's `get_frame` returns None until the next IDR.
+# But Apple emits IDRs on tile 0 only (~every 1.7 s), and a tile-0 IDR
+# re-roots tile 0 immediately while tiles 1-3 still reference pre-wedge
+# POCs, so they re-wedge and re-recover for ~4 IDR cycles — an ~8 s
+# all-tile freeze for what is usually a single broken tile. Set
+# ISS_PERTILE_RECOVERY=1 to instead mark ONLY the gate-flagged broken tiles
+# (`bad_streak > 0`) as awaiting re-root: the healthy tiles keep decoding +
+# publishing from their intact history, and only the broken tile(s) wait
+# for the shared tile-0 IDR. Cold start (before the very first IDR) is
+# untouched — `_dpb_has_idr` still gates every tile then.
+_PERTILE_RECOVERY = os.environ.get("ISS_PERTILE_RECOVERY") == "1"
+
+
 # libavcodec flags. AV_CODEC_FLAG_LOW_DELAY = 0x80000 disables frame
 # reordering buffers. AV_CODEC_FLAG2_FAST = 0x400000 enables non-bitexact
 # but faster decode paths (acceptable for live screen-share).
@@ -355,6 +379,14 @@ class HevcDecoder:
         # references mean every tile's frames become visually meaningful
         # the moment ANY tile delivers an IDR.
         self._dpb_has_idr = False
+        # Per-tile mid-stream recovery set (ISS_PERTILE_RECOVERY only).
+        # On a wedge we add just the gate-flagged broken tiles here
+        # instead of clearing the session-wide `_dpb_has_idr`; those
+        # tiles' P-frames are dropped and their `get_frame` returns None
+        # until the shared tile-0 IDR re-roots the context (which clears
+        # the whole set). Empty in the default path — `_dpb_has_idr`
+        # remains the sole gate then.
+        self._tiles_await_idr: set[int] = set()
         # Burst cache for fallback re-feed (set by feed_burst).
         self._burst_cache: dict[int, list[bytes]] = {}
         # Counts how many NALUs we've fed since the last successful
@@ -577,8 +609,15 @@ class HevcDecoder:
         (b) the shared codec context hasn't yet decoded any IDR (output
         before that is concealment fill from a cold DPB), or (c) the
         legacy heuristic gate (if enabled) blocked the frame.
+
+        Under ISS_PERTILE_RECOVERY, a tile that wedged mid-stream and is
+        still awaiting the re-root IDR also returns None — but only that
+        tile; its healthy siblings keep publishing from their own intact
+        DPB history.
         """
         if not self._dpb_has_idr:
+            return None
+        if _PERTILE_RECOVERY and tile_idx in self._tiles_await_idr:
             return None
         slot = self._tiles[tile_idx]
         with slot.lock:
@@ -721,11 +760,26 @@ class HevcDecoder:
                 log.debug("tile %d IDR (nt=%d) — gate opens", tile_idx, nal_type)
             if not self._dpb_has_idr:
                 self._dpb_has_idr = True
-        elif not self._dpb_has_idr:
-            # Drop P-frames before the first IDR — feeding them to a
-            # cold codec context produces concealment-fill output that
-            # the rest of the pipeline cannot distinguish from real
-            # content. Better to wait for the IDR and start clean.
+            if _PERTILE_RECOVERY and self._tiles_await_idr:
+                # The shared codec context's DPB is re-rooted by this IDR
+                # (Apple emits IDRs on tile 0 only, but cross-tile refs
+                # mean it re-roots every tile). Every tile that was
+                # waiting on the wedge can resume.
+                self._tiles_await_idr.clear()
+        elif not self._dpb_has_idr or (
+            _PERTILE_RECOVERY and tile_idx in self._tiles_await_idr
+        ):
+            # Drop P-frames while the context can't decode them. Two cases:
+            #   - cold start (`not _dpb_has_idr`): no IDR has EVER landed,
+            #     so the DPB is empty for ALL tiles — feeding P-frames
+            #     produces concealment-fill output the pipeline can't
+            #     distinguish from real content. (Default path: this is
+            #     the only drop condition.)
+            #   - mid-stream per-tile recovery (`tile_idx in
+            #     _tiles_await_idr`, ISS_PERTILE_RECOVERY only): this tile
+            #     wedged and its refs are gone; drop just its P-frames
+            #     until the re-root IDR clears the await set. Healthy
+            #     siblings (not in the set) fall through and keep decoding.
             self._pre_idr_drops = getattr(self, "_pre_idr_drops", 0) + 1
             if self._pre_idr_drops in (1, 10, 100, 1000):
                 log.info(
@@ -862,24 +916,63 @@ class HevcDecoder:
 
 
     def _try_recovery(self) -> None:
-        """Reset the codec to a clean state without losing the active
-        decoder context. Calls `flush_buffers()` to clear libavcodec's
-        internal queue (and the hwaccel's wedge state, if any), then
-        clears our per-tile IDR-seen flags so `_decode_one` will drop
-        every P-frame until the next IDR for that tile arrives. The
-        `mark_decode_error` calls in `_handle_decode_error` already
-        triggered FIRs for each tile, so fresh IDRs are on the way."""
-        with self._codec_lock:
-            codec = self._codec
-            if codec is not None:
-                try:
-                    codec.flush_buffers()
-                except Exception as e:
-                    log.debug("flush_buffers failed: %s", e)
-        self._dpb_has_idr = False
-        for slot in self._tiles:
-            with slot.lock:
-                slot.saw_idr_since_reset = False
+        """Native-aligned wedge recovery — do NOT flush the codec.
+
+        Apple's own viewer (AVConference) never flushes or invalidates
+        its VTDecompressionSession on a decode error: it flags the bad
+        frame, keeps the one session alive, and requests a keyframe
+        (FIR/PLI). We mirror that. `flush_buffers()` wipes the SHARED
+        DPB; because Apple emits IDRs only on tile 0 — and a tile-0 IDR
+        does NOT in practice evict tiles 1-3's reference pictures from
+        the working DPB (see `HevcRpsTracker.commit_decoded`) — wiping
+        the DPB ourselves orphans those tiles: their refs are gone, no
+        per-tile IDR re-roots them, and feeding their next P-frames
+        re-wedges the just-flushed decoder → flush → re-wedge → flush, a
+        self-sustaining cascade (observed: ~13 s of back-to-back
+        `errno=35` flushes that even a full `restart()` couldn't break).
+
+        Instead we just stop feeding P-frames until the next IDR re-roots
+        the DPB (`_dpb_has_idr = False`); the caller has requested a fresh
+        keyframe (FIR) on wedge-entry. The codec's existing reference
+        frames survive, so the tiles that weren't hit resume from their own
+        intact history once the keyframe lands. (No `flush_buffers()`, so
+        the RPS tracker still mirrors the live DPB and must NOT be reset
+        here.)
+
+        Under ISS_PERTILE_RECOVERY we go one step finer: rather than the
+        session-wide `_dpb_has_idr = False` (which drops + blanks ALL four
+        tiles until the next tile-0 IDR — an ~8 s freeze across ~4 IDR
+        cycles for what is usually one broken tile), we mark ONLY the
+        gate-flagged broken tiles (`bad_streak > 0`) as awaiting re-root.
+        The healthy tiles keep decoding + publishing from their intact
+        history; the broken tiles' P-frames are dropped and their frames
+        held back until the shared tile-0 IDR clears the await set in
+        `_decode_one`. (If no tile is flagged — shouldn't happen on a real
+        wedge, but be safe — we mark all so we never get stuck.)
+
+        We also DRAIN the worker queue: at high bitrate the wedge is a
+        backlog of hundreds of stale P-frames (each re-EAGAIN-ing), and
+        grinding through them all before the incoming IDR is reached is
+        what stretches recovery to ~15 s. Dropping the backlog lets the
+        worker reach the recovery IDR in ~1 RTT. Safe to empty here: this
+        runs on the decode worker thread (via `_decode_one`), the queue's
+        only consumer."""
+        if _PERTILE_RECOVERY:
+            broken = {
+                ti for ti in range(len(self._tiles))
+                if self._gate._states[ti].bad_streak > 0
+            }
+            if not broken:
+                broken = set(range(len(self._tiles)))
+            self._tiles_await_idr |= broken
+            for ti in broken:
+                with self._tiles[ti].lock:
+                    self._tiles[ti].saw_idr_since_reset = False
+        else:
+            self._dpb_has_idr = False
+            for slot in self._tiles:
+                with slot.lock:
+                    slot.saw_idr_since_reset = False
         self._eagain_streak = 0
 
     def _drain_codec_to_slots(self) -> None:
@@ -1098,6 +1191,7 @@ class HevcDecoder:
         self._next_pts = 0
         self._pts_to_tile = {}
         self._dpb_has_idr = False
+        self._tiles_await_idr.clear()
         self._pre_idr_drops = 0
         self._rps_tracker.reset()
         self.last_clean_donl = [None] * self.num_tiles
