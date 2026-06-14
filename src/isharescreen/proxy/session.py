@@ -388,6 +388,10 @@ class Session:
         # during the burst tail.
         self._dpb_error_window: deque[float] = deque()
         self._last_decoder_restart_t: float = 0.0
+        # Throttle for the per-tile stuck-tile FIR backstop (`_check_stall`
+        # Path B). Separate from `_last_decoder_restart_t` so it never
+        # blocks the 15 s total-freeze restart (Path A).
+        self._last_stuck_tile_fir_t: float = 0.0
 
         # Per-tile FIR rate limit, applied at the wire layer in
         # `_send_fir_for_tile` so it coalesces requests from every
@@ -2433,10 +2437,15 @@ class Session:
           B. *One tile* frozen but the others publish (Apple sometimes
              ignores per-tile FIRs after a SkyLight transition). The
              session-wide last_publish_t looks healthy because the
-             other tiles update it. We need a per-tile watchdog: if
-             any tile's quality-gate has been firing bad-state for
-             >3 s, force a decoder restart so all tiles re-bootstrap
-             from a fresh burst.
+             other tiles update it. A per-tile watchdog keeps a backstop
+             FIR storm on tiles whose `bad_streak` is high — but it does
+             NOT restart/flush the shared decoder (that wipes the healthy
+             tiles' DPB → all-tile freeze cascade; see hevc._try_recovery).
+             The stuck tile rides its last frame until its IDR re-roots it.
+
+        Only Path A's 15 s *total* freeze (no tile publishing at all) still
+        falls back to a decoder restart — at that point there are no
+        healthy tiles left to orphan.
 
         Never marks the session dead from this path — consumers
         handle reconnect on stall via the TCP read-loop separately."""
@@ -2444,6 +2453,15 @@ class Session:
             return
         gap = time.monotonic() - self._last_publish_t
         now = time.monotonic()
+
+        # Track whether packet loss is actively growing — the discriminator
+        # for Path B's two stuck-tile failure modes. A broken-ref stall from
+        # real loss must NOT flush (cascade); a *lossless* stall is a genuine
+        # VideoToolbox saturation wedge that only a restart can clear.
+        cur_loss = self._lost_pkts
+        if cur_loss > getattr(self, "_loss_at_prev_stall_check", 0):
+            self._last_loss_growth_t = now
+        self._loss_at_prev_stall_check = cur_loss
 
         # --- A: session-wide stall ---
         # Apple usually responds to a FIR within ~1 RTT, so keep
@@ -2454,6 +2472,35 @@ class Session:
         # path is the same either way. Only restart after a really
         # long unrecovered silence (≥ 15 s) where the decoder may
         # genuinely be stuck on internal state.
+        #
+        # Saturation wedge (fast path): video packets ARE flowing but the
+        # decoder has produced nothing for a few seconds AND loss is not
+        # growing → a genuine VideoToolbox internal wedge (errno=35 on every
+        # send, even the recovery IDR — incompressible content above the HW
+        # decoder's real-time throughput). EAGAIN no longer bumps bad_streak
+        # (see hevc._handle_decode_error) so Path B can't catch this, and the
+        # no-flush path can't clear an internal VT wedge — only a codec
+        # rebuild does. Gated on NO recent loss so a broken-ref (loss) stall
+        # never restarts here (it stays no-flush). Catches it at ~4 s instead
+        # of the 15 s last resort.
+        recent_loss = (now - getattr(self, "_last_loss_growth_t", 0.0)) < 3.0
+        pkts_flowing = (self._last_video_pkt_t > 0.0
+                        and now - self._last_video_pkt_t < 0.5)
+        if (gap > 2.5 and self._decoder is not None
+                and not recent_loss and pkts_flowing):
+            last_restart = getattr(self, "_last_decoder_restart_t", 0.0)
+            if now - last_restart >= 3.0:
+                self._last_decoder_restart_t = now
+                log.warning(
+                    "decoder stuck %.1fs, packets flowing, no loss — VT "
+                    "saturation wedge; restart decoder + FIR", gap,
+                )
+                try:
+                    self._decoder.restart()
+                except Exception as e:
+                    log.debug("saturation restart failed: %s", e)
+                self.request_fir()
+                return
         if gap > 15.0 and self._decoder is not None:
             last_restart = getattr(self, "_last_decoder_restart_t", 0.0)
             if now - last_restart >= 8.0:
@@ -2522,19 +2569,47 @@ class Session:
             return
         worst = max((s.bad_streak for s in states), default=0)
         if worst >= STUCK_TILE_ERRORS:
-            last_restart = getattr(self, "_last_decoder_restart_t", 0.0)
-            if now - last_restart >= 4.0:
-                self._last_decoder_restart_t = now
-                log.warning(
-                    "tile stuck (worst bad_streak=%d errors); "
-                    "restart decoder + FIR storm",
-                    worst,
-                )
-                try:
-                    self._decoder.restart()
-                except Exception as e:
-                    log.debug("per-tile-stall restart failed: %s", e)
-                self.request_fir()
+            recent_loss = (now - getattr(self, "_last_loss_growth_t", 0.0)) < 3.0
+            stuck = [i for i in range(self.num_tiles)
+                     if states[i].bad_streak >= STUCK_TILE_ERRORS]
+            if recent_loss:
+                # Broken reference chain from real packet loss. A stuck TILE
+                # must NOT restart/flush the SHARED decoder: `restart()`
+                # wipes all four tiles' DPB, orphaning the 3 healthy tiles
+                # (no per-tile IDR re-roots them) → an all-tile freeze +
+                # errno=35 restart-loop (the exact cascade hevc._try_recovery
+                # avoids). Keep a backstop FIR storm; the healthy tiles run on
+                # and hevc.py drops the stuck tile's P-frames until its IDR.
+                last_fir = getattr(self, "_last_stuck_tile_fir_t", 0.0)
+                if now - last_fir >= 2.0:
+                    self._last_stuck_tile_fir_t = now
+                    log.warning(
+                        "tile stuck (worst bad_streak=%d, tiles=%s, loss "
+                        "active); FIR storm, no flush (native-aligned)",
+                        worst, stuck,
+                    )
+                    self.request_fir()
+            else:
+                # Lossless stall = genuine VideoToolbox saturation wedge
+                # (errno=35 on every send, even the recovery IDR — content
+                # above the HW decoder's real-time throughput). The no-flush
+                # path can't clear an internal VT wedge; only a codec rebuild
+                # does. Safe to restart here: with no loss there are no
+                # missing refs to orphan, so no cascade. Throttled so the
+                # decoder can re-bootstrap before another restart.
+                last_restart = getattr(self, "_last_decoder_restart_t", 0.0)
+                if now - last_restart >= 4.0:
+                    self._last_decoder_restart_t = now
+                    log.warning(
+                        "tile stuck (worst bad_streak=%d, tiles=%s, no loss) "
+                        "— VT saturation wedge; restart decoder + FIR",
+                        worst, stuck,
+                    )
+                    try:
+                        self._decoder.restart()
+                    except Exception as e:
+                        log.debug("saturation-wedge restart failed: %s", e)
+                    self.request_fir()
 
     # ── tx-side port helpers ─────────────────────────────────────────
 
