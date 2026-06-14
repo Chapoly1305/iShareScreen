@@ -1712,6 +1712,24 @@ class Session:
         else:
             packets = sorted(grp, key=lambda x: x[0])
 
+        # Frame-completeness check (native jitter-buffer behaviour). An
+        # access unit is fragmented across consecutive RTP sequence
+        # numbers; a gap between this group's sorted packets means at
+        # least one slice / FU fragment never arrived, so the reassembled
+        # NALUs are truncated. Apple's own viewer (AVConference's
+        # VideoPacketBuffer) does NOT feed an incomplete frame to the
+        # decoder — it skips it and requests recovery — because feeding a
+        # partial access unit produces malformed-bitstream errors that
+        # can wedge VideoToolbox. We mirror that below: harvest param
+        # sets first (those NALUs may be intact and small), then drop the
+        # frame if it's incomplete. `&0xFFFF` makes the 65535->0 wrap a
+        # diff of 1 and a duplicate seq a diff of 0; only diff>1 is a gap.
+        oseq = [p[0] for p in packets]
+        incomplete = any(
+            ((oseq[i + 1] - oseq[i]) & 0xFFFF) > 1
+            for i in range(len(oseq) - 1)
+        )
+
         nalus = list(reassemble_group([p for _, _, p in packets]))
 
         # If a dynamic resolution change is in progress, harvest fresh
@@ -1719,6 +1737,27 @@ class Session:
         # decoder has the correct dimensions.
         if self._needs_param_harvest and nalus:
             self._harvest_param_sets(nalus)
+            if self._needs_param_harvest:
+                # Harvest still incomplete: the shared decoder context is
+                # still sized for the OLD canvas. Feeding these new-canvas
+                # NALUs into it breaks the DPB on every resize and can
+                # wedge VideoToolbox (errno=35). Drop the group — the
+                # encoder re-sends the IDR burst (we FIR on harvest
+                # completion below, and `_check_stall` FIR-storms if the
+                # param sets are ever lost), so we resume cleanly once the
+                # new SPS/PPS land and the decoder is rebuilt.
+                return
+            # Harvest just completed inside the call above: `set_params` +
+            # `restart` rebuilt the context at the new dimensions, so the
+            # remaining NALUs in THIS group (the new-canvas IDR slice) are
+            # safe to feed below.
+
+        if incomplete:
+            # Don't feed a partial access unit. The broken reference chain
+            # is re-rooted by the FIR the decoder's missing-ref / wedge
+            # path requests once a later complete frame references this
+            # dropped one.
+            return
 
         for nalu in nalus:
             self._decoder.feed_nalu(nalu, ti)
