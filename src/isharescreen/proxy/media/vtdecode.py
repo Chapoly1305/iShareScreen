@@ -24,6 +24,7 @@ import logging
 import os
 import struct
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -46,6 +47,11 @@ except Exception:  # pragma: no cover - non-macOS / missing pyobjc
 _LOCK_READONLY = 0x00000001                       # kCVPixelBufferLock_ReadOnly
 _NV24_FMT = 0x34343466                             # '444f'
 _VT_DEBUG = os.environ.get("ISS_VT_DEBUG") == "1"
+# Diagnostic: dump every VCL NALU we feed VT (Annex-B framed, in feed order)
+# so the feed ORDER can be analysed offline against POC. Same env var as the
+# libav path; only the active decoder writes.
+_NALU_DUMP_PATH = os.environ.get("ISS_NALU_DUMP")
+_nalu_dump_f = open(_NALU_DUMP_PATH, "wb") if _NALU_DUMP_PATH else None
 
 
 def available() -> bool:
@@ -91,13 +97,21 @@ class VTHevcDecoder:
         # log path, never fires for VT). Provide a real gate, a None tracker.
         self._gate = FrameQualityGate(num_tiles)
         self._rps_tracker = None
-        self._hw_name = "videotoolbox"
+        # Display name surfaced as the "decoder" field in the control-socket
+        # snapshot + the TUI header line. Distinct from the libav hwaccel name
+        # ("videotoolbox") so an operator can see which path is live: this
+        # direct-VTDecompressionSession path vs libav's VT *hwaccel* glue.
+        self._hw_name = "videotoolbox-native"
 
         self._fmt = None                       # CMVideoFormatDescription
         self._session = None                   # VTDecompressionSession
         self._params: Optional[tuple] = None   # (vps, sps, (pps...))
         self._seq = 0                          # monotonic decode counter
         self._feed_total = 0
+        self._feeds_at_last_pub = 0
+        self._last_pub_t = 0.0
+        self._last_err_fir_t = 0.0
+        self._restart_suppressed = 0
         self._decode_errors = 0                # benign VT conceals (diagnostic)
         self._lock = threading.Lock()          # guards session create/teardown
         self._seen_fmt = False
@@ -175,12 +189,26 @@ class VTHevcDecoder:
         if 0 <= tile_idx < self.num_tiles:
             b = self.nalu_counts_per_tile[tile_idx]
             b[t] = b.get(t, 0) + 1
+        if t in IDR_RANGE:
+            # A tile-0 IDR re-roots the shared context for ALL tiles (Apple
+            # IDRs on tile 0 only; cross-tile refs re-root the rest), so fan
+            # out — matches the libav path. This is half of the gate's
+            # two-condition `keyframe_required` clear; `mark_clean` on the
+            # next good frame is the other half. Without it the gate — armed
+            # by an SSRC adoption or a stuck event from session.py, not by VT
+            # (VT decodes fine) — stays armed forever and FIR-storms ("4 tiles
+            # still need recovery; Apple not responding to FIR").
+            for ti in range(self.num_tiles):
+                self._gate.mark_idr_observed(ti)
         # Only VCL slices (0-31) are decode frames. VPS/SPS/PPS (32-34), SEI
         # (39/40) etc. reached the decoder inline on the libav path, but VT
         # takes its parameter sets from the CMVideoFormatDescription — feeding
         # a non-VCL NALU as a sample buffer just produces a decode error.
         if t >= 32:
             return
+        if _nalu_dump_f is not None:
+            _nalu_dump_f.write(b"\x00\x00\x00\x01" + (
+                nalu if isinstance(nalu, bytes) else bytes(nalu)))
         self._feed_total += 1
         if _VT_DEBUG and self._feed_total % 200 == 0:
             log.info("VTdbg feed/tile=%s good=%s errs=%d",
@@ -236,6 +264,19 @@ class VTHevcDecoder:
         diagnostic snapshot."""
         if status != 0 or image_buffer is None:
             self._decode_errors += 1
+            # Request a recovery keyframe EARLY (throttled) rather than waiting
+            # for session.py's 3 s "stuck" watchdog. A single missing/undecodable
+            # frame breaks the inter-frame chain → every later frame conceals
+            # until an IDR; Apple answers a FIR in ~0.2 s, so FIRing on the first
+            # error of a burst turns a ~3 s freeze into a sub-second blip. The
+            # gate's FIR send is itself rate-limited, and the 0.5 s throttle here
+            # keeps bad_streak low so the Path-B watchdog never trips (and VT's
+            # restart() is a no-op regardless) — no storm, no cascade.
+            now = time.monotonic()
+            if (0 <= tile_idx < self.num_tiles
+                    and now - self._last_err_fir_t >= 0.5):
+                self._last_err_fir_t = now
+                self._gate.mark_decode_error(tile_idx)
             return
         tile = self._cvbuf_to_tile(image_buffer)
         if tile is None:
@@ -247,6 +288,30 @@ class VTHevcDecoder:
             slot.frame = tile
             slot.seq = seq
             slot.good_count += 1
+        # Diagnostic: measure the session-wide publish gap. _on_decoded is
+        # single-threaded (sync decode on the RX process thread), so the gap
+        # between any two calls is the real publish gap. A long gap with MANY
+        # feeds-in-between = VT stalled while being fed; with ~0 feeds = the
+        # RX/host starved us. This is what the Path-A "decoder stuck" watchdog
+        # trips on.
+        now = time.monotonic()
+        if self._last_pub_t > 0.0:
+            gap = now - self._last_pub_t
+            if gap > 1.5:
+                fed = self._feed_total - self._feeds_at_last_pub
+                if fed > 30:
+                    # Fed but couldn't decode for >1.5 s = a real decode stall.
+                    log.warning("VT decode stall %.2fs — fed %d NALUs, all "
+                                "concealed (broken ref chain)", gap, fed)
+                elif _VT_DEBUG:
+                    # ~0 feeds = host/RX sent nothing (static screen / idle).
+                    log.info("VT publish gap %.2fs — host idle (fed %d)", gap, fed)
+        self._last_pub_t = now
+        self._feeds_at_last_pub = self._feed_total
+        # The clean-frame half of the gate's two-condition recovery clear
+        # (pairs with mark_idr_observed). Lets `keyframe_required` discharge
+        # so the FIR storm stops once a real frame flows again.
+        self._gate.mark_clean(tile_idx)
         if self._on_frame_published is not None:
             try:
                 self._on_frame_published(tile_idx)
@@ -324,8 +389,21 @@ class VTHevcDecoder:
         pass
 
     def restart(self) -> None:
-        with self._lock:
-            self._build_session_locked()
+        """DPB-PRESERVING no-op by design. session.py calls restart() on SSRC
+        adoption and from the stall watchdog to "reset" the decoder — but for
+        VideoToolbox a rebuild WIPES the DPB, producing a ~3 s
+        all-frames-conceal burst until the next IDR, which re-trips the
+        watchdog → restart → a self-sustaining freeze cascade (the same
+        flush-is-the-engine pattern the libav path suffers). VT doesn't need
+        it: it re-roots on the IDR the paired request_fir() pulls (or Apple's
+        natural cadence) while keeping its DPB intact, so every "restart" path
+        degrades to native-aligned FIR-only recovery. Only set_params() — a
+        real format/resolution change with a new SPS — rebuilds the session."""
+        self._restart_suppressed += 1
+        if _VT_DEBUG:
+            log.info("VT restart() suppressed (DPB-preserving, #%d) — "
+                     "recovering via FIR/IDR, not a session wipe",
+                     self._restart_suppressed)
 
     def close(self) -> None:
         with self._lock:
