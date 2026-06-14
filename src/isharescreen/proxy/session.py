@@ -850,13 +850,43 @@ class Session:
         # videotoolbox quirks) and for verifying the SW fallback path
         # actually works on each platform.
         import os as _os
+        import sys as _sys
+        from .media import vtdecode
         prefer_hwaccel = _os.environ.get("ISS_FORCE_SW_HEVC", "0") == "0"
-        self._decoder = HevcDecoder(
-            num_tiles=num_tiles,
-            enable_quality_gate=True,
-            on_frame_published=self._on_frame_published,
-            prefer_hwaccel=prefer_hwaccel,
+        # Decoder selection. On macOS the native VideoToolbox path
+        # (VTDecompressionSession, vtdecode.py) decodes Apple's stream the way
+        # its own viewer does — VideoToolbox manages the DPB and conceals the
+        # odd missing-ref frame instead of BLOCKING, which is what libav's
+        # hwaccel glue does (errno=35 → our drain/drop recovery → cascade
+        # freeze). It's the default on macOS; `ISS_DECODER=libav` forces the
+        # cross-platform libav path, and `ISS_FORCE_SW_HEVC=1` forces libav
+        # software (and therefore libav).
+        _decoder_choice = _os.environ.get("ISS_DECODER", "auto").lower()
+        _use_vt = (
+            _sys.platform == "darwin"
+            and prefer_hwaccel
+            and _decoder_choice in ("auto", "vt", "videotoolbox")
+            and vtdecode.available()
         )
+        if _use_vt:
+            try:
+                self._decoder = vtdecode.VTHevcDecoder(
+                    num_tiles=num_tiles,
+                    enable_quality_gate=True,
+                    on_frame_published=self._on_frame_published,
+                )
+                log.info("HEVC decoder: native VideoToolbox (VTDecompressionSession)")
+            except Exception as e:
+                log.warning("VideoToolbox-native decoder unavailable (%s) — "
+                            "falling back to libav", e)
+                _use_vt = False
+        if not _use_vt:
+            self._decoder = HevcDecoder(
+                num_tiles=num_tiles,
+                enable_quality_gate=True,
+                on_frame_published=self._on_frame_published,
+                prefer_hwaccel=prefer_hwaccel,
+            )
         if not prefer_hwaccel:
             log.info("ISS_FORCE_SW_HEVC=1: HW decoders disabled")
         self._decoder.set_params(burst.vps, burst.sps, burst.all_pps)

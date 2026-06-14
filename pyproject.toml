@@ -50,6 +50,13 @@ dependencies = [
     # markup-escape call and also comes in transitively via textual.
     "textual>=0.50",
     "rich>=13",
+    # macOS: native VideoToolbox HEVC decode path (src/.../media/vtdecode.py).
+    # VideoToolbox manages the DPB the way Apple's own viewer does, avoiding
+    # libav's hwaccel DPB mismanagement that periodically wedges the stream.
+    # Other platforms use the libav `av` decoder; these are darwin-only.
+    "pyobjc-framework-VideoToolbox>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-CoreMedia>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]
