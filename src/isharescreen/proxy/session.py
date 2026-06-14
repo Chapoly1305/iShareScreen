@@ -106,9 +106,17 @@ _BURST_RETRY_SLEEP_S = 0.8
 # packets aren't dropped by the kernel (RcvbufErrors). The process thread
 # does decrypt + dispatch from the queue. If the process thread can't keep
 # up the queue fills and we drop packets at the app layer instead — same
-# end result as a kernel drop, but moved to a place we can measure. 4096
-# packets at ~1500 bytes is ~6 MB worst-case memory.
-_UDP_DRAIN_QUEUE_MAX = 4096
+# end result as a kernel drop, but moved to a place we can measure.
+#
+# 16384 (~24 MB worst-case at ~1500 B) absorbs the bursts a HiDPI/2x stream
+# produces: at ~300 Mbps the packet rate is ~28k pps, and the old 4096 cap
+# was only ~0.15 s of buffer — measured overflowing in bursts (snapshot
+# showed depth≈1 but drop=15197, i.e. the process thread keeps up on average
+# but spikes blew past the shallow queue, breaking the ref chain). The deeper
+# queue is ~0.6 s, enough for the encoder's per-frame/IDR bursts; the process
+# thread drains it back to ~empty between spikes so the added latency only
+# appears during a genuine overload, not steady state.
+_UDP_DRAIN_QUEUE_MAX = 16384
 
 # Stall threshold — if no decoded video frame in this long, mark the
 # session as soft-dead. Consumer reconnects by calling close() + connect().

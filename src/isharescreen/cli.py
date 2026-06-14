@@ -105,11 +105,11 @@ def _make_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "--hidpi", choices=("auto", "on", "off"), default="auto",
         help=(
-            "HiDPI (Retina) rendering of the host display. 'on' = always 2x "
-            "(crisp, high bandwidth); 'off' = flat 1x (low bandwidth, larger "
-            "UI on non-Retina clients); 'auto' (default) = match the local "
-            "display (2x on a Retina client, 1x otherwise; downgrades to 1x "
-            "when 2x wouldn't fit the host backing cap)"
+            "HiDPI (Retina) rendering of the host display. 'on' = Retina 2x, "
+            "full quality (up to ~300 Mbps); 'off' = flat 1x quality (up to "
+            "~60 Mbps); 'auto' (default) = match the local display (2x on a "
+            "Retina client, 1x otherwise; downgrades to 1x when 2x wouldn't fit "
+            "the host backing cap)"
         ),
     )
     g.add_argument(

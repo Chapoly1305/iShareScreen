@@ -147,9 +147,9 @@ class ConnectScreen(Screen):
             yield Label("HiDPI")
             yield Select(
                 options=[
-                    ("Auto — match this display (Retina→2×, else 1×)", "auto"),
-                    ("On — Retina 2× (crisp, high bandwidth)", "on"),
-                    ("Off — flat 1× (low bandwidth, bigger UI)", "off"),
+                    ("Auto — match this display (Retina → full, else flat)", "auto"),
+                    ("On — Retina, full quality (up to ~300 Mbps)", "on"),
+                    ("Off — flat quality (up to ~60 Mbps)", "off"),
                 ],
                 value=self._prefill.hidpi,
                 id="hidpi",
