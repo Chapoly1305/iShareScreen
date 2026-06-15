@@ -972,7 +972,7 @@ class Session:
             # the generic libav d3d11va-RExt / Intel QSV paths on Windows/Linux.
             # ISS_FORCE_SW_HEVC=1 pins the libav software path.
             _pf = prefer_hwaccel
-            _override = ("libav-hevc444" if not prefer_hwaccel
+            _override = ("libav-hevc444-sw" if not prefer_hwaccel
                          else registry.normalize_override(_decoder_choice, "hevc"))
 
         _spec, self._decoder = registry.build_best(

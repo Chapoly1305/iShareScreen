@@ -76,14 +76,14 @@ def _probe_one(hwaccel_type: str) -> bool:
         return False
 
 
-_method_cache: dict[str, str] = {}
+_libav_cache: dict[str, bool] = {}
+_qsv_cache: dict[str, bool] = {}
 
 
 def _qsv_hevc444() -> bool:
-    """Whether Intel Quick Sync (`hevc_qsv`) hardware-decodes HEVC 4:4:4.
-    On Intel Gen11+/Xe iGPUs this succeeds where the generic libav hwaccel
-    can't (libav's d3d11va HEVC path lacks the 4:4:4 profile). Lazy import so
-    the QSV decoder module is only pulled in when probing."""
+    """Raw probe: whether Intel Quick Sync (`hevc_qsv`) hardware-decodes HEVC
+    4:4:4. Succeeds on Intel Gen11+/Xe where older generic d3d11va couldn't.
+    Lazy import so the QSV module is only pulled in when probing."""
     try:
         from .qsvhevc import qsv_hevc444_available
         return qsv_hevc444_available()
@@ -92,40 +92,61 @@ def _qsv_hevc444() -> bool:
         return False
 
 
-def hevc444_decode_method() -> "str | None":
-    """How HEVC 4:4:4 can be hardware-decoded here: ``"qsv"`` (Intel Quick
-    Sync), ``"libav"`` (generic libav hwaccel / native VideoToolbox), or
-    ``None`` (no HW 4:4:4 → AVC fallback). Cached for the process lifetime."""
-    if "method" in _method_cache:
-        return _method_cache["method"] or None
+# The generic-libav and Intel-QSV HEVC 4:4:4 paths are probed INDEPENDENTLY
+# (not first-wins) so the decoder registry can prefer the vendor-specific
+# decoder when both work, per the configured priorities. Each is cached for
+# the process lifetime (hardware capability can't change without new hardware)
+# and honors the `ISS_HEVC444=0/1` escape hatch.
+
+def libav_hevc444_hwdecode() -> bool:
+    """Generic libav hwaccel path: d3d11va RExt / vaapi / cuda on Win/Linux, or
+    native VideoToolbox on macOS. `ISS_HEVC444=0/1` forces off/on."""
+    if "v" in _libav_cache:
+        return _libav_cache["v"]
     override = os.environ.get("ISS_HEVC444")
     if override == "0":
-        _method_cache["method"] = ""
-        return None
-    method = ""
-    if sys.platform == "darwin":
-        method = "libav"          # native VideoToolbox path (vtdecode.py)
+        r = False
+    elif sys.platform == "darwin":
+        r = True                       # native VideoToolbox path (vtdecode.py)
+    elif override == "1":
+        r = True                       # forced on; trust the libav path
     else:
         hwaccels = _PROBE_HWACCELS.get(sys.platform, _PROBE_HWACCELS["*"])
-        if any(_probe_one(h) for h in hwaccels):
-            method = "libav"
-        elif _qsv_hevc444():
-            method = "qsv"
-    if override == "1" and not method:
-        method = "libav"          # forced on; trust the libav path
-    _method_cache["method"] = method
-    return method or None
+        r = any(_probe_one(h) for h in hwaccels)
+    _libav_cache["v"] = r
+    return r
+
+
+def qsv_hevc444_hwdecode() -> bool:
+    """Intel Quick Sync (`hevc_qsv`) path. `ISS_HEVC444=0` forces off; macOS has
+    no QSV."""
+    if "v" in _qsv_cache:
+        return _qsv_cache["v"]
+    if os.environ.get("ISS_HEVC444") == "0" or sys.platform == "darwin":
+        r = False
+    else:
+        r = _qsv_hevc444()
+    _qsv_cache["v"] = r
+    return r
+
+
+def hevc444_decode_method() -> "str | None":
+    """Back-compat summary of the independent probes: 'libav' (generic,
+    reported first) / 'qsv' / None. The registry uses the probes directly so it
+    can prefer QSV by priority; this helper just preserves the old API."""
+    if libav_hevc444_hwdecode():
+        return "libav"
+    if qsv_hevc444_hwdecode():
+        return "qsv"
+    return None
 
 
 def supports_hevc444_hwdecode() -> bool:
-    """Whether this platform's GPU can hardware-decode HEVC 4:4:4 by any path.
-    Cached for the process lifetime (the answer can't change without new
-    hardware).
-
-    `ISS_HEVC444=0`/`1` overrides the probe (force AVC fallback / force HEVC) —
-    an escape hatch for a misbehaving probe and for testing the fallback path
-    on 4:4:4-capable hardware."""
-    return hevc444_decode_method() is not None
+    """Whether ANY hardware path decodes HEVC 4:4:4 here. Drives codec
+    negotiation (no HW 4:4:4 → AVC 4:2:0). `ISS_HEVC444=0/1` overrides the
+    probe — an escape hatch for a misbehaving probe or for testing the fallback
+    on capable hardware."""
+    return libav_hevc444_hwdecode() or qsv_hevc444_hwdecode()
 
 
 # NOTE: codec resolution (`--codec auto` -> hevc/avc) moved to
@@ -133,4 +154,5 @@ def supports_hevc444_hwdecode() -> bool:
 # 4:4:4 decoder is available rather than probing here directly. hwcaps remains
 # the probe provider (the registry's availability callbacks delegate to it).
 
-__all__ = ["supports_hevc444_hwdecode", "hevc444_decode_method"]
+__all__ = ["supports_hevc444_hwdecode", "hevc444_decode_method",
+           "libav_hevc444_hwdecode", "qsv_hevc444_hwdecode"]
