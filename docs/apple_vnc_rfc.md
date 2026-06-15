@@ -759,13 +759,13 @@ The switch to compressed media is gated on completion of the `0x1c` MediaStreamO
        46B  video2 key1 ; 46B video2 key2 ; video2_offer (video2_offer_len bytes; present only if non-zero)
 ```
 
-- **Offer/answer state**: client sends `0x1c` offer → server returns `0x1c` answer → media transport begins. The per-stream `*_offer` blobs are opaque to the screen-sharing code (passed to AVConference's `AVCMediaStreamNegotiator`); their internal format and the full answer layout remain a **revision gap**. (The `u32` at +0x06 is the `flags` field above, not an unknown word; the `u32` at +0x10 is reserved/zero in every captured offer.)
+- **Offer/answer state**: client sends `0x1c` offer → server returns `0x1c` answer → media transport begins. The per-stream `*_offer` blobs are passed to AVConference's `AVCMediaStreamNegotiator`; the video offer is a protobuf carrying one codec bank per offered codec, and the server selects the codec by the bank's RTP payload number (§10.7.1) — this is the knob a client uses to choose HEVC vs. AVC. The full answer layout (beyond the canvas geometry the client reads back) remains a **revision gap**. (The `u32` at +0x06 is the `flags` field above, not an unknown word; the `u32` at +0x10 is reserved/zero in every captured offer.)
 
 ### 10.4 UDP Flows and RTP Framing
 
 Two UDP flows relative to the control port `P` (default 5900):
 
-- **`P+1` (5901): video** — RTP payload type `100` (HEVC), with the video stream's RTCP multiplexed on the same port;
+- **`P+1` (5901): video** — RTP payload type `100` (HEVC) **or** `123` (H.264/AVC), depending on the negotiated codec (§10.7.1); the video stream's RTCP is multiplexed on the same port;
 - **`P` (5900): audio** — RTP payload type `101` (AAC-ELD-SBR), with the audio stream's RTCP multiplexed on the same port.
 
 RTCP is rtcp-muxed onto each media port alongside that port's RTP; there is no separate RTCP port. RTCP (PT 200–207) is seen on both 5901 and 5900. Video is delivered as **four RTP streams** on four consecutive SSRCs, each a horizontal tile (§10.7). Each SSRC has an independent sequence space; receivers MUST track the SRTP rollover counter (ROC) **per SSRC**.
@@ -804,6 +804,23 @@ NAL units are ordered across SSRCs by decoding-order number to feed a single dec
 - All four tile streams MUST be fed to a **single** HEVC decoder instance: the encoder uses cross-tile picture references (a P-frame on one SSRC references picture-order-count values produced on another SSRC); per-tile decoders fail with missing-reference errors. The base SSRC carries IDRs; the other three carry only inter-coded frames; a single shared-DPB decoder fed all four in decoding order decodes every tile.
 - IDR access units appear only on the **base SSRC** (tile 0); a client SHOULD treat any IDR as a DPB reset for all tiles. Presentation recomposites the four tiles vertically in SSRC order.
 - The exact tile-to-screen geometry rules (strip ordering, CTU padding) beyond the observed four-strip model are a **revision gap**.
+
+### 10.7.1 Codec Negotiation and the AVC / H.264 Alternative (4:2:0)
+
+The video MediaBlob (§10.3) advertises one **codec bank per offered codec**, each keyed by an RTP payload number. The server selects a codec by that number and, when more than one is offered, **prefers HEVC**. Two banks are defined:
+
+- payload **`100` → HEVC** Range Extensions, 4:4:4, 8-bit (§10.7);
+- payload **`123` → H.264 / AVC**.
+
+A client therefore selects the codec by **which bank(s) it advertises**: offering both yields HEVC; offering only the `123` bank forces H.264. The server's H.264 encoder emits **High profile @ L4.2, 4:2:0** — it exposes only the H.264 `Main` / `ConstrainedBaseline` profile levels plus this High path, **none of which is 4:4:4**, so the AVC stream is always 4:2:0. This is the interop path for receivers whose GPU cannot hardware-decode HEVC 4:4:4 (most consumer GPUs decode H.264 / HEVC-Main 4:2:0 in hardware but not HEVC RExt 4:4:4). Confidence: **confirmed** (static analysis of `AVConference` codec/profile tables + live negotiation + live decode of a standalone client).
+
+The H.264 RTP framing is an Apple variant of RFC 6184 that mirrors the HEVC variant's decoding-order numbering:
+
+- **Parameter sets** are NOT sent as Annex-B SPS/PPS NALs. They arrive once, up front, as an Apple-wrapped **`avc1` sample description embedding an `avcC` box** (the MP4 `AVCDecoderConfigurationRecord`, carrying SPS+PPS). This packet's first byte has the H.264 forbidden-zero-bit set, so it is never confused with a slice NAL; a receiver parses the `avcC` to seed its decoder. A client that assumes in-band Annex-B parameter sets never starts.
+- **Slices** ride in **Fragmentation Unit B (type 29)** with a **2-byte DON** after the FU header (the H.264 analogue of HEVC's DONL). STAP-A/STAP-B aggregation and single-NAL packets follow RFC 6184 with the same DON placement.
+- The four-tile / four-SSRC model, base-SSRC-only IDRs, and single shared-decoder requirement are the **same** as HEVC (§10.7). A shared H.264 decoder fed all four tiles in decoding order decodes every tile; libav emits benign "reference frames exceed max" warnings because the shared DPB pools four tiles' references.
+
+Residual gap: AVC behaviour under mid-session dynamic resolution (§10.9) — re-harvesting a fresh `avcC` after a resize — is unverified.
 
 ### 10.8 RTCP Feedback and Loss Recovery
 
@@ -890,7 +907,8 @@ Profile A plus the Adaptive media transport.
 | R-C4 | Decrypt SRTP with AES-256-CTR + HMAC-SHA1-80, tracking ROC per SSRC | MUST | C | decrypt-verify |
 | R-C5 | Depayload HEVC per the Apple RFC 7798 variant (DONL on single/AP/FU) | MUST | C | decode |
 | R-C6 | Feed all four tile SSRCs to a single HEVC decoder; treat any IDR as a DPB reset; composite tiles vertically | MUST | C | decode |
-| R-C7 | Decode HEVC RExt 4:4:4 8-bit | MUST | C | decode |
+| R-C7 | Decode HEVC RExt 4:4:4 8-bit (the default-negotiated codec) | MUST | C | decode |
+| R-C7a | Optionally negotiate the AVC bank (payload `123`) and decode H.264 High 4:2:0 — depay per RFC 6184 + Apple DON, seed the decoder from the up-front `avc1`/`avcC` config (§10.7.1) — for receivers without HEVC 4:4:4 hardware decode | MAY | C | decode |
 | R-C8 | Emit RTCP receiver feedback and a keyframe request (legacy FIR PT 192 or AVPF FIR) on loss | SHOULD | C | interop |
 | R-C9 | Emit a media keepalive | MAY | C | interop |
 | R-C10 | On media negotiation failure or sustained decode failure, fall back to the framebuffer path (§12) | MUST | C | negative |
