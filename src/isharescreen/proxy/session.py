@@ -42,7 +42,7 @@ from .input import InputController
 from .media.aac_eld import AacEldDecoder, make_aac_eld_decoder
 from .media.hevc import HevcDecoder
 from .media.hwcaps import resolve_codec
-from .media.nalu import reassemble_group, reassemble_group_h264
+from .media.nalu import reassemble_group, reassemble_group_h264, is_avc_config
 from .media.quality_gate import TileVisState
 from .. import __version__ as _iss_version
 from .control import ControlServer
@@ -468,6 +468,15 @@ class Session:
         # during the burst tail.
         self._dpb_error_window: deque[float] = deque()
         self._last_decoder_restart_t: float = 0.0
+        # AVC hardware-decode POC-wrap workaround: automatically request a
+        # fresh IDR before frame_num/poc_lsb wrap, the rollover the AMD d3d11va
+        # H.264 decoder mishandles. Enabled by ISS_AVC_HW_REANCHOR (any truthy
+        # value — keeps hardware decode on instead of the software fallback).
+        # Frame-count driven, not time-based; see _maybe_reanchor.
+        import os as _os0
+        _reanchor_env = (_os0.environ.get("ISS_AVC_HW_REANCHOR", "") or "").strip()
+        self._avc_reanchor_enabled: bool = _reanchor_env not in ("", "0", "false", "no")
+        self._last_reanchor_t: float = 0.0
         # Throttle for the per-tile stuck-tile FIR backstop (`_check_stall`
         # Path B). Separate from `_last_decoder_restart_t` so it never
         # blocks the 15 s total-freeze restart (Path A).
@@ -936,16 +945,67 @@ class Session:
             # has none of the HEVC RExt-4:4:4 hwaccel pathologies that make the
             # native-VT path necessary for HEVC.
             from .media.avc import AvcDecoder
+            # d3d11va's H.264 decoder corrupts Apple's stream at the
+            # frame_num/POC wrap (~34 s in): Apple encodes the 4 tiles as one
+            # interleaved low-delay stream anchored on per-tile long-term
+            # references, and the D3D11 decoder's reference resolution collapses
+            # when poc_lsb wraps (log2_max_poc_lsb=13 → every ~34 s) — all four
+            # tiles start decoding off the same picture, so the canvas dissolves
+            # into four identical bands. Software libav decodes the identical
+            # bitstream correctly indefinitely (verified: clean past the wrap,
+            # 839 fps aggregate = 3.5× real-time on this class of machine), so
+            # force software for AVC on Windows. Override with ISS_AVC_HWACCEL=1.
+            avc_prefer_hwaccel = prefer_hwaccel
+            if self._avc_reanchor_enabled:
+                # Keep hardware decode; avoid the d3d11va POC-wrap bug by
+                # periodically re-anchoring with a fresh IDR (see _maybe_
+                # reanchor, driven from _tx_loop). Lower latency/CPU than the
+                # software fallback at the cost of a keyframe burst every N s.
+                avc_prefer_hwaccel = prefer_hwaccel
+                log.info("AVC: hardware decode + automatic IDR re-anchor "
+                         "(every ~%d frames since IDR, d3d11va POC-wrap "
+                         "workaround)", self._AVC_REANCHOR_FRAMES)
+            elif (_sys.platform == "win32"
+                    and _os.environ.get("ISS_AVC_HWACCEL", "0") == "0"):
+                avc_prefer_hwaccel = False
+                log.info("AVC: forcing software decode "
+                         "(d3d11va H.264 POC-wrap corruption workaround)")
             self._decoder = AvcDecoder(
                 num_tiles=num_tiles,
                 enable_quality_gate=True,
                 on_frame_published=self._on_frame_published,
-                prefer_hwaccel=prefer_hwaccel,
+                prefer_hwaccel=avc_prefer_hwaccel,
             )
-            log.info("AVC/H.264 decoder: libav shared context")
+            log.info("AVC/H.264 decoder: libav shared context (%s)",
+                     "software" if not avc_prefer_hwaccel else "hwaccel-preferred")
         else:
+            # Intel Quick Sync HEVC 4:4:4: the generic libav d3d11va HEVC
+            # hwaccel can't decode Apple's 4:4:4 (falls back to CPU), but
+            # Intel's dedicated hevc_qsv decoder can. Prefer it when the probe
+            # confirmed QSV is the working 4:4:4 path on this machine — that's
+            # what restores full-quality hardware decode on an Intel iGPU.
+            from .media.hwcaps import hevc444_decode_method
+            _use_qsv = (
+                prefer_hwaccel
+                and _decoder_choice in ("auto", "qsv")
+                and hevc444_decode_method() == "qsv"
+            )
+            if _use_qsv:
+                try:
+                    from .media.qsvhevc import QsvHevcDecoder
+                    self._decoder = QsvHevcDecoder(
+                        num_tiles=num_tiles,
+                        enable_quality_gate=True,
+                        on_frame_published=self._on_frame_published,
+                    )
+                    log.info("HEVC 4:4:4 decoder: Intel Quick Sync (hevc_qsv)")
+                except Exception as e:
+                    log.warning("QSV HEVC decoder unavailable (%s) — falling back "
+                                "to libav", e)
+                    _use_qsv = False
             _use_vt = (
-                _sys.platform == "darwin"
+                not _use_qsv
+                and _sys.platform == "darwin"
                 and prefer_hwaccel
                 and _decoder_choice in ("auto", "vt", "videotoolbox")
                 and vtdecode.available()
@@ -962,7 +1022,7 @@ class Session:
                     log.warning("VideoToolbox-native decoder unavailable (%s) — "
                                 "falling back to libav", e)
                     _use_vt = False
-            if not _use_vt:
+            if not _use_qsv and not _use_vt:
                 self._decoder = HevcDecoder(
                     num_tiles=num_tiles,
                     enable_quality_gate=True,
@@ -1877,16 +1937,25 @@ class Session:
         )
 
         if self._resolved_codec == "avc":
-            # H.264 RTP framing (RFC 6184 + Apple DON); avc1/avcC config
-            # wrappers are skipped here — the canvas is fixed mid-stream so the
-            # burst-harvested SPS/PPS stay valid (AVC dynamic-resolution
-            # re-harvest is a separate follow-up).
-            nalus = list(reassemble_group_h264([p for _, _, p in packets]))
+            raw_payloads = [p for _, _, p in packets]
+            if self._needs_param_harvest:
+                # AVC param sets live in an avcC config packet, not inline NALs.
+                # Scan the raw payloads and harvest on first hit.
+                for raw in raw_payloads:
+                    if is_avc_config(raw):
+                        self._harvest_avc_param_sets(raw)
+                        break
+                if self._needs_param_harvest:
+                    # Config packet not seen yet — drop until it arrives.
+                    return
+                # Harvest just completed: decoder rebuilt with new SPS/PPS;
+                # fall through and feed the IDR NALUs from this same group.
+            nalus = list(reassemble_group_h264(raw_payloads))
         else:
             nalus = list(reassemble_group([p for _, _, p in packets]))
 
-        # If a dynamic resolution change is in progress, harvest fresh
-        # VPS/SPS/PPS from the new encoder's burst so the restarted
+        # If a dynamic resolution change is in progress (HEVC path), harvest
+        # fresh VPS/SPS/PPS from the new encoder's burst so the restarted
         # decoder has the correct dimensions.
         if self._needs_param_harvest and nalus:
             self._harvest_param_sets(nalus)
@@ -1960,6 +2029,30 @@ class Session:
             self._decoder.restart()
             self._needs_param_harvest = False
             self.request_fir()
+
+    def _harvest_avc_param_sets(self, avc_config_payload: bytes) -> None:
+        """Extract SPS/PPS from an avcC config packet and restart the AVC decoder.
+
+        Called from _flush_group when _needs_param_harvest is set and an avcC
+        config packet is seen on the new SSRC group's first burst. The avcC
+        packet carries updated SPS/PPS (potentially different num_ref_frames,
+        level, etc.) — feeding the decoder fresh extradata before the first IDR
+        prevents the "reference frames exceeds max" and IDR-parse errors that
+        occur when restart() was fired with the original burst's stale params."""
+        from .media.nalu import parse_avc_config
+        sps, ppss = parse_avc_config(avc_config_payload)
+        if not sps or not ppss:
+            log.warning("harvest_avc: avcC parse failed (%dB) — will retry", len(avc_config_payload))
+            return
+        pps_map = {i: p for i, p in enumerate(ppss)}
+        log.info("harvest_avc: SPS=%dB PPS=%d — restarting decoder with new params",
+                 len(sps), len(pps_map))
+        self._decoder.set_params(b"", sps, pps_map)
+        self._last_decoder_restart_t = time.monotonic()
+        self._dpb_error_window.clear()
+        self._decoder.restart()
+        self._needs_param_harvest = False
+        self.request_fir()
 
     def _evict_stale_groups(self) -> None:
         """Drop incomplete groups whose marker never arrived, and expire
@@ -2087,6 +2180,15 @@ class Session:
         # Blacklist the previously-adopted group so we never go back.
         self._ssrc_blacklist.update(self._ssrc_to_tile.keys())
         self._ssrc_to_tile = new_map
+        # A fresh SSRC group is a fresh encoder instance: its LTR frame
+        # ordinals (the "monotonic per decoded frame" id in RTCP_APP_LTRP)
+        # restart from zero. Our ack counter must restart too — otherwise we
+        # keep acking the OLD encoder's high ids, which the new encoder never
+        # issued, so it can't pin a long-term reference and its P-frames drift
+        # against a reference our DPB doesn't share → cross-tile corruption and
+        # flicker. Reset so the new stream is acked from its own frame 0.
+        self._ltr_tile_counts = {}
+        self._ltr_last_acked = 0
         # Keep the authoritative tile count in step with the adopted
         # group so num_tiles (and the frontend's per-tile loops) track a
         # mid-session tile-count change rather than the connect-time value.
@@ -2107,15 +2209,34 @@ class Session:
                 self._dpb_error_window.clear()
                 self.request_fir()
             else:
-                # Restart the decoder + FIR for the new tiles. We tried
-                # skipping the restart to avoid a 1.5–6 s outage, but
-                # without it the SW fallback path can't re-feed burst
-                # NALUs and the new context starves until an unprompted
-                # IDR shows up (often never).
-                self._last_decoder_restart_t = now
                 self._dpb_error_window.clear()
-                self._decoder.restart()
-                self.request_fir()
+                if self._resolved_codec == "avc":
+                    # AVC plain SSRC adoption: soft-reset (reset DPB tracking
+                    # state WITHOUT flushing the libav codec context or DPB).
+                    #
+                    # Apple's FIR responses after an SSRC group switch are
+                    # 'P-IDR' NALUs — nal_unit_type=5 header but a non-intra
+                    # slice that references DPB frames from the PRIOR encoder
+                    # context. A full restart() wipes the DPB, so every P-IDR
+                    # fails ("A non-intra slice in an IDR NAL unit" / "no frame!"),
+                    # the concealment handler fires another FIR, the encoder
+                    # restarts again, and the cycle repeats ~every 2 s — an
+                    # indefinite FIR storm with persistent image corruption.
+                    #
+                    # With an intact DPB the P-IDRs decode immediately, frames
+                    # flow normally, and the encoder's next natural I-IDR
+                    # re-anchors the DPB cleanly. The resolution is the same
+                    # (same SPS) so we do NOT set _needs_param_harvest here;
+                    # that flag is reserved for genuine 0x451 canvas resizes.
+                    self._last_decoder_restart_t = now
+                    self._decoder.soft_reset()
+                    self.request_fir()
+                else:
+                    # HEVC: SPS/PPS are inline NALs in the new IDR burst;
+                    # restart now and let the decoder absorb them on arrival.
+                    self._last_decoder_restart_t = now
+                    self._decoder.restart()
+                    self.request_fir()
 
     # ── RTCP RX loop (server SR for jitter / dlsr) ──────────────────
 
@@ -2741,6 +2862,7 @@ class Session:
                     self.request_fir()
                 self._drain_pending_fir()
                 self._drain_pending_nack()
+                self._maybe_reanchor()
                 self._check_stall()
                 if self._tx_tick % _TX_PROFILE_EVERY_N_TICKS == 0:
                     self._log_profile_snapshot()
@@ -2966,6 +3088,50 @@ class Session:
                 sent.append(ti)
         if sent:
             log.debug("FIR/PLI sent for tiles %s", sorted(sent))
+
+    # poc_lsb wraps at 2^13 = 8192 frames on Apple's H.264 stream — the
+    # rollover the d3d11va decoder mishandles into a cross-tile collapse.
+    # Re-anchor (request a fresh IDR) once the decoder has fed this many frames
+    # since its last IDR, leaving ~1200 frames of margin for the FIR round-trip
+    # and IDR delivery so the wrap never actually happens.
+    _AVC_REANCHOR_FRAMES = 7000
+    # After requesting, wait this long for Apple's IDR to arrive (which resets
+    # frames_since_idr) before requesting again — avoids FIR-spamming while the
+    # keyframe is in flight, but still retries if the IDR is lost.
+    _AVC_REANCHOR_COOLDOWN_S = 3.0
+
+    def _maybe_reanchor(self) -> None:
+        """Automatic IDR re-anchor for the AVC hardware path (ISS_AVC_HW_REANCHOR).
+
+        The AMD d3d11va H.264 decoder corrupts when poc_lsb wraps (~8192 frames
+        of unbroken P-frames). Apple never re-anchors on its own, and the
+        corruption is silent (valid-looking but wrong frames, no decode error),
+        so we can't react to it after the fact — we PREEMPT it: watch the
+        decoder's frames-since-last-IDR and request a fresh IDR just before the
+        wrap. Frame-count-driven (not wall-clock), so it self-adapts to the
+        framerate and is naturally reset by any IDR — startup, SSRC adoption, or
+        our own request — meaning a recent re-anchor pushes the next one out.
+
+        Sends a plain per-tile FIR (no gate keyframe-arming), so the decoder
+        keeps publishing P-frames until the IDR lands; the only cost is the
+        keyframe burst's bandwidth, now incurred only when actually near the
+        wrap rather than on a fixed timer."""
+        if not self._avc_reanchor_enabled or not self._connected or self._decoder is None:
+            return
+        fsi = getattr(self._decoder, "frames_since_idr", 0)
+        if fsi < self._AVC_REANCHOR_FRAMES:
+            return
+        now = time.monotonic()
+        if now - self._last_reanchor_t < self._AVC_REANCHOR_COOLDOWN_S:
+            return
+        self._last_reanchor_t = now
+        sent = sum(
+            1 for ti in range(self.num_tiles)
+            if self._send_fir_for_tile(ti, log_per_tile=False)
+        )
+        log.info("AVC re-anchor: %d frames since IDR (≥%d) — requesting fresh "
+                 "IDR (%d/%d tiles) before poc wrap",
+                 fsi, self._AVC_REANCHOR_FRAMES, sent, self.num_tiles)
 
     def _send_fir_for_tile(self, tile_idx: int, log_per_tile: bool = True) -> bool:
         """Returns True if a FIR was actually emitted (False if rate-

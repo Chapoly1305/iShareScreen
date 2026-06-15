@@ -76,28 +76,56 @@ def _probe_one(hwaccel_type: str) -> bool:
         return False
 
 
+_method_cache: dict[str, str] = {}
+
+
+def _qsv_hevc444() -> bool:
+    """Whether Intel Quick Sync (`hevc_qsv`) hardware-decodes HEVC 4:4:4.
+    On Intel Gen11+/Xe iGPUs this succeeds where the generic libav hwaccel
+    can't (libav's d3d11va HEVC path lacks the 4:4:4 profile). Lazy import so
+    the QSV decoder module is only pulled in when probing."""
+    try:
+        from .qsvhevc import qsv_hevc444_available
+        return qsv_hevc444_available()
+    except Exception as e:
+        log.info("hevc444 qsv probe: unavailable (%s)", e)
+        return False
+
+
+def hevc444_decode_method() -> "str | None":
+    """How HEVC 4:4:4 can be hardware-decoded here: ``"qsv"`` (Intel Quick
+    Sync), ``"libav"`` (generic libav hwaccel / native VideoToolbox), or
+    ``None`` (no HW 4:4:4 → AVC fallback). Cached for the process lifetime."""
+    if "method" in _method_cache:
+        return _method_cache["method"] or None
+    override = os.environ.get("ISS_HEVC444")
+    if override == "0":
+        _method_cache["method"] = ""
+        return None
+    method = ""
+    if sys.platform == "darwin":
+        method = "libav"          # native VideoToolbox path (vtdecode.py)
+    else:
+        hwaccels = _PROBE_HWACCELS.get(sys.platform, _PROBE_HWACCELS["*"])
+        if any(_probe_one(h) for h in hwaccels):
+            method = "libav"
+        elif _qsv_hevc444():
+            method = "qsv"
+    if override == "1" and not method:
+        method = "libav"          # forced on; trust the libav path
+    _method_cache["method"] = method
+    return method or None
+
+
 def supports_hevc444_hwdecode() -> bool:
-    """Whether this platform's GPU can hardware-decode HEVC 4:4:4. Cached for
-    the process lifetime (the answer can't change without new hardware).
+    """Whether this platform's GPU can hardware-decode HEVC 4:4:4 by any path.
+    Cached for the process lifetime (the answer can't change without new
+    hardware).
 
     `ISS_HEVC444=0`/`1` overrides the probe (force AVC fallback / force HEVC) —
     an escape hatch for a misbehaving probe and for testing the fallback path
     on 4:4:4-capable hardware."""
-    override = os.environ.get("ISS_HEVC444")
-    if override in ("0", "1"):
-        return override == "1"
-    if "result" in _cache:
-        return _cache["result"]
-    if sys.platform == "darwin":
-        # macOS production decodes via the native VideoToolbox path
-        # (vtdecode.py), which handles Apple's 4:4:4 stream on every Mac we
-        # target; no libav probe needed.
-        _cache["result"] = True
-        return True
-    hwaccels = _PROBE_HWACCELS.get(sys.platform, _PROBE_HWACCELS["*"])
-    result = any(_probe_one(h) for h in hwaccels)
-    _cache["result"] = result
-    return result
+    return hevc444_decode_method() is not None
 
 
 def resolve_codec(choice: str) -> str:
@@ -115,4 +143,4 @@ def resolve_codec(choice: str) -> str:
     return "avc"
 
 
-__all__ = ["resolve_codec", "supports_hevc444_hwdecode"]
+__all__ = ["resolve_codec", "supports_hevc444_hwdecode", "hevc444_decode_method"]

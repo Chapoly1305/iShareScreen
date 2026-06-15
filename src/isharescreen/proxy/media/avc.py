@@ -50,7 +50,6 @@ log = logging.getLogger(__name__)
 _NALU_DUMP_PATH = os.environ.get("ISS_NALU_DUMP")
 _nalu_dump_f = open(_NALU_DUMP_PATH, "wb") if _NALU_DUMP_PATH else None
 
-
 def _h264_type(b: int) -> int:
     return b & 0x1F
 
@@ -108,6 +107,10 @@ class AvcDecoder:
         self._burst_cache: dict[int, list[bytes]] = {}
         self._silent_nalus = 0
         self._recovery_in_progress = False
+        # Frames fed since the last IDR (any source). The session uses this to
+        # request a fresh IDR before poc_lsb wraps (~8192) on the AVC hardware
+        # path — the rollover the d3d11va decoder mishandles. See _maybe_reanchor.
+        self.frames_since_idr = 0
 
     # -- public configuration ------------------------------------------
 
@@ -246,6 +249,22 @@ class AvcDecoder:
         if self._sps and self._all_pps:
             self._create_codec(force_software=self._hw_failed)
 
+    def soft_reset(self) -> None:
+        """Reset DPB tracking without flushing the codec context.
+
+        On plain SSRC group adoption (same canvas resolution), the decoder's
+        DPB frames from the prior SSRC group remain valid references for the
+        new stream. Apple's FIR responses are 'P-IDR' NALUs — nal_unit_type=5
+        (IDR) in the header but a non-intra slice that references existing DPB
+        entries. A full restart() wipes the DPB, so every P-IDR fails with
+        "A non-intra slice in an IDR NAL unit", libav fires "no frame!", the
+        concealment handler sends another FIR, and the encoder restarts again
+        every ~2 s — a sustained FIR storm. With an intact DPB the P-IDRs
+        decode immediately, frames flow, and the encoder's next natural I-IDR
+        re-anchors the DPB cleanly."""
+        self._try_recovery()
+        self._recovery_in_progress = False
+
     def close(self) -> None:
         self._teardown()
 
@@ -257,6 +276,12 @@ class AvcDecoder:
             return
         nal_type = _h264_type(nalu[0])
         if nal_type == H264_NAL_IDR:
+            # An IDR resets the stream's frame_num/poc_lsb to 0, so reset our
+            # since-IDR frame counter too. The session watches this counter to
+            # request a fresh IDR before poc_lsb would wrap (~8192 frames) — the
+            # rollover the d3d11va decoder mishandles. Counts every IDR source:
+            # startup burst, SSRC adoption, and our own re-anchor requests.
+            self.frames_since_idr = 0
             slot = self._tiles[tile_idx]
             with slot.lock:
                 slot.saw_idr_since_reset = True
@@ -268,6 +293,11 @@ class AvcDecoder:
             # Drop P-frames until the first IDR roots the DPB.
             self._pre_idr_drops = getattr(self, "_pre_idr_drops", 0) + 1
             return
+        else:
+            # A non-IDR frame that will be fed: advance the since-IDR counter.
+            # Tracks the stream's poc/frame_num progression (Apple steps both by
+            # 1 per frame) so the session can re-anchor before the poc wrap.
+            self.frames_since_idr = getattr(self, "frames_since_idr", 0) + 1
 
         if _nalu_dump_f is not None:
             _nalu_dump_f.write(_NAL_START_CODE + bytes(nalu))
@@ -417,7 +447,16 @@ class AvcDecoder:
     def _try_hwaccel(self, hw_type: str, extradata: bytes):
         try:
             from av.codec.hwaccel import HWAccel
-            hw = HWAccel(device_type=hw_type)
+            # ISS_D3D11_ADAPTER selects which GPU does d3d11va decode by DXGI
+            # adapter index (0 = default/primary, usually the discrete GPU). Use
+            # this to pick the Intel iGPU over a discrete AMD/NVIDIA card — e.g.
+            # to dodge the AMD VCN H.264 POC-wrap bug. Applies to d3d11va only.
+            device = os.environ.get("ISS_D3D11_ADAPTER")
+            if device and hw_type in ("d3d11va", "d3d11"):
+                hw = HWAccel(device_type=hw_type, device=device)
+                log.info("d3d11va: using DXGI adapter index %s", device)
+            else:
+                hw = HWAccel(device_type=hw_type)
             c = av.CodecContext.create("h264", "r", hwaccel=hw)
             c.extradata = extradata
             c.thread_type = "NONE"

@@ -161,6 +161,24 @@ _HW_FRAME_FORMATS = frozenset({
     "mediacodec",
 })
 
+# Packed 4:4:4 formats that Intel Quick Sync (hevc_qsv) outputs for HEVC RExt
+# 4:4:4 decode: one interleaved sample group per pixel, full chroma. Reformat to
+# planar yuv444p so the existing full-resolution planar GPU upload handles them.
+# vuyx = V,U,Y,X(pad); these are true 4:4:4 (no chroma loss), so the reformat is
+# a lossless de-interleave, not a subsample.
+_PACKED_444_FORMATS = frozenset({"vuyx", "vuya", "ayuv", "uyva", "xyuv"})
+
+# 4:2:0 subsampled formats carry HALF-resolution chroma. The GPU renderer's
+# chroma textures are canvas-sized and sampled 1:1 with luma (correct for the
+# 4:4:4 HEVC hot path), so half-res chroma uploaded at the luma origin fills
+# only the top-left quarter of each tile — the rest samples the neutral-128
+# pre-clear and renders as desaturated gray. Upsample chroma to full
+# resolution (yuv444p) before plane extraction so it maps 1:1 with luma. This
+# is the AVC/H.264 4:2:0 fallback path (no HEVC 4:4:4 HW decode). Limited-range
+# nv12 → yuv444p (and full-range yuvj420p → yuvj444p) preserves Y and the U/V
+# sample values exactly; only the chroma spatial extent changes.
+_CHROMA_420_FORMATS = frozenset({"nv12", "nv21", "yuv420p", "yuvj420p"})
+
 
 def _av_frame_to_tile(
     frame: av.VideoFrame,
@@ -198,6 +216,27 @@ def _av_frame_to_tile(
         # libswscale; the GPU upload path already handles it as planar
         # full-resolution Y/U/V.
         frame = reformatter_holder[0].reformat(frame, format="yuv444p")
+        fmt = frame.format.name
+
+    if fmt in _PACKED_444_FORMATS:
+        # Intel QSV 4:4:4 (vuyx etc.): de-interleave to planar yuv444p. Full
+        # chroma preserved — this is the full-quality HEVC 4:4:4 path.
+        if reformatter_holder[0] is None:
+            from av.video.reformatter import VideoReformatter
+            reformatter_holder[0] = VideoReformatter()
+        frame = reformatter_holder[0].reformat(frame, format="yuv444p")
+        fmt = frame.format.name
+
+    if fmt in _CHROMA_420_FORMATS:
+        # Upsample half-res chroma to full resolution so the canvas-sized,
+        # 1:1-sampled chroma textures cover the whole tile instead of just its
+        # top-left quarter (see _CHROMA_420_FORMATS note). Preserve full vs.
+        # limited range by keeping the 'j' (full-range) variant.
+        if reformatter_holder[0] is None:
+            from av.video.reformatter import VideoReformatter
+            reformatter_holder[0] = VideoReformatter()
+        target = "yuvj444p" if fmt == "yuvj420p" else "yuv444p"
+        frame = reformatter_holder[0].reformat(frame, format=target)
         fmt = frame.format.name
 
     if fmt in ("nv12", "nv21"):
