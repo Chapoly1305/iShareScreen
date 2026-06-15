@@ -814,6 +814,8 @@ The video MediaBlob (§10.3) advertises one **codec bank per offered codec**, ea
 
 A client therefore selects the codec by **which bank(s) it advertises**: offering both yields HEVC; offering only the `123` bank forces H.264. The server's H.264 encoder emits **High profile @ L4.2, 4:2:0** — it exposes only the H.264 `Main` / `ConstrainedBaseline` profile levels plus this High path, **none of which is 4:4:4**, so the AVC stream is always 4:2:0. This is the interop path for receivers whose GPU cannot hardware-decode HEVC 4:4:4 (most consumer GPUs decode H.264 / HEVC-Main 4:2:0 in hardware but not HEVC RExt 4:4:4). Confidence: **confirmed** (static analysis of `AVConference` codec/profile tables + live negotiation + live decode of a standalone client).
 
+**Capability-based selection.** Because the choice is made before any video arrives (at offer time), a conforming client SHOULD pick the codec from its own decode capability rather than offer-then-discover: probe whether the local GPU hardware-decodes HEVC 4:4:4 — e.g. attempt a hardware decode of a small 4:4:4 sample with software fallback **disabled**, treating success as support — and advertise the HEVC bank when it does, the AVC bank when it does not. This matters most on Windows (D3D11VA) and Linux (VAAPI), where 4:4:4 decode support varies by GPU generation; macOS VideoToolbox decodes Apple's 4:4:4 stream on all supported Macs.
+
 The H.264 RTP framing is an Apple variant of RFC 6184 that mirrors the HEVC variant's decoding-order numbering:
 
 - **Parameter sets** are NOT sent as Annex-B SPS/PPS NALs. They arrive once, up front, as an Apple-wrapped **`avc1` sample description embedding an `avcC` box** (the MP4 `AVCDecoderConfigurationRecord`, carrying SPS+PPS). This packet's first byte has the H.264 forbidden-zero-bit set, so it is never confused with a slice NAL; a receiver parses the `avcC` to seed its decoder. A client that assumes in-band Annex-B parameter sets never starts.
@@ -909,6 +911,7 @@ Profile A plus the Adaptive media transport.
 | R-C6 | Feed all four tile SSRCs to a single HEVC decoder; treat any IDR as a DPB reset; composite tiles vertically | MUST | C | decode |
 | R-C7 | Decode HEVC RExt 4:4:4 8-bit (the default-negotiated codec) | MUST | C | decode |
 | R-C7a | Optionally negotiate the AVC bank (payload `123`) and decode H.264 High 4:2:0 — depay per RFC 6184 + Apple DON, seed the decoder from the up-front `avc1`/`avcC` config (§10.7.1) — for receivers without HEVC 4:4:4 hardware decode | MAY | C | decode |
+| R-C7b | When supporting both codecs, select between them from a GPU HEVC-4:4:4 hardware-decode capability probe (§10.7.1) rather than offering both and discovering the result | SHOULD | C | interop |
 | R-C8 | Emit RTCP receiver feedback and a keyframe request (legacy FIR PT 192 or AVPF FIR) on loss | SHOULD | C | interop |
 | R-C9 | Emit a media keepalive | MAY | C | interop |
 | R-C10 | On media negotiation failure or sustained decode failure, fall back to the framebuffer path (§12) | MUST | C | negative |
