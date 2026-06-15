@@ -128,19 +128,9 @@ def supports_hevc444_hwdecode() -> bool:
     return hevc444_decode_method() is not None
 
 
-def resolve_codec(choice: str) -> str:
-    """Resolve a `--codec` value to a concrete `"hevc"` / `"avc"`.
+# NOTE: codec resolution (`--codec auto` -> hevc/avc) moved to
+# media/registry.py::resolve_codec, which asks the decoder registry whether any
+# 4:4:4 decoder is available rather than probing here directly. hwcaps remains
+# the probe provider (the registry's availability callbacks delegate to it).
 
-    `"auto"` probes the GPU: HEVC 4:4:4 when hardware-decodable, else H.264
-    4:2:0. `"hevc"` / `"avc"` pass through unchanged (no probe)."""
-    if choice != "auto":
-        return choice
-    if supports_hevc444_hwdecode():
-        log.info("codec=auto: GPU hardware-decodes HEVC 4:4:4 -> using hevc")
-        return "hevc"
-    log.info("codec=auto: no HEVC 4:4:4 hardware decode -> falling back to "
-             "avc (H.264 4:2:0)")
-    return "avc"
-
-
-__all__ = ["resolve_codec", "supports_hevc444_hwdecode", "hevc444_decode_method"]
+__all__ = ["supports_hevc444_hwdecode", "hevc444_decode_method"]
