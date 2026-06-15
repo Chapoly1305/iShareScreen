@@ -77,6 +77,48 @@ def test_nv24_emits_passthrough_tileframe():
     assert tile.width == w and tile.height == h
 
 
+def _nv12_frame(w, h, *, uv_pad=0):
+    """Synthetic nv12 frame: Y at full res + HALF-res interleaved Cb,Cr.
+    `uv_pad` adds stride padding past the live `w` bytes/row (w//2 pairs)."""
+    y_line = w
+    uv_line = w + uv_pad                       # w//2 (Cb,Cr) pairs = w live bytes
+    ybuf = (np.arange(h * y_line) % 256).astype(np.uint8).tobytes()
+    uv = np.zeros((h // 2, uv_line), dtype=np.uint8)
+    uv[:, :w] = (np.arange((h // 2) * w).reshape(h // 2, w) % 251).astype(np.uint8)
+    return _FakeFrame("nv12", w, h, [_FakePlane(ybuf, y_line),
+                                     _FakePlane(uv.tobytes(), uv_line)]), ybuf, uv, uv_line
+
+
+def test_nv12_emits_halfres_biplanar_passthrough():
+    """AVC/H.264 4:2:0: nv12 must passthrough to a HALF-res biplanar
+    TileFrame (no CPU deinterleave, no swscale 4:2:0->4:4:4 upsample). The
+    GPU renderer bilinearly upsamples chroma via the chroma_scale uniform."""
+    w, h = 64, 8
+    frame, ybuf, uv, uv_line = _nv12_frame(w, h, uv_pad=8)
+    tile, had_err = _av_frame_to_tile(frame, [None], set())
+    assert had_err is False
+    assert tile.is_nv12_passthrough and tile.v is None
+    assert tile.y == ybuf                      # luma verbatim
+    assert tile.u == uv.tobytes()              # interleaved half-res UV verbatim
+    assert tile.uv_stride == uv_line
+    assert tile.chroma_width == w // 2         # 4:2:0 → half horizontal
+    assert tile.chroma_height == h // 2        # 4:2:0 → half vertical
+    assert tile.width == w and tile.height == h
+
+
+def test_yuv420p_emits_halfres_planar():
+    """Software-decoded H.264 (yuv420p) → half-res PLANAR TileFrame (not
+    upsampled to 4:4:4); the renderer chroma_scale handles the upsampling."""
+    w, h = 64, 8
+    yp = _FakePlane((np.arange(h * w) % 256).astype(np.uint8).tobytes(), w)
+    up = _FakePlane((np.arange((h // 2) * (w // 2)) % 251).astype(np.uint8).tobytes(), w // 2)
+    vp = _FakePlane((np.arange((h // 2) * (w // 2)) % 247).astype(np.uint8).tobytes(), w // 2)
+    frame = _FakeFrame("yuv420p", w, h, [yp, up, vp])
+    tile, _ = _av_frame_to_tile(frame, [None], set())
+    assert tile.v is not None                  # planar, NOT passthrough
+    assert tile.chroma_width == w // 2 and tile.chroma_height == h // 2
+
+
 def test_rg8_sampling_reproduces_cpu_deinterleave():
     """The crux: reading the rg8 texture (.r=byte[2x], .g=byte[2x+1]) must yield
     the same U and V planes the old stride-2 CPU deinterleave produced."""

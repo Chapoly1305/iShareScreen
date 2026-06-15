@@ -41,11 +41,15 @@ struct VsOut {
 };
 
 // uv_scale maps the viewport's [0,1] sampling range onto just the
-// decoded-content sub-region of the textures, cropping out any black
+// decoded-content sub-region of the LUMA texture, cropping out any black
 // padding the encoder left when the real frame is smaller than the
-// allocated canvas. (1,1) = sample the whole texture.
+// allocated canvas. chroma_scale is uv_scale shrunk by the chroma
+// subsample ratio (== uv_scale for 4:4:4; half for 4:2:0), so the shader
+// samples the half-res chroma in the top-left sub-region and the bilinear
+// sampler upsamples it to luma resolution. (1,1) = sample the whole texture.
 struct Uniforms {
     uv_scale: vec2<f32>,
+    chroma_scale: vec2<f32>,
 };
 @group(0) @binding(4) var<uniform> U: Uniforms;
 
@@ -76,10 +80,11 @@ fn vs(@builtin(vertex_index) i: u32) -> VsOut {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    let uv = in.uv * U.uv_scale;
-    let y  = textureSample(y_tex, samp, uv).r;
-    let cb = textureSample(u_tex, samp, uv).r - 0.5;
-    let cr = textureSample(v_tex, samp, uv).r - 0.5;
+    let luv = in.uv * U.uv_scale;
+    let cuv = in.uv * U.chroma_scale;
+    let y  = textureSample(y_tex, samp, luv).r;
+    let cb = textureSample(u_tex, samp, cuv).r - 0.5;
+    let cr = textureSample(v_tex, samp, cuv).r - 0.5;
     let r = y + 1.5748   * cr;
     let g = y - 0.187324 * cb - 0.468124 * cr;
     let b = y + 1.8556   * cb;
@@ -99,7 +104,7 @@ struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
 };
-struct Uniforms { uv_scale: vec2<f32>, };
+struct Uniforms { uv_scale: vec2<f32>, chroma_scale: vec2<f32>, };
 @group(0) @binding(3) var<uniform> U: Uniforms;
 
 @vertex
@@ -126,9 +131,10 @@ fn vs(@builtin(vertex_index) i: u32) -> VsOut {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    let uv = in.uv * U.uv_scale;
-    let y  = textureSample(y_tex, samp, uv).r;
-    let c  = textureSample(uv_tex, samp, uv);
+    let luv = in.uv * U.uv_scale;
+    let cuv = in.uv * U.chroma_scale;
+    let y  = textureSample(y_tex, samp, luv).r;
+    let c  = textureSample(uv_tex, samp, cuv);
     let cb = c.r - 0.5;
     let cr = c.g - 0.5;
     let r = y + 1.5748   * cr;
@@ -192,6 +198,14 @@ class Renderer:
         self._content_w = 0
         self._content_h = 0
 
+        # Chroma subsample ratio (chroma_dims / luma_dims), locked from the
+        # first uploaded tile. 1.0 = 4:4:4 (Apple HEVC nv24 / yuv444p);
+        # 0.5 = 4:2:0 (H.264/AVC nv12 / yuv420p). Feeds the `chroma_scale`
+        # uniform so the shader samples half-res chroma with GPU bilinear
+        # upsampling instead of a CPU swscale 4:2:0→4:4:4 pass.
+        self._chroma_rw = 1.0
+        self._chroma_rh = 1.0
+
         # Two chroma layouts are supported and chosen per session from the
         # first uploaded tile (see `upload_tile`):
         #   * planar    — Y + separate U + V, three r8unorm textures (the
@@ -246,15 +260,15 @@ class Renderer:
             mag_filter=wgpu.FilterMode.linear,
             min_filter=wgpu.FilterMode.linear,
         )
-        # 16-byte uniform: vec2 uv_scale (+8 bytes std140 tail padding).
-        # Updated per-draw with the content/canvas ratio.
+        # 16-byte uniform: vec2 uv_scale + vec2 chroma_scale. Updated
+        # per-draw with the content/canvas ratio and the chroma ratio.
         self._uniform_buf = device.create_buffer(
             size=16,
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
         )
         device.queue.write_buffer(
             self._uniform_buf, 0,
-            np.array([1.0, 1.0, 0.0, 0.0], dtype=np.float32).tobytes(),
+            np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32).tobytes(),
         )
         tex_entry = {
             "visibility": wgpu.ShaderStage.FRAGMENT,
@@ -404,6 +418,8 @@ class Renderer:
         # software fallback → planar yuv444p), so this never flips mid-stream.
         if self._mode is None:
             self._mode = "biplanar" if tile.is_nv12_passthrough else "planar"
+            self._chroma_rw = (tile.chroma_width / tile.width) if tile.width else 1.0
+            self._chroma_rh = (tile.chroma_height / tile.height) if tile.height else 1.0
         origin = (0, origin_y, 0)
         # Grow the real decoded-content extent so draw() can crop the
         # texture's black padding and letterbox what the encoder
@@ -428,11 +444,16 @@ class Renderer:
         )
 
         cw, ch = tile.chroma_width, tile.chroma_height
-        # Same canvas-bound for chroma as for luma so the last tile's
-        # padding chroma rows don't get uploaded.
-        chroma_rows = min(ch, slot_height, max(0, self._h - origin_y))
+        # Chroma may be subsampled (4:2:0 → half-res). It stacks in the
+        # top-left at the chroma-scaled origin; the `chroma_scale` uniform
+        # maps sampling onto that sub-region (GPU bilinear upsamples). For
+        # 4:4:4 (rh=1) this reduces to the luma origin/bounds, byte-for-byte.
+        chroma_origin_y = int(round(origin_y * self._chroma_rh))
+        chroma_rows = min(ch, int(round(rows * self._chroma_rh)),
+                          max(0, self._h - chroma_origin_y))
         if chroma_rows <= 0:
             return
+        chroma_origin = (0, chroma_origin_y, 0)
 
         if tile.v is None:
             # Biplanar passthrough (Apple nv24): the interleaved UV plane goes
@@ -442,7 +463,7 @@ class Renderer:
             uv = np.frombuffer(tile.u, dtype=np.uint8)
             uv = uv[: tile.uv_stride * ch].reshape(ch, tile.uv_stride)
             self._device.queue.write_texture(
-                {"texture": self._uv_tex, "origin": origin},
+                {"texture": self._uv_tex, "origin": chroma_origin},
                 np.ascontiguousarray(uv[:chroma_rows]),
                 {"offset": 0, "bytes_per_row": tile.uv_stride},
                 (cw, chroma_rows, 1),
@@ -458,13 +479,13 @@ class Renderer:
             u = u[: tile.uv_stride * ch].reshape(ch, tile.uv_stride)[:, :cw]
             v = v[: tile.uv_stride * ch].reshape(ch, tile.uv_stride)[:, :cw]
         self._device.queue.write_texture(
-            {"texture": self._u_tex, "origin": origin},
+            {"texture": self._u_tex, "origin": chroma_origin},
             np.ascontiguousarray(u[:chroma_rows]),
             {"offset": 0, "bytes_per_row": cw},
             (cw, chroma_rows, 1),
         )
         self._device.queue.write_texture(
-            {"texture": self._v_tex, "origin": origin},
+            {"texture": self._v_tex, "origin": chroma_origin},
             np.ascontiguousarray(v[:chroma_rows]),
             {"offset": 0, "bytes_per_row": cw},
             (cw, chroma_rows, 1),
@@ -553,9 +574,15 @@ class Renderer:
         # on either axis independently.
         ux = cw / self._w if self._w else 1.0
         uy = ch / self._h if self._h else 1.0
+        # chroma_scale = uv_scale × chroma-subsample ratio. The half-res
+        # chroma content occupies the top-left (content×ratio) texels, so
+        # its sampling range shrinks by the ratio. 4:4:4 (ratio 1) →
+        # chroma_scale == uv_scale (the unchanged HEVC path).
+        csx = ux * self._chroma_rw
+        csy = uy * self._chroma_rh
         self._device.queue.write_buffer(
             self._uniform_buf, 0,
-            np.array([ux, uy, 0.0, 0.0], dtype=np.float32).tobytes(),
+            np.array([ux, uy, csx, csy], dtype=np.float32).tobytes(),
         )
         # Aspect-preserving fit: one uniform scale (same factor on both
         # axes) sized to the largest content rect that fits the target,

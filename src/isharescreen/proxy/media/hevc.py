@@ -168,16 +168,15 @@ _HW_FRAME_FORMATS = frozenset({
 # a lossless de-interleave, not a subsample.
 _PACKED_444_FORMATS = frozenset({"vuyx", "vuya", "ayuv", "uyva", "xyuv"})
 
-# 4:2:0 subsampled formats carry HALF-resolution chroma. The GPU renderer's
-# chroma textures are canvas-sized and sampled 1:1 with luma (correct for the
-# 4:4:4 HEVC hot path), so half-res chroma uploaded at the luma origin fills
-# only the top-left quarter of each tile — the rest samples the neutral-128
-# pre-clear and renders as desaturated gray. Upsample chroma to full
-# resolution (yuv444p) before plane extraction so it maps 1:1 with luma. This
-# is the AVC/H.264 4:2:0 fallback path (no HEVC 4:4:4 HW decode). Limited-range
-# nv12 → yuv444p (and full-range yuvj420p → yuvj444p) preserves Y and the U/V
-# sample values exactly; only the chroma spatial extent changes.
-_CHROMA_420_FORMATS = frozenset({"nv12", "nv21", "yuv420p", "yuvj420p"})
+# 4:2:0 subsampled formats (the AVC/H.264 fallback path) carry HALF-resolution
+# chroma. These are emitted as half-res TileFrames (nv12 → biplanar rg8
+# passthrough, nv21/yuv420p → half-res planar); the GPU renderer samples them
+# through a per-axis `chroma_scale` so its bilinear sampler upsamples chroma to
+# luma resolution on the fly. We deliberately do NOT libswscale-upsample
+# 4:2:0 → 4:4:4 on the CPU first: at HiDPI that full-res chroma rebuild ate the
+# frame budget and capped AVC at ~41 fps. (The chroma detail lost to 4:2:0 is
+# decimated at the host encoder and unrecoverable either way — see
+# avc-offer-params memory.)
 
 
 def _av_frame_to_tile(
@@ -227,20 +226,28 @@ def _av_frame_to_tile(
         frame = reformatter_holder[0].reformat(frame, format="yuv444p")
         fmt = frame.format.name
 
-    if fmt in _CHROMA_420_FORMATS:
-        # Upsample half-res chroma to full resolution so the canvas-sized,
-        # 1:1-sampled chroma textures cover the whole tile instead of just its
-        # top-left quarter (see _CHROMA_420_FORMATS note). Preserve full vs.
-        # limited range by keeping the 'j' (full-range) variant.
-        if reformatter_holder[0] is None:
-            from av.video.reformatter import VideoReformatter
-            reformatter_holder[0] = VideoReformatter()
-        target = "yuvj444p" if fmt == "yuvj420p" else "yuv444p"
-        frame = reformatter_holder[0].reformat(frame, format=target)
-        fmt = frame.format.name
+    if fmt == "nv12":
+        # Biplanar 4:2:0 passthrough (VideoToolbox / d3d11va / VAAPI H.264).
+        # Hand the half-res interleaved Cb,Cr plane to the GPU verbatim
+        # (v is None); the biplanar rg8 shader reads .r=Cb / .g=Cr and the
+        # GPU's bilinear sampler upsamples chroma to luma resolution. This
+        # avoids BOTH a CPU deinterleave AND the libswscale 4:2:0→4:4:4
+        # upsample that capped HiDPI AVC at ~41 fps. Byte order matches nv24.
+        yp = frame.planes[0]
+        uvp = frame.planes[1]
+        return TileFrame(
+            y=bytes(yp), u=bytes(uvp), v=None,
+            width=width, height=height,
+            y_stride=yp.line_size,
+            uv_stride=uvp.line_size,
+            chroma_width=width // 2,
+            chroma_height=height // 2,
+        ), had_error
 
-    if fmt in ("nv12", "nv21"):
-        # Biplanar 4:2:0: Y plane + half-resolution interleaved UV.
+    if fmt == "nv21":
+        # Biplanar 4:2:0 with Cr,Cb order — the rg8 passthrough shader can't
+        # swap channels, so deinterleave to half-res planar U/V here (rare:
+        # most H.264 HW decoders emit nv12). Still half-res → GPU upsamples.
         yp = frame.planes[0]
         uvp = frame.planes[1]
         chroma_h = height // 2
@@ -248,12 +255,8 @@ def _av_frame_to_tile(
             np.frombuffer(bytes(uvp), dtype=np.uint8)
             .reshape(chroma_h, uvp.line_size)[:, :width]
         )
-        if fmt == "nv12":
-            u_bytes = uv_view[:, 0::2].tobytes()
-            v_bytes = uv_view[:, 1::2].tobytes()
-        else:
-            v_bytes = uv_view[:, 0::2].tobytes()
-            u_bytes = uv_view[:, 1::2].tobytes()
+        v_bytes = uv_view[:, 0::2].tobytes()
+        u_bytes = uv_view[:, 1::2].tobytes()
         return TileFrame(
             y=bytes(yp), u=u_bytes, v=v_bytes,
             width=width, height=height,
