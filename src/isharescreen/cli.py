@@ -167,6 +167,17 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
     g.add_argument(
+        "--record", metavar="PATH", default=None,
+        help=(
+            "capture the whole session to a libpcap file at PATH. Every byte "
+            "on the TCP control socket and the two UDP media sockets is "
+            "written exactly as it goes on the wire (still encrypted), with "
+            "synthetic Ethernet/IP/TCP|UDP framing — byte-identical to a "
+            "tcpdump capture. Open it in Wireshark or feed it to the Python "
+            "dissector (the connect log prints the exact decode command)."
+        ),
+    )
+    g.add_argument(
         "--auto-quit-secs", type=int, default=0,
         help=(
             "exit after N seconds. In --headless mode, this is the smoke-test "
@@ -279,6 +290,7 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
         audio=args.audio,
         share_console=args.share_console, alt_session=args.alt_session,
         control_socket=args.control_socket,
+        record_pcap=args.record,
     )
 
 
