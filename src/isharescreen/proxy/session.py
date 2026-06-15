@@ -41,7 +41,7 @@ from .media.tiles import TileFrame
 from .input import InputController
 from .media.aac_eld import AacEldDecoder, make_aac_eld_decoder
 from .media.hevc import HevcDecoder
-from .media.nalu import reassemble_group
+from .media.nalu import reassemble_group, reassemble_group_h264
 from .media.quality_gate import TileVisState
 from .. import __version__ as _iss_version
 from .control import ControlServer
@@ -194,6 +194,17 @@ class SessionConfig:
     advertise: Optional[AdvertiseDims] = None
     hdr: bool = False
     audio: bool = True
+
+    # Video codec to negotiate with the host:
+    #   "hevc" (default) → Apple HEVC RExt 4:4:4 — best quality, but HW-decodes
+    #          only on GPUs that support HEVC 4:4:4 (else a CPU fallback).
+    #   "avc"  → H.264 High 4:2:0 (the host's only H.264 chroma). Lower quality,
+    #          but HW-decodes on essentially every GPU (Windows D3D11VA, Linux
+    #          VAAPI, macOS VideoToolbox).
+    # Implemented by advertising only that codec's bank in the 0x1c offer
+    # (offers.py keys off ISS_VIDEO_CODEC); the matching depay + decoder are
+    # selected here in the Session.
+    video_codec: Literal["hevc", "avc"] = "hevc"
     # HiDPI mode for the host's virtual display, resolved to a backing:point
     # ratio by the frontend (which knows the window size):
     #   "on"   → always 2× (Retina): crisp, but ~4× the pixels = more
@@ -909,31 +920,46 @@ class Session:
         # cross-platform libav path, and `ISS_FORCE_SW_HEVC=1` forces libav
         # software (and therefore libav).
         _decoder_choice = _os.environ.get("ISS_DECODER", "auto").lower()
-        _use_vt = (
-            _sys.platform == "darwin"
-            and prefer_hwaccel
-            and _decoder_choice in ("auto", "vt", "videotoolbox")
-            and vtdecode.available()
-        )
-        if _use_vt:
-            try:
-                self._decoder = vtdecode.VTHevcDecoder(
-                    num_tiles=num_tiles,
-                    enable_quality_gate=True,
-                    on_frame_published=self._on_frame_published,
-                )
-                log.info("HEVC decoder: native VideoToolbox (VTDecompressionSession)")
-            except Exception as e:
-                log.warning("VideoToolbox-native decoder unavailable (%s) — "
-                            "falling back to libav", e)
-                _use_vt = False
-        if not _use_vt:
-            self._decoder = HevcDecoder(
+        if cfg.video_codec == "avc":
+            # AVC path: the host streams H.264 4:2:0. vtdecode.py is HEVC-only,
+            # so use the libav-based AvcDecoder (D3D11VA / VideoToolbox / VAAPI
+            # HW with software fallback) on every platform. The H.264 stream
+            # has none of the HEVC RExt-4:4:4 hwaccel pathologies that make the
+            # native-VT path necessary for HEVC.
+            from .media.avc import AvcDecoder
+            self._decoder = AvcDecoder(
                 num_tiles=num_tiles,
                 enable_quality_gate=True,
                 on_frame_published=self._on_frame_published,
                 prefer_hwaccel=prefer_hwaccel,
             )
+            log.info("AVC/H.264 decoder: libav shared context")
+        else:
+            _use_vt = (
+                _sys.platform == "darwin"
+                and prefer_hwaccel
+                and _decoder_choice in ("auto", "vt", "videotoolbox")
+                and vtdecode.available()
+            )
+            if _use_vt:
+                try:
+                    self._decoder = vtdecode.VTHevcDecoder(
+                        num_tiles=num_tiles,
+                        enable_quality_gate=True,
+                        on_frame_published=self._on_frame_published,
+                    )
+                    log.info("HEVC decoder: native VideoToolbox (VTDecompressionSession)")
+                except Exception as e:
+                    log.warning("VideoToolbox-native decoder unavailable (%s) — "
+                                "falling back to libav", e)
+                    _use_vt = False
+            if not _use_vt:
+                self._decoder = HevcDecoder(
+                    num_tiles=num_tiles,
+                    enable_quality_gate=True,
+                    on_frame_published=self._on_frame_published,
+                    prefer_hwaccel=prefer_hwaccel,
+                )
         if not prefer_hwaccel:
             log.info("ISS_FORCE_SW_HEVC=1: HW decoders disabled")
         self._decoder.set_params(burst.vps, burst.sps, burst.all_pps)
@@ -1098,6 +1124,10 @@ class Session:
         (without it the encoder-canvas reply degenerates and no burst
         arrives), so we always send a valid audio offer; `cfg.audio=False`
         only skips local decode + playback."""
+        # The video offer advertises only `cfg.video_codec`'s bank; offers.py
+        # keys off ISS_VIDEO_CODEC. Set it here so this offer (and the dynamic-
+        # resolution re-offer) matches the depay + decoder we wire up below.
+        os.environ["ISS_VIDEO_CODEC"] = cfg.video_codec
         video_offer, audio_offer = create_offers()
         # Stash for mid-session 0x1c re-offers (dynamic resolution).
         self._video_offer = video_offer
@@ -1148,6 +1178,7 @@ class Session:
         self._drain_socket_into(self._sock_video, burst_buf, max_seconds=2.0)
         return gather_initial_burst(
             burst_buf, self._video_decryptor, quality_tier=cfg.quality_tier,
+            codec=cfg.video_codec,
         )
 
     def _teardown_negotiation_tcp(self) -> None:
@@ -1836,7 +1867,14 @@ class Session:
             for i in range(len(oseq) - 1)
         )
 
-        nalus = list(reassemble_group([p for _, _, p in packets]))
+        if self._config.video_codec == "avc":
+            # H.264 RTP framing (RFC 6184 + Apple DON); avc1/avcC config
+            # wrappers are skipped here — the canvas is fixed mid-stream so the
+            # burst-harvested SPS/PPS stay valid (AVC dynamic-resolution
+            # re-harvest is a separate follow-up).
+            nalus = list(reassemble_group_h264([p for _, _, p in packets]))
+        else:
+            nalus = list(reassemble_group([p for _, _, p in packets]))
 
         # If a dynamic resolution change is in progress, harvest fresh
         # VPS/SPS/PPS from the new encoder's burst so the restarted

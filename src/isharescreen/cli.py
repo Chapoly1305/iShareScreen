@@ -113,6 +113,16 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
     g.add_argument(
+        "--codec", choices=("hevc", "avc"), default="hevc",
+        help=(
+            "video codec to negotiate with the host. 'hevc' (default) = Apple "
+            "HEVC RExt 4:4:4: best quality, but hardware-decodes only on GPUs "
+            "with HEVC 4:4:4 support (otherwise a slow CPU fallback). 'avc' = "
+            "H.264 High 4:2:0: lower quality, but hardware-decodes on virtually "
+            "any GPU (Windows D3D11VA / Linux VAAPI / macOS VideoToolbox)."
+        ),
+    )
+    g.add_argument(
         "--curtain", action=argparse.BooleanOptionalAction, default=True,
         help=(
             "blank the host's physical screen via a SkyLight virtual "
@@ -286,6 +296,7 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
         dynamic_resolution=dynamic_resolution,
         hdr=args.hdr,
         hidpi=args.hidpi,
+        video_codec=args.codec,
         curtain=args.curtain,
         audio=args.audio,
         share_console=args.share_console, alt_session=args.alt_session,

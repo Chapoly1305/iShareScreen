@@ -9,6 +9,7 @@ per-call dynamic fields: session_id, timestamp, and the CallID UUID.
 from __future__ import annotations
 
 import logging
+import os
 import platform
 import plistlib
 import secrets
@@ -87,13 +88,21 @@ def _build_audio_f9_entry(f1: int, f2: int, f3: Optional[int]) -> bytes:
 _APPLE_AUDIO_F9 = b"".join(_build_audio_f9_entry(*t) for t in _AUDIO_F9_TIERS)
 
 
-# ── HEVC + AVC parameter strings ──────────────────────────────────────
-
-_HEVC_PARAMS = (
+# ── HEVC + AVC feature-list strings ───────────────────────────────────
+#
+# Each video codec bank carries a semicolon-delimited feature-list string
+# (FLS, field 3). The codec a bank represents is keyed off its RTP payload
+# *number* (field 1) by the host: PT 123 → H.264/AVC, PT 100 → HEVC RExt
+# 4:4:4 (confirmed live 2026-06 against a real host — offering PT 123 alone
+# makes screensharingd stream H.264, PT 100 alone streams HEVC; matches the
+# wire PT 100=HEVC seen in captures). The two FLS strings below are Apple's
+# verbatim per-codec values. (An earlier revision had these two names
+# swapped; it never mattered because both banks were always offered.)
+_AVC_PARAMS = (
     b"FLS;MS:-1;LF:-1;LTR;CABAC;POS:0;EOD:1;HTS:2;RR:3;"
     b"AR:16/9,5/8;XR:16/9,5/8;"
 )
-_AVC_PARAMS = (
+_HEVC_PARAMS = (
     b"FLS;LF:-1;POS:5;EOD:1;HTS:2;RR:3;POSE:4;"
     b"AR:16/9,5/8;XR:16/9,5/8;"
 )
@@ -148,22 +157,39 @@ def _build_mediablob(mode: int, session_id: int, timestamp: int) -> bytes:
     if mode == 7:
         res_entry = _field_varint(1, 1) + _field_varint(2, 1) + _field_varint(3, 50115) + _field_varint(4, 0)
         res_entry_alt = _field_varint(1, 1) + _field_varint(2, 2) + _field_varint(3, 50115) + _field_varint(4, 0)
-        hevc_bank = (
+        # AVC/H.264 bank — RTP PT 123. (4 res entries + field4=1, verbatim
+        # from Apple's createOffer.) Host has only H.264 Main/ConstrainedBaseline
+        # → always 4:2:0.
+        avc_bank = (
             _field_varint(1, 123)
             + _field_bytes(2, res_entry) + _field_bytes(2, res_entry_alt)
             + _field_bytes(2, res_entry) + _field_bytes(2, res_entry_alt)
-            + _field_bytes(3, _HEVC_PARAMS)
+            + _field_bytes(3, _AVC_PARAMS)
             + _field_varint(4, 1)
         )
-        avc_bank = (
+        # HEVC RExt 4:4:4 bank — RTP PT 100. (2 res entries + field4=14.)
+        hevc_bank = (
             _field_varint(1, 100)
             + _field_bytes(2, res_entry) + _field_bytes(2, res_entry_alt)
-            + _field_bytes(3, _AVC_PARAMS)
+            + _field_bytes(3, _HEVC_PARAMS)
             + _field_varint(4, 14)
         )
+        # ISS_VIDEO_CODEC selects which codec bank(s) to advertise. The host
+        # maps the bank's RTP payload number to a codec and, when both are
+        # offered, prefers HEVC — so to force H.264 4:2:0 (e.g. for a client
+        # whose GPU can't HW-decode HEVC RExt 4:4:4) we must advertise the AVC
+        # bank *only*. Default "both" reproduces Apple's native offer
+        # byte-for-byte (AVC bank first, then HEVC) and yields HEVC 4:4:4.
+        _codec = os.environ.get("ISS_VIDEO_CODEC", "both").lower()
+        if _codec == "avc":
+            banks = _field_bytes(3, avc_bank)
+        elif _codec == "hevc":
+            banks = _field_bytes(3, hevc_bank)
+        else:
+            banks = _field_bytes(3, avc_bank) + _field_bytes(3, hevc_bank)
         desc = (
             _field_varint(1, session_id) + _field_varint(2, 0)
-            + _field_bytes(3, hevc_bank) + _field_bytes(3, avc_bank)
+            + banks
             + _field_varint(6, 4) + _field_varint(7, 1) + _field_varint(8, 63)
             + _field_varint(9, 1) + _field_varint(12, 1)
         )
