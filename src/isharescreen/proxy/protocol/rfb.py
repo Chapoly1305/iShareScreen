@@ -203,18 +203,30 @@ def build_virtual_display(
     logical (point) size while the mode table carries the pixel dimensions.
     `hidpi_scale=1` flat-encodes at the requested resolution.
 
-    `alt_user_login=True` marks the cmd=2 alt-user path. The "magic byte"
-    Apple's captured cmd=2 traffic sets is a single `0x07` at
-    displayInfo+0x99 — which is the low byte of the `reserved` u32 at
-    +0x96. With that byte clear, the daemon's `createLoginWindow=1` branch
-    leaves `virtualDisplayCount=0` and the encoder targets the *console*
-    user's screen instead of the alt-user vdisplay we just spawned. The
-    other deltas in Apple's cmd=2 SDC (specific display-name string,
-    MBP-shaped physical dimensions, heterogeneous mode list) appear to be
-    informational. Now that we always emit `reserved = 7`, displayInfo+0x99
-    is already `0x07` for every 0x1d, so this flag is currently a no-op at
-    the byte level — kept for call-site intent and in case the reserved
-    value ever changes.
+    `alt_user_login=True` flips a single byte at displayInfo+0x99 to 0x07.
+    That byte is the low byte of the displayInfo `rotations` u32 at +0x96.
+
+    CAUTION: an earlier reading (below) treated this byte as the "magic
+    bit" that makes the daemon target the alt-user vdisplay instead of the
+    *console* screen. Decompiling screensharingd + ScreensharingAgent
+    (24G231) contradicts that: +0x96 is logged as `rotations` and forwarded
+    verbatim to `SLVirtualDisplaySettings ...rotations:`, and *neither
+    binary branches on +0x96/+0x99*. The console-vs-login-window choice is
+    actually driven by a runtime session probe plus the `BlankScreen`
+    CFPreference, not this descriptor field. A live re-test confirmed this:
+    running the alt-session path with this byte = 0 vs = 0x07 produced
+    byte-identical protocol behavior (same conn1/conn2 auth, ServerInit
+    geometry, enc1103, and cmd=2 dance) — no observable effect, matching
+    the decompilation. (Caveat: on the test host the connecting user was
+    the console user, so alt-session streamed 0 frames either way and the
+    feature itself was not exercised end-to-end.) The write is retained out
+    of caution; drop it once alt-session is validated on a true
+    non-console-user host.
+
+    Earlier (unverified) note: "captured cmd=2 alt-user traffic sets this
+    byte; with it clear the daemon's createLoginWindow=1 branch leaves
+    virtualDisplayCount=0 and targets the console screen." Believed to be a
+    misattribution given the decompilation above.
     """
     # `width`/`height` are the LOGICAL (point / scaled) target. `hidpi_scale`
     # is the backing:point ratio the mode table advertises: 2 => Retina
@@ -229,7 +241,10 @@ def build_virtual_display(
 
     di = bytearray(di_size)
     struct.pack_into(">H", di, 0x00, di_size)
-    name_bytes = display_name.encode("utf-8")[:121]  # leave 1 byte for NUL at +0x79
+    # Region is D+0x02..+0x79 (120 bytes). Cap at 119 so a NUL fits at +0x79
+    # and the write cannot overrun display_flags at +0x7a. (Was [:121], which
+    # could write through +0x7a for names >119 bytes.)
+    name_bytes = display_name.encode("utf-8")[:119]
     di[0x02:0x02 + len(name_bytes)] = name_bytes
 
     # display_flags: always set DYNAMIC_RESOLUTION (0x01) — matches
