@@ -41,6 +41,7 @@ from .media.tiles import TileFrame
 from .input import InputController
 from .media.aac_eld import AacEldDecoder, make_aac_eld_decoder
 from .media.hevc import HevcDecoder
+from .media.hwcaps import resolve_codec
 from .media.nalu import reassemble_group, reassemble_group_h264
 from .media.quality_gate import TileVisState
 from .. import __version__ as _iss_version
@@ -196,15 +197,18 @@ class SessionConfig:
     audio: bool = True
 
     # Video codec to negotiate with the host:
-    #   "hevc" (default) → Apple HEVC RExt 4:4:4 — best quality, but HW-decodes
-    #          only on GPUs that support HEVC 4:4:4 (else a CPU fallback).
-    #   "avc"  → H.264 High 4:2:0 (the host's only H.264 chroma). Lower quality,
-    #          but HW-decodes on essentially every GPU (Windows D3D11VA, Linux
-    #          VAAPI, macOS VideoToolbox).
-    # Implemented by advertising only that codec's bank in the 0x1c offer
-    # (offers.py keys off ISS_VIDEO_CODEC); the matching depay + decoder are
-    # selected here in the Session.
-    video_codec: Literal["hevc", "avc"] = "hevc"
+    #   "auto" (default) → probe whether this GPU can hardware-decode HEVC 4:4:4
+    #          (media/hwcaps.py) and use "hevc" if so, else "avc". This is what
+    #          makes Windows/Linux clients with no HEVC-4:4:4 HW decode fall back
+    #          to H.264 4:2:0 instead of grinding on a CPU HEVC decode.
+    #   "hevc" → force Apple HEVC RExt 4:4:4 — best quality, but HW-decodes only
+    #          on GPUs that support HEVC 4:4:4 (else a slow CPU fallback).
+    #   "avc"  → force H.264 High 4:2:0 (the host's only H.264 chroma). Lower
+    #          quality, but HW-decodes on essentially every GPU.
+    # The resolved codec is advertised by offering only that codec's bank in the
+    # 0x1c offer (offers.py keys off ISS_VIDEO_CODEC); the matching depay +
+    # decoder are selected here in the Session (see self._resolved_codec).
+    video_codec: Literal["auto", "hevc", "avc"] = "auto"
     # HiDPI mode for the host's virtual display, resolved to a backing:point
     # ratio by the frontend (which knows the window size):
     #   "on"   → always 2× (Retina): crisp, but ~4× the pixels = more
@@ -303,6 +307,11 @@ class Session:
 
     def __init__(self, config: SessionConfig) -> None:
         self._config = config
+        # Resolve "auto" to a concrete codec now (probes the GPU once for HEVC
+        # 4:4:4 hardware-decode support; cached). "hevc"/"avc" pass through.
+        # Used for the offer, the burst harvest, the decoder choice, and the
+        # streaming-path depay — everywhere instead of config.video_codec.
+        self._resolved_codec: str = resolve_codec(config.video_codec)
 
         # Connection state — None when disconnected.
         self._negotiation: Optional[NegotiationResult] = None
@@ -920,7 +929,7 @@ class Session:
         # cross-platform libav path, and `ISS_FORCE_SW_HEVC=1` forces libav
         # software (and therefore libav).
         _decoder_choice = _os.environ.get("ISS_DECODER", "auto").lower()
-        if cfg.video_codec == "avc":
+        if self._resolved_codec == "avc":
             # AVC path: the host streams H.264 4:2:0. vtdecode.py is HEVC-only,
             # so use the libav-based AvcDecoder (D3D11VA / VideoToolbox / VAAPI
             # HW with software fallback) on every platform. The H.264 stream
@@ -1124,10 +1133,10 @@ class Session:
         (without it the encoder-canvas reply degenerates and no burst
         arrives), so we always send a valid audio offer; `cfg.audio=False`
         only skips local decode + playback."""
-        # The video offer advertises only `cfg.video_codec`'s bank; offers.py
+        # The video offer advertises only the resolved codec's bank; offers.py
         # keys off ISS_VIDEO_CODEC. Set it here so this offer (and the dynamic-
         # resolution re-offer) matches the depay + decoder we wire up below.
-        os.environ["ISS_VIDEO_CODEC"] = cfg.video_codec
+        os.environ["ISS_VIDEO_CODEC"] = self._resolved_codec
         video_offer, audio_offer = create_offers()
         # Stash for mid-session 0x1c re-offers (dynamic resolution).
         self._video_offer = video_offer
@@ -1178,7 +1187,7 @@ class Session:
         self._drain_socket_into(self._sock_video, burst_buf, max_seconds=2.0)
         return gather_initial_burst(
             burst_buf, self._video_decryptor, quality_tier=cfg.quality_tier,
-            codec=cfg.video_codec,
+            codec=self._resolved_codec,
         )
 
     def _teardown_negotiation_tcp(self) -> None:
@@ -1867,7 +1876,7 @@ class Session:
             for i in range(len(oseq) - 1)
         )
 
-        if self._config.video_codec == "avc":
+        if self._resolved_codec == "avc":
             # H.264 RTP framing (RFC 6184 + Apple DON); avc1/avcC config
             # wrappers are skipped here — the canvas is fixed mid-stream so the
             # burst-harvested SPS/PPS stay valid (AVC dynamic-resolution

@@ -1,0 +1,118 @@
+"""GPU capability probe for HEVC 4:4:4 hardware decode + codec auto-selection.
+
+Apple's screen-share default video codec is HEVC RExt 4:4:4, which only recent
+GPUs hardware-decode (AMD RDNA3+, Intel Arc / 12th-gen+, NVIDIA Ada+); on the
+rest, libav silently falls back to CPU decode, which is far too slow for a live
+4-tile stream. H.264 4:2:0 (the AVC codec bank, see offers.py) hardware-decodes
+on virtually every GPU (D3D11VA on Windows, VAAPI on Linux, VideoToolbox on
+macOS). `--codec auto` (the default) resolves to HEVC 4:4:4 when the GPU can
+hardware-decode it and to H.264 4:2:0 otherwise.
+
+Detection is a *real* hardware decode of a tiny embedded HEVC 4:4:4 IDR through
+the same libav hwaccel path production uses. If the decoded frame comes back in
+a hardware pixel format the GPU supports it; if libav fell back to software
+(frame format `yuv444p`) or the hwaccel failed to initialise, it does not. This
+tests the actual decode path rather than trusting a static profile table, so it
+can't be fooled by a profile GUID that's advertised but broken.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import sys
+
+log = logging.getLogger(__name__)
+
+# A 64x64 HEVC Main 4:4:4 8-bit IDR access unit (VPS + SPS + PPS + IDR slice,
+# Annex-B), produced by libx265 from a yuv444p frame. Self-contained: it
+# decodes with a fresh decoder context, no external parameter sets. ~97 bytes.
+_HEVC444_SAMPLE = bytes.fromhex(
+    "0000000140010c01ffff0408000003009e280000030000baba0240000000014201"
+    "010408000003009e280000030000ba90041020b2dd25261734040000030004003d"
+    "090020000000014401c070306011200000012801ade0d117ffd39173238b80"
+)
+
+# Per-platform hwaccel candidates to probe, in priority order — mirrors the
+# decoder's own list in hevc.py so the probe tests what production would use.
+_PROBE_HWACCELS: dict[str, tuple[str, ...]] = {
+    "darwin": ("videotoolbox",),
+    "win32": ("d3d11va", "d3d12va"),
+    "*": ("vaapi", "cuda"),
+}
+
+_cache: dict[str, bool] = {}
+
+
+def _probe_one(hwaccel_type: str) -> bool:
+    """True iff `hwaccel_type` hardware-decodes the embedded HEVC 4:4:4 sample.
+
+    Uses `allow_software_fallback=False` so libav will NOT silently decode in
+    software when the GPU lacks the profile: a produced frame then means the
+    GPU did it, while an unsupported profile yields no frame / an exception.
+    (Inspecting `frame.format` is unreliable — VideoToolbox hands back a normal
+    `nv24`/`nv12` frame even on a true hardware decode.)"""
+    try:
+        import av
+        from av.codec.hwaccel import HWAccel
+
+        try:
+            hw = HWAccel(device_type=hwaccel_type, allow_software_fallback=False)
+        except TypeError:
+            # Older PyAV without the kwarg can't distinguish HW from a SW
+            # fallback here; be conservative and report unsupported (→ AVC).
+            log.info("hevc444 probe (%s): PyAV lacks allow_software_fallback; "
+                     "assuming no HW 4:4:4", hwaccel_type)
+            return False
+        ctx = av.CodecContext.create("hevc", "r", hwaccel=hw)
+        frames = list(ctx.decode(av.Packet(_HEVC444_SAMPLE)))
+        frames += list(ctx.decode(None))  # flush
+        ok = bool(frames)
+        log.info("hevc444 probe (%s): %s%s", hwaccel_type,
+                 "HW-decoded" if ok else "no HW frame",
+                 (" (fmt=%s)" % frames[0].format.name) if frames else "")
+        return ok
+    except Exception as e:
+        log.info("hevc444 probe (%s): unavailable (%s)", hwaccel_type, e)
+        return False
+
+
+def supports_hevc444_hwdecode() -> bool:
+    """Whether this platform's GPU can hardware-decode HEVC 4:4:4. Cached for
+    the process lifetime (the answer can't change without new hardware).
+
+    `ISS_HEVC444=0`/`1` overrides the probe (force AVC fallback / force HEVC) —
+    an escape hatch for a misbehaving probe and for testing the fallback path
+    on 4:4:4-capable hardware."""
+    override = os.environ.get("ISS_HEVC444")
+    if override in ("0", "1"):
+        return override == "1"
+    if "result" in _cache:
+        return _cache["result"]
+    if sys.platform == "darwin":
+        # macOS production decodes via the native VideoToolbox path
+        # (vtdecode.py), which handles Apple's 4:4:4 stream on every Mac we
+        # target; no libav probe needed.
+        _cache["result"] = True
+        return True
+    hwaccels = _PROBE_HWACCELS.get(sys.platform, _PROBE_HWACCELS["*"])
+    result = any(_probe_one(h) for h in hwaccels)
+    _cache["result"] = result
+    return result
+
+
+def resolve_codec(choice: str) -> str:
+    """Resolve a `--codec` value to a concrete `"hevc"` / `"avc"`.
+
+    `"auto"` probes the GPU: HEVC 4:4:4 when hardware-decodable, else H.264
+    4:2:0. `"hevc"` / `"avc"` pass through unchanged (no probe)."""
+    if choice != "auto":
+        return choice
+    if supports_hevc444_hwdecode():
+        log.info("codec=auto: GPU hardware-decodes HEVC 4:4:4 -> using hevc")
+        return "hevc"
+    log.info("codec=auto: no HEVC 4:4:4 hardware decode -> falling back to "
+             "avc (H.264 4:2:0)")
+    return "avc"
+
+
+__all__ = ["resolve_codec", "supports_hevc444_hwdecode"]

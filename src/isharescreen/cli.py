@@ -113,13 +113,15 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
     g.add_argument(
-        "--codec", choices=("hevc", "avc"), default="hevc",
+        "--codec", choices=("auto", "hevc", "avc"), default="auto",
         help=(
-            "video codec to negotiate with the host. 'hevc' (default) = Apple "
-            "HEVC RExt 4:4:4: best quality, but hardware-decodes only on GPUs "
-            "with HEVC 4:4:4 support (otherwise a slow CPU fallback). 'avc' = "
-            "H.264 High 4:2:0: lower quality, but hardware-decodes on virtually "
-            "any GPU (Windows D3D11VA / Linux VAAPI / macOS VideoToolbox)."
+            "video codec to negotiate with the host. 'auto' (default) probes "
+            "whether this GPU can hardware-decode HEVC 4:4:4 and uses it if so, "
+            "otherwise falls back to H.264 4:2:0. 'hevc' = force Apple HEVC RExt "
+            "4:4:4 (best quality; slow CPU fallback on GPUs without 4:4:4 HW "
+            "decode). 'avc' = force H.264 High 4:2:0 (lower quality, but "
+            "hardware-decodes on virtually any GPU: D3D11VA / VAAPI / "
+            "VideoToolbox)."
         ),
     )
     g.add_argument(
