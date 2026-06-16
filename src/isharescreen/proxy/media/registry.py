@@ -9,8 +9,8 @@ selector filters to the negotiated codec, sorts hardware-before-software then by
 priority, and returns the first spec whose `available()` probe passes. Two knobs
 sit on top:
 
-  * codec negotiation — `resolve_codec("auto")` offers HEVC when any 4:4:4
-    decoder is available here, else AVC 4:2:0 (`can_decode`).
+  * codec negotiation — `resolve_codec("auto")` offers HEVC when a hardware
+    4:4:4 decoder is available here, else AVC 4:2:0 (`can_decode`).
   * manual override — `ISS_DECODER=<name>` / `--decoder <name>` forces a spec;
     `--list-decoders` prints the live matrix (run it on an Intel box to see
     whether `libav-hevc444` covers 4:4:4 via the generic DXVA-RExt path, making
@@ -129,10 +129,9 @@ def _build_avc(num_tiles, *, enable_quality_gate=True, on_frame_published=None,
 #                          VideoToolbox hwaccel fallback on macOS. On Windows,
 #                          probe currently fails (see note above); this slot is
 #                          reserved for future d3d11va RExt support.
-#    20  libav-hevc444-sw  SOFTWARE HEVC 4:4:4 — last resort before AVC. Slow
-#                          for live 4-tile streams but preserves full 4:4:4
-#                          chroma fidelity. resolve_codec picks this over AVC
-#                          when no HW 4:4:4 decoder is available.
+#    20  libav-hevc444-sw  SOFTWARE HEVC 4:4:4 — last resort when HEVC is
+#                          explicitly requested. Slow for live 4-tile streams
+#                          but preserves full 4:4:4 chroma fidelity.
 #     1  libav-avc420      H.264 4:2:0 — experimental; absolute last resort.
 _REGISTRY: list[DecoderSpec] = [
     DecoderSpec("vt-hevc444", "hevc", "444", ("darwin",), "hardware", 100,
@@ -244,16 +243,14 @@ def resolve_codec(choice: str) -> str:
     """Resolve a `--codec` value to a concrete 'hevc' / 'avc'. 'auto' offers
     HEVC when any 4:4:4 decoder is available here, else H.264 4:2:0.
 
-    Priority: HW HEVC 4:4:4 > SW HEVC 4:4:4 (last resort) > AVC 4:2:0."""
+    Priority: HW HEVC 4:4:4 > AVC 4:2:0. Software HEVC 4:4:4 remains available
+    when HEVC is requested explicitly, but does not drive auto negotiation."""
     if choice != "auto":
         return choice
     if can_decode("hevc", "444", hardware_only=True):
         log.info("codec=auto: a HEVC 4:4:4 hardware decoder is available -> hevc")
         return "hevc"
-    if can_decode("hevc", "444", hardware_only=False):
-        log.info("codec=auto: no HEVC 4:4:4 hardware decoder; software fallback available -> hevc (sw)")
-        return "hevc"
-    log.info("codec=auto: no HEVC 4:4:4 decoder -> avc (H.264 4:2:0)")
+    log.info("codec=auto: no HEVC 4:4:4 hardware decoder -> avc (H.264 4:2:0)")
     return "avc"
 
 
