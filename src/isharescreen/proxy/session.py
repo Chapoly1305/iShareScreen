@@ -262,9 +262,15 @@ class Session:
         from .protocol.clipboard import ClipboardReassembler
         self._clipboard_reassembler = ClipboardReassembler()
         self._ssrc_to_tile: dict[int, int] = {}
+        # Per-tile received coded bytes — to see which screen band (tile)
+        # eats the bandwidth (tile 0 = top/menu-bar strip, 1-3 down the
+        # screen). Surfaced as KB/s in the profile log.
+        self._tile_bytes: dict[int, int] = {}
+        self._last_tile_bytes: dict[int, int] = {}
         self._last_ssrc_adopt_ts: float = 0.0
         self._ssrc_blacklist: set[int] = set()
         self._last_profile_good: list[int] = []
+        self._last_profile_clean: list[int] = []
 
         # Cipher state for the TX channel.
         self._video_decryptor: Optional[SRTPDecryptor] = None
@@ -373,6 +379,15 @@ class Session:
         # ON by default; set ISS_LTRP=0 to disable.
         self._ltr_enabled = os.environ.get("ISS_LTRP", "1") != "0"
         self._ltr_last_acked: int = 0
+        self._ltr_acks_sent: int = 0
+        # The per-ack LTR log fires at frame rate and drowns the debug log
+        # (a `tail` then only covers a few seconds, hiding real events like
+        # gray-outs). Off by default; ISS_LOG_LTR=1 re-enables it for LTRP
+        # debugging. Acks-flowing is otherwise visible via the profile line.
+        self._log_ltr_acks = os.environ.get("ISS_LOG_LTR") == "1"
+        # Dedup state for the misc-status (0x14) push log — only emit when
+        # the cmd value changes, not on every repeat.
+        self._last_misc_status_cmd: object = None
 
         # DPB-break detection state. `_dpb_error_window` is a sliding
         # ring of monotonic timestamps for libav "Could not find ref"
@@ -383,6 +398,14 @@ class Session:
         # during the burst tail.
         self._dpb_error_window: deque[float] = deque()
         self._last_decoder_restart_t: float = 0.0
+        # Escalation state: when a "Could not find ref" storm persists
+        # through repeated targeted FIRs, the tile-0 IDR fan-out doesn't
+        # clear it (tiles 1-3 are P-only; the host won't send them their own
+        # IDR). Count consecutive storm FIRs; past the threshold, escalate to
+        # a force-IDR of ALL tiles (the manual force-IDR action), which does
+        # clear the gray.
+        self._dpb_fir_count: int = 0
+        self._last_dpb_error_t: float = 0.0
         # Gray-out event aggregator. Multiple paths (per-tile gate FIR,
         # batched DPB-break FIR) can emit FIRs within a few ms. Buffer
         # the tile indices and the most recent libav concealment message
@@ -395,7 +418,7 @@ class Session:
         # Per-tile FIR rate limit, applied at the wire layer in
         # `_send_fir_for_tile` so it coalesces requests from every
         # caller (SSRC adoption, quality_gate, libav concealment fast
-        # path, soft concealment, F12, stall watchdog) into one FIR
+        # path, soft concealment, force-IDR, stall watchdog) into one FIR
         # per tile per `_FIR_MIN_INTERVAL_S` window. Without this,
         # multiple recovery paths firing within ~500 ms during an
         # SSRC restart caused Apple to send several IDRs per tile,
@@ -520,7 +543,7 @@ class Session:
 
     def request_fir(self, tile_idx: Optional[int] = None) -> None:
         """Externally trigger an FIR (forces a fresh IDR). Without args,
-        targets every tile. Used by the F12 manual refresh hotkey, the
+        targets every tile. Used by the TUI's force-IDR ('f') action, the
         SSRC-adoption restart path, and tests.
 
         Funnels through the gate's `keyframe_required` set so the
@@ -997,7 +1020,7 @@ class Session:
         action = cmd.get("action")
         if action == "fir":
             # Force an IDR refresh on every tile. Same effect as the
-            # F12 fallback in the desktop frontend.
+            # TUI's force-IDR ('f') action.
             try:
                 self.request_fir(None)
             except Exception:
@@ -1226,7 +1249,9 @@ class Session:
         try:
             pkt = build_rtcp_app_ltrp(ssrc, donl)
             sock.sendto(enc.protect(pkt), (self._dest_host, self._video_dest_port))
-            log.debug("LTR ack sent: DONL=%d (tile 0)", donl)
+            self._ltr_acks_sent += 1
+            if self._log_ltr_acks:
+                log.debug("LTR ack sent: DONL=%d (tile 0)", donl)
         except OSError as e:
             log.debug("LTR ack send failed: %s", e)
 
@@ -1262,6 +1287,14 @@ class Session:
             return
         # Raise PyAV's libav verbosity so concealment WARNINGs reach
         # the Python logger.
+        # Surface EVERY libav message reaching the handler (before the
+        # keyword whitelist below drops it), so a HW decoder's own error
+        # reports aren't silently discarded — this is how we find out what
+        # d3d11va actually emits when it goes gray. Default ON for now (set
+        # ISS_LOG_LIBAV=0 to silence). Kept at WARNING level: the messages
+        # that matter (decode / hwaccel errors) are ERROR-class, so it stays
+        # quiet during normal playback and only fires on real trouble.
+        _log_all_libav = os.environ.get("ISS_LOG_LIBAV", "1") != "0"
         try:
             _avlog.set_libav_level(_avlog.WARNING)
             _avlog.set_level(_avlog.WARNING)
@@ -1281,9 +1314,13 @@ class Session:
         class _LibavConcealmentHandler(logging.Handler):
             def emit(self_h, record):  # noqa: N805
                 try:
-                    msg = record.getMessage().lower()
+                    raw = record.getMessage().strip()
                 except Exception:
                     return
+                msg = raw.lower()
+                if _log_all_libav:
+                    # Diagnostic: log it ALL, before the whitelist drops it.
+                    log.info("LIBAV_RAW[%s] %s", record.levelname, raw)
                 if not any(kw in msg for kw in concealment_keywords):
                     return
                 for sess in tuple(getattr(Session, "_active_sessions", ())):
@@ -1331,8 +1368,8 @@ class Session:
     # ~7 short-term refs per P-slice so a single bad slice produces ~7
     # events; the older threshold of 12 required >=2 bad slices in the
     # same second and skipped recovery for single-slice corruption,
-    # leaving the user with persistent gray artifacts that only F12
-    # cleared. The post-restart grace below + the fast cooldown +
+    # leaving the user with persistent gray artifacts that only a manual
+    # force-IDR cleared. The post-restart grace below + the fast cooldown +
     # mark_decode_error's own per-tile cooldown all cap the FIR rate,
     # so a single bad slice no longer produces a FIR storm.
     _DPB_ERR_WINDOW_S: float = 1.0
@@ -1368,6 +1405,17 @@ class Session:
     # back-to-back retries still wait long enough to see whether the
     # first FIR worked.
     _FIR_MIN_INTERVAL_S: float = 0.25
+    # Persistent-DPB-break escalation. When a "Could not find ref" storm
+    # survives this many targeted fast-path FIRs (each ~1 s apart), escalate
+    # to force-IDR ALL tiles (request_fir(None) = the TUI 'f' action), which
+    # users confirm reliably clears the persistent gray. ~3 s of continuous
+    # FIR-resistant corruption before escalating — fast enough to beat a
+    # manual click, slow enough not to blanket-FIR on transient single-frame
+    # loss (which the targeted FIR + natural IDR already handles).
+    _DPB_FORCEALL_AFTER_FIRS: int = 3
+    # A gap this long with no "Could not find ref" means the previous storm
+    # cleared (real recovery); reset the escalation counter.
+    _DPB_STORM_RESET_S: float = 3.0
 
     def _on_libav_concealment(self, msg: str) -> None:
         """Two response modes for libav's "Could not find ref" log:
@@ -1397,6 +1445,11 @@ class Session:
         # natural IDR cycle.
         if "could not find ref" in msg.lower():
             self._last_concealment_msg = msg
+            # Storm tracking for reconnect escalation: a long gap since the
+            # last ref-miss means the prior storm cleared → reset the count.
+            if now - self._last_dpb_error_t > self._DPB_STORM_RESET_S:
+                self._dpb_fir_count = 0
+            self._last_dpb_error_t = now
             events = self._dpb_error_window
             events.append(now)
             cutoff = now - self._DPB_ERR_WINDOW_S
@@ -1413,11 +1466,29 @@ class Session:
                     and now - last_fast >= self._DPB_FAST_COOLDOWN_S):
                 self._last_dpb_fast_recovery_t = now
                 events.clear()
-                log.warning(
-                    "DPB break: %d 'Could not find ref' events in %.1fs "
-                    "— FIR for fresh IDR",
-                    self._DPB_ERR_THRESHOLD, self._DPB_ERR_WINDOW_S,
-                )
+                self._dpb_fir_count += 1
+                if self._dpb_fir_count >= self._DPB_FORCEALL_AFTER_FIRS:
+                    # The per-tile FIR above isn't clearing the storm. Escalate
+                    # to the SAME action the TUI 'f' key does — request_fir(None)
+                    # → gate.force_keyframe_all() + FIR every tile. Users report
+                    # this manual Force-IDR ALWAYS clears the persistent gray,
+                    # where the targeted auto-FIR (tile 0 / bad tiles only)
+                    # doesn't. We hold it back to the persistent case so we
+                    # don't blanket-FIR all tiles on every transient loss.
+                    log.warning(
+                        "DPB break persisted through %d FIRs — escalating to "
+                        "force-IDR ALL tiles (= TUI 'f' action)",
+                        self._dpb_fir_count,
+                    )
+                    self._dpb_fir_count = 0
+                    self.request_fir(None)
+                else:
+                    log.warning(
+                        "DPB break: %d 'Could not find ref' events in %.1fs "
+                        "— FIR for fresh IDR (attempt %d/%d before force-all)",
+                        self._DPB_ERR_THRESHOLD, self._DPB_ERR_WINDOW_S,
+                        self._dpb_fir_count, self._DPB_FORCEALL_AFTER_FIRS,
+                    )
                 # Don't blanket-FIR all tiles. The libav log line
                 # doesn't tell us which tile produced the ref-miss,
                 # but the per-tile post-decode `had_decode_error`
@@ -1587,6 +1658,7 @@ class Session:
             packets = sorted(grp, key=lambda x: x[0])
 
         ordered = [p for _, _, p in packets]
+        self._tile_bytes[ti] = self._tile_bytes.get(ti, 0) + sum(len(p) for p in ordered)
         # The access unit's DONL (decoding-order number) — the LTR ring key
         # the LTRP ack must echo. Same for every NALU in the group.
         donl = first_donl(ordered) if self._ltr_enabled else None
@@ -1898,7 +1970,11 @@ class Session:
         #   11 = UserSessionChanged
         if msg_type == 0x14:
             cmd = struct.unpack(">H", msg[6:8])[0] if len(msg) >= 8 else None
-            log.debug("server sent 0x14 misc-status (cmd=%s): %s", cmd, msg.hex())
+            # Only log on change — the host re-pushes the same status
+            # (typically cmd=4) every couple seconds, which is pure noise.
+            if cmd != self._last_misc_status_cmd:
+                log.debug("server sent 0x14 misc-status (cmd=%s): %s", cmd, msg.hex())
+                self._last_misc_status_cmd = cmd
             if cmd == 2:
                 log.info("remote clipboard changed; sending fetch (0x0b)")
                 try:
@@ -2186,6 +2262,26 @@ class Session:
         self._last_profile_lost_per_tile = list(lost)
         elapsed = _TX_INTERVAL_S * _TX_PROFILE_EVERY_N_TICKS
         rates = [round(d / elapsed, 1) for d in delta]
+        # Clean (non-concealed) per-tile rate — the honest "real video"
+        # signal. A tile with a high `rates` but ~0 `clean_rates` is GRAY:
+        # it's churning concealed frames at full throughput. (good_count
+        # counts concealed frames; clean_count does not.)
+        clean = self._decoder.clean_counts
+        cbase = (self._last_profile_clean
+                 if len(self._last_profile_clean) == len(clean)
+                 else [0] * len(clean))
+        cdelta = [clean[i] - cbase[i] for i in range(len(clean))]
+        if any(d < 0 for d in cdelta):
+            cdelta = list(clean)
+        self._last_profile_clean = list(clean)
+        clean_rates = [round(d / elapsed, 1) for d in cdelta]
+        # Per-tile KB/s — which screen band is eating the bandwidth.
+        n_t = len(clean)
+        tile_kbs = []
+        for ti in range(n_t):
+            db = self._tile_bytes.get(ti, 0) - self._last_tile_bytes.get(ti, 0)
+            tile_kbs.append(round(max(0, db) / elapsed / 1024, 1))
+        self._last_tile_bytes = dict(self._tile_bytes)
         # RX/TX rate deltas over the same interval.
         rx_v = self._rx_pkts_video; rx_c = self._rx_pkts_ctrl; rx_t = self._rx_pkts_tcp
         bv = self._rx_bytes_video; bc = self._rx_bytes_ctrl
@@ -2252,8 +2348,19 @@ class Session:
         # Periodic profile log is debug-level: the same data flows out the
         # control socket as a structured snapshot for the TUI / monitors,
         # so a normal user doesn't need it spamming the log every 2 s.
+        # LTRP recovery telemetry: ack count proves iss is acking; far_ref
+        # (a P-slice referencing a POC >=16 frames back, vs the normal ~7)
+        # is the wire signature that the host honoured an ack and recovered
+        # via a long-term-style reference instead of a full IDR. far>0 with
+        # acks climbing == LTRP working end-to-end. far==0 while gray recurs
+        # == acks still no-op. See hevc_rps far_ref_events / _send_ltr_ack.
+        rps = getattr(self._decoder, "_rps_tracker", None)
+        ltr_far = getattr(rps, "far_ref_events", 0)
+        ltr_dist = getattr(rps, "max_ref_distance", 0)
+        ltr_miss = getattr(rps, "missing_ref_events", 0)
         log.debug(
-            "profile: decoder=%s tiles=%s rates=%s fps loss/tile=%s "
+            "profile: decoder=%s tiles=%s rates=%s clean_rates=%s gray_tiles=%s fps tile_KBs=%s loss/tile=%s "
+            "ltr=ack%d/far%d/dist%d/miss%d "
             "loss_total=%d unmapped=%d "
             "ssrc_groups=%d last_publish=%.1fs ago "
             "udp_q=video[%d/%d drop=%d] ctrl[%d/%d drop=%d] "
@@ -2261,7 +2368,8 @@ class Session:
             "tx_pps=%.2f cursor=%dms_ago/n=%d tcp_types={%s} "
             "nalu={%s}",
             decoder_name,
-            good, rates, loss_delta,
+            good, rates, clean_rates, sorted(self._decoder.bad_tiles), tile_kbs, loss_delta,
+            self._ltr_acks_sent, ltr_far, ltr_dist, ltr_miss,
             loss_total, loss_unmapped,
             ssrc_groups,
             last_publish_age,

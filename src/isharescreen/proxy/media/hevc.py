@@ -114,6 +114,12 @@ class _TileSlot:
     don't tear."""
     raw_frame: Optional[av.VideoFrame] = None
     good_count: int = 0
+    # Frames published WITHOUT a libav decode-error flag — i.e. actually
+    # clean video, not concealed gray. `good_count` counts every published
+    # frame including concealed ones, so a fully-gray tile still shows a
+    # healthy good_count/rate; `clean_count` is the honest "is this tile
+    # showing real picture" signal. Compare the two in the profile log.
+    clean_count: int = 0
     last_evaluated_count: int = 0
     # Per-tile flag, kept for diagnostics. The actual publish gate is
     # the session-wide `_dpb_has_idr` because Apple's stream uses
@@ -350,6 +356,7 @@ class HevcDecoder:
 
         # HW state.
         self._hw_name: Optional[str] = None
+        self._hw_verified = False  # first-frame HW-binding truthfulness check
         self._hw_failed = False
 
         # Decode worker + queue.
@@ -636,14 +643,27 @@ class HevcDecoder:
         return self._gate.tile_state(tile_idx)
 
     @property
+    def bad_tiles(self) -> set[int]:
+        """Tiles the gate considers gray/concealing and awaiting recovery
+        (decoder-agnostic; works on HW decoders too). See gate.bad_tiles."""
+        return self._gate.bad_tiles
+
+    @property
     def hw_accel(self) -> Optional[str]:
         """The active HW accelerator name, or None on software."""
         return self._hw_name
 
     @property
     def good_counts(self) -> list[int]:
-        """Per-tile decoded-frame totals since last reset."""
+        """Per-tile published-frame totals since last reset (INCLUDES
+        concealed/gray frames — this is throughput, not visual health)."""
         return [t.good_count for t in self._tiles]
+
+    @property
+    def clean_counts(self) -> list[int]:
+        """Per-tile CLEAN (non-concealed) published-frame totals. A tile
+        whose good_count climbs but clean_count is flat is showing gray."""
+        return [t.clean_count for t in self._tiles]
 
     # -- lifecycle -----------------------------------------------------
 
@@ -784,6 +804,21 @@ class HevcDecoder:
 
     def _publish_frame(self, frame: av.VideoFrame) -> None:
         """Map `frame.pts` back to its source tile and update that slot."""
+        # One-time HW-binding truthfulness check: if we requested a hwaccel
+        # but the output is a software pixel format, the accel never bound
+        # (e.g. D3D11VA on a 4:4:4 stream) — relabel as software so the
+        # profile log / `hw_accel` are honest and downstream stops assuming
+        # a GPU surface. The decode itself is unaffected; only the label.
+        if not self._hw_verified:
+            self._hw_verified = True
+            if (self._hw_name is not None
+                    and frame.format.name not in _HW_FRAME_FORMATS):
+                log.warning(
+                    "hwaccel %r did not bind for this stream (output=%s); "
+                    "decoding in software", self._hw_name, frame.format.name,
+                )
+                self._hw_name = None
+
         ti = self._pts_to_tile.pop(frame.pts, None)
         if ti is None:
             # PTS aged out of the map (rare on healthy streams; can happen
@@ -791,10 +826,20 @@ class HevcDecoder:
             log.debug("frame pts=%d not in map", frame.pts)
             return
 
+        # Concealed (gray) frames carry libav's decode-error flag; count
+        # them in good_count (throughput) but NOT clean_count (real video),
+        # so the profile can distinguish a healthy tile from a gray one that
+        # is still churning concealed frames at full rate.
+        err = getattr(frame, "decode_error_flags", 0)
+        flg = getattr(frame, "flags", 0)
+        had_error = bool(err) or bool(flg & 0x01)
+
         slot = self._tiles[ti]
         with slot.lock:
             slot.raw_frame = frame
             slot.good_count += 1
+            if not had_error:
+                slot.clean_count += 1
 
         if self._on_frame_published is not None:
             try:
@@ -953,11 +998,18 @@ class HevcDecoder:
             hw = HWAccel(device_type=hw_type)
             c = av.CodecContext.create("hevc", "r", hwaccel=hw)
             c.extradata = extradata
-            # Single-threaded for HEVC: HEVC frame/slice threading can
-            # interact awkwardly with cross-frame DPB references at the
-            # decoder level. The HW path itself parallelises internally.
-            c.thread_type = "NONE"
-            c.thread_count = 1
+            # SLICE threading (parallelise within a frame), all cores.
+            # On Windows, DXVA2/D3D11VA cannot decode HEVC 4:4:4 (FFmpeg's
+            # hevc get_format never offers them for YUV444P), so this "HW"
+            # context silently software-decodes Apple's 4:4:4 stream. Single
+            # thread only hit ~57 fps on busy full-res content (< the 60 fps
+            # stream) → backlog → gray; SLICE threading measured ~205 fps.
+            # SLICE (not FRAME) adds no latency and no frame reordering, so
+            # it's safe for the cross-frame DPB refs Apple's tiles use. When
+            # a real HW decoder does bind, it parallelises internally and
+            # ignores this setting.
+            c.thread_type = "SLICE"
+            c.thread_count = 0
             c.flags = _CODEC_FLAG_LOW_DELAY
             c.flags2 = _CODEC_FLAG2_FAST
             c.open()
@@ -967,15 +1019,17 @@ class HevcDecoder:
             return None
 
     def _make_sw_context(self, extradata: bytes) -> av.codec.context.CodecContext:
-        # Single shared context, single thread. Cross-tile POC refs make
-        # frame/slice threading risky for Apple's stream — the original
-        # rev-eng work landed on NONE for this reason. SW perf at 1440p
-        # in this mode is ~15-30 fps on a modest CPU; for higher
-        # framerates, HW accel takes over.
+        # Single shared context, SLICE threading across all cores. SLICE
+        # parallelises within a single frame's CTU rows (no frame reordering,
+        # no added latency), so the cross-tile/cross-frame DPB refs Apple's
+        # stream relies on are decoded in order — unlike FRAME threading,
+        # which the original rev-eng work correctly avoided. Single-thread
+        # 4:4:4 decode fell behind the 60 fps stream on busy content
+        # (~57 fps measured at 2940x1912); SLICE measured ~205 fps.
         c = av.CodecContext.create("hevc", "r")
         c.extradata = extradata
-        c.thread_type = "NONE"
-        c.thread_count = 1
+        c.thread_type = "SLICE"
+        c.thread_count = 0
         c.flags = _CODEC_FLAG_LOW_DELAY
         c.flags2 = _CODEC_FLAG2_FAST
         c.open()
@@ -986,6 +1040,12 @@ class HevcDecoder:
     ) -> None:
         self._codec = codec
         self._hw_name = hw_name
+        # _try_hwaccel labels the context with the REQUESTED hwaccel, but the
+        # accel only binds in get_format. e.g. DXVA2/D3D11VA are never offered
+        # for HEVC 4:4:4, so on Windows Apple's stream silently decodes in
+        # software through a context still labelled "d3d11va". Re-verify from
+        # the first real frame's pixel format (see _publish_frame).
+        self._hw_verified = False
         self._reformatter[0] = None
         self._seen_fmts.clear()
         self._next_pts = 0
@@ -1050,6 +1110,7 @@ class HevcDecoder:
             with slot.lock:
                 slot.raw_frame = None
                 slot.good_count = 0
+                slot.clean_count = 0
                 slot.last_evaluated_count = 0
                 slot.saw_idr_since_reset = False
         self._gate.reset()
