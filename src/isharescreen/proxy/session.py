@@ -2188,9 +2188,18 @@ class Session:
                     self.request_fir()
                 else:
                     # HEVC: SPS/PPS are inline NALs in the new IDR burst;
-                    # restart now and let the decoder absorb them on arrival.
-                    self._last_decoder_restart_t = now
-                    self._decoder.restart()
+                    # restart so the decoder absorbs them on arrival.
+                    # Guard against rapid back-to-back SSRC rotations (e.g.
+                    # Apple emitting two new groups within 2 s at curtain
+                    # start): the second full restart discards IDR frames
+                    # in-flight for the first group's FIR, making recovery
+                    # nearly impossible.  If we just restarted within 3 s
+                    # the decoder is already fresh — skip the redundant
+                    # teardown and let the FIR re-anchor the new group.
+                    last_restart = getattr(self, "_last_decoder_restart_t", 0.0)
+                    if now - last_restart >= 3.0:
+                        self._last_decoder_restart_t = now
+                        self._decoder.restart()
                     self.request_fir()
 
     # ── RTCP RX loop (server SR for jitter / dlsr) ──────────────────
