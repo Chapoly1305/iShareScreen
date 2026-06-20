@@ -154,6 +154,25 @@ class InputController:
             return
         self._send(build_key_event(down=bool(down), keysym=int(keysym)))
 
+    def request_framebuffer_update(
+        self, *, incremental: bool = True,
+        x: int = 0, y: int = 0, w: int = 1, h: int = 1,
+    ) -> None:
+        """msg 0x03 FramebufferUpdateRequest — used as the cursor-pipeline
+        keepalive. The daemon re-arms its cursor (enc 1104) sender after each
+        rect it sends and needs a fresh request to keep going; SS.app polls
+        continuously so its cursor never freezes, iss historically requested
+        once at startup and stopped. We poll a MINIMAL 1x1 region: the cursor
+        pseudo-encoding is region-independent (sent whenever the cursor
+        changes against any outstanding request), so a 1x1 request re-arms it
+        WITHOUT making the daemon answer with full-screen video rects — a
+        full-screen request does pull video over the RFB channel and
+        destabilises the HP RTP stream (why the earlier full-screen attempt
+        was reverted)."""
+        self._send(struct.pack(
+            ">BBHHHH", 0x03, 1 if incremental else 0, x, y, w, h,
+        ))
+
     def send_clipboard_enable(self) -> None:
         """msg 0x15 — ask screensharingd to enable autopasteboard. Mode 1 =
         "start monitoring local pasteboard" per ScreensharingAgent's

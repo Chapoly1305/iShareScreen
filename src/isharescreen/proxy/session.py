@@ -307,6 +307,14 @@ class Session:
         self._ctrl_q: queue.Queue[bytes] = queue.Queue(maxsize=_UDP_DRAIN_QUEUE_MAX)
         self._video_q_dropped = 0
         self._ctrl_q_dropped = 0
+        # Self-inflicted-backlog detection. When software decode can't keep
+        # up, the video receive queue overflows and drops our OWN packets;
+        # the resulting sequence gaps/gray are not network loss, so NACK/FIR
+        # retransmit requests are futile and self-amplifying (they add load to
+        # an already-overflowing queue → a multi-Mbps storm). `_decode_behind`
+        # is recomputed once per tx tick and gates the NACK/FIR drains.
+        self._last_q_drop_seen = 0
+        self._decode_behind = False
         # RX/TX byte+packet counters. _rx_msg_type_counts[type] tracks
         # inbound RFB msg-type histogram on the TCP control channel —
         # critical for diagnosing the "cursor freeze after idle" bug
@@ -453,6 +461,11 @@ class Session:
         self._cursor_callback: Optional[
             Callable[[Optional["_CursorImage"]], None]
         ] = None
+        # Safety counter for the cursor-keepalive: any video/raw rect arriving
+        # over the RFB channel means an FBU request pulled video (the old
+        # full-screen-request bug). Stays 0 with the 1x1 keepalive; surfaced
+        # in the profile log so a regression is visible.
+        self._fbu_video_rects = 0
 
     # ── public lifecycle ─────────────────────────────────────────────
 
@@ -2017,6 +2030,7 @@ class Session:
         #   then n_rects × { rect_header (12B) + encoding_payload }
         n_rects = struct.unpack(">H", msg[2:4])[0]
         offset = 4
+        saw_cursor = False
         for _ in range(n_rects):
             if offset + 12 > len(msg):
                 log.debug("FBU truncated at rect header (offset=%d)", offset)
@@ -2026,6 +2040,7 @@ class Session:
             )
             offset += 12
             if encoding == 1104:
+                saw_cursor = True
                 consumed = self._handle_cursor_rect(msg, offset, f0, f1, f2, f3)
                 if consumed < 0:
                     return
@@ -2048,19 +2063,26 @@ class Session:
                     return
                 offset += 2 + sz
             else:
-                # Unknown pseudo-encoding on the control channel — we
-                # can't tell its payload size, so we have to give up
-                # parsing the rest of this FBU. The next msg starts
-                # with a fresh type byte so this isn't fatal.
-                log.debug("FBU rect with unknown encoding=%d; aborting walk",
-                          encoding)
+                # A non-cursor, non-config rect on the control channel means
+                # the daemon answered with video/raw pixel data over RFB. With
+                # the 1x1 keepalive below this should never happen; count it as
+                # the safety signal that a request pulled video (the failure
+                # mode of the old full-screen request that destabilised RTP).
+                self._fbu_video_rects += 1
+                log.debug("FBU rect with video/unknown encoding=%d; aborting "
+                          "walk (video_rects=%d)", encoding, self._fbu_video_rects)
                 return
-        # Note: no re-arm. The daemon's cursor sender is a free-running
-        # pthread (SendFrameBuffer) that calls EncodeCursorImageWithAlpha
-        # whenever the host's cursor changes, gated by a single flag
-        # that's set once when SetEncodings advertises encoding 1104.
-        # msg 0x03 (FBU req) does NOT touch any cursor state and
-        # cannot trigger or accelerate cursor sends.
+        # Re-arm the cursor pipeline. The daemon's threads stay alive (it's
+        # not a dead cursor pthread) — the cursor just
+        # stops because the daemon re-arms its sender after each rect and needs
+        # a fresh request, which iss wasn't sending (SS.app polls continuously,
+        # so it never freezes). Re-request a MINIMAL 1x1 region after each
+        # cursor update so shape changes keep flowing, without pulling video.
+        if saw_cursor and self._input is not None:
+            try:
+                self._input.request_framebuffer_update()
+            except Exception:
+                pass
 
     def _handle_cursor_rect(
         self, msg: bytes, offset: int,
@@ -2219,15 +2241,43 @@ class Session:
 
     # ── TX loop (heartbeat + RTCP + on-demand FIR/PLI/NACK + watchdog) ─
 
+    def _maybe_poll_cursor(self) -> None:
+        """Periodic minimal (1x1) FramebufferUpdateRequest, every tx tick
+        (~2/s), to keep the daemon's cursor (enc 1104) sender armed so cursor-
+        shape changes keep flowing after the screen goes idle. The daemon
+        re-arms its sender after each rect and goes quiet without ongoing
+        requests (the 'cursor freezes after idle' bug — RE'd: the daemon's
+        threads are all alive, it's request-starvation, not a dead pthread).
+        The 1x1 region keeps it from pulling video (see
+        InputController.request_framebuffer_update)."""
+        if self._input is None:
+            return
+        try:
+            self._input.request_framebuffer_update()
+        except Exception:
+            pass
+
     def _tx_loop(self) -> None:
         while not self._stop_evt.is_set():
             self._tx_tick += 1
             try:
+                # Recompute self-inflicted-backlog state before the NACK/FIR
+                # drains. Backlogged = our receive queue is actively dropping
+                # (decode can't drain it) or already half-full. While
+                # backlogged, the gaps are our own dropped packets, not
+                # network loss, so we hold off retransmit requests.
+                dropped_now = self._video_q_dropped
+                self._decode_behind = (
+                    dropped_now > self._last_q_drop_seen
+                    or self._video_q.qsize() > _UDP_DRAIN_QUEUE_MAX // 2
+                )
+                self._last_q_drop_seen = dropped_now
                 self._send_heartbeat()
                 self._send_rr_and_maybe_sr()
                 self._drain_pending_fir()
                 self._drain_pending_nack()
                 self._check_stall()
+                self._maybe_poll_cursor()
                 if self._tx_tick % _TX_PROFILE_EVERY_N_TICKS == 0:
                     self._log_profile_snapshot()
             except Exception as e:
@@ -2468,6 +2518,13 @@ class Session:
     def _drain_pending_fir(self) -> None:
         if self._decoder is None:
             return
+        # Self-inflicted backlog: the gray tiles are from our own dropped
+        # packets (decode can't keep up), not network loss. FIRing only makes
+        # the server resend full IDRs into an already-overflowing queue. Hold
+        # off — keyframe_required stays populated and fires once decode
+        # catches up (queue drains, _decode_behind clears).
+        if self._decode_behind:
+            return
         # Apple-idle suppression: if no video packet has arrived in the
         # last 1.5 s, Apple's encoder rate-controlled to silence on a
         # static screen — there's nothing to FIR productively (Apple
@@ -2560,6 +2617,15 @@ class Session:
         self._last_concealment_msg = ""
 
     def _drain_pending_nack(self) -> None:
+        # Self-inflicted backlog: the sequence gaps are our own dropped
+        # packets (receive queue overflow), not network loss. NACKing them is
+        # futile (the retransmits get dropped too) and self-amplifying — this
+        # is the dominant cause of the multi-Mbps idle storm. Discard the
+        # pending gaps until decode catches up; genuine loss (queue draining)
+        # still NACKs normally.
+        if self._decode_behind:
+            self._nack_pending.clear()
+            return
         sock = self._sock_ctrl
         enc = self._srtcp_enc
         sender = self._our_video_ssrc

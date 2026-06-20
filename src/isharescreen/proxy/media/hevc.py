@@ -16,10 +16,12 @@ RX threads enqueue NALUs and return; libavcodec releases the GIL inside
 ``codec.decode()`` so the rest of the process stays responsive while the
 HEVC heavy lifting happens.
 
-Hardware acceleration is requested per-platform (VideoToolbox on macOS,
-D3D11VA on Windows, VAAPI on Linux). Software libavcodec is the universal
-fallback. The HW path matches Apple Screen Sharing perf when the underlying
-silicon supports HEVC RExt 4:4:4 (RDNA3+, Intel Arc/12th gen+, NVIDIA Ada+).
+Hardware acceleration is requested per-platform (D3D11VA on Windows, VAAPI
+on Linux); macOS intentionally runs software-only (see _PLATFORM_HWACCELS).
+Software libavcodec is the universal fallback and, in practice, the path
+nearly everyone hits: Apple's stream is HEVC RExt 4:4:4, which the common
+desktop HW decoders (D3D11VA/DXVA2/VAAPI) do not support — they are 4:2:0
+only — so the decoder silently stays on software for this stream.
 
 The frame-stats quality gate (gray / black / green-pop detection + FIR
 escalation) lives in `quality_gate.py`.
@@ -69,18 +71,17 @@ _QUEUE_MAX = 512                           # NALUs in flight to the decoder
 _WORKER_DEQUEUE_TIMEOUT_S = 0.5
 _WORKER_JOIN_TIMEOUT_S = 2.0
 
-# HW-accel fallback thresholds — empirical, tuned against Apple Silicon
-# + Linux iGPU.
-# 10 was too aggressive: VideoToolbox routinely emits 10+ EAGAINs during
-# warm-up (codec buffering input before producing output). 50 lets VT
+# HW-accel fallback thresholds — empirical (Windows D3D11VA, Linux iGPU
+# VAAPI). 10 was too aggressive: a HW decoder routinely emits 10+ EAGAINs
+# during warm-up (codec buffering input before producing output). 50 lets it
 # settle without being mistaken for a broken accelerator.
 _HWACCEL_EAGAIN_STREAK_LIMIT = 50
 # Number of NALUs we feed to a hwaccel context with zero output frames
-# before forcing a fallback to software. VideoToolbox can decode the
-# initial burst successfully and then go silent on Apple HEVC RExt
-# 4:4:4 — `decode()` returns no error but emits no frames. EAGAIN
-# logic doesn't catch this; we'd otherwise wait for the SSRC-adoption
-# stall window (10-15s) before realising decode is dead.
+# before forcing a fallback to software. A HW decoder can accept the initial
+# burst and then go silent on Apple HEVC RExt 4:4:4 — `decode()` returns no
+# error but emits no frames. EAGAIN logic doesn't catch this; we'd otherwise
+# wait for the SSRC-adoption stall window (10-15s) before realising decode
+# is dead.
 _HWACCEL_SILENT_NALU_LIMIT = 60  # one source frame's worth of NALUs at 60 fps
 _HWACCEL_BURST_ERROR_THRESHOLD = 20
 _HWACCEL_BURST_ERROR_WINDOW = 40
@@ -94,8 +95,14 @@ _PTS_MAP_SOFT_MAX = 4000
 _PTS_MAP_PRUNE_KEEP = 2000
 
 # Per-platform HW accel candidate list, in priority order.
+# macOS deliberately has NO hwaccel: Apple's stream is HEVC RExt 4:4:4 and
+# the only macOS HW path for it is VideoToolbox, but a real macOS user would
+# run Apple's own Screen Sharing.app, not iss. Forcing software decode on
+# macOS keeps it on the exact same libavcodec path as Windows/Linux (where
+# 4:4:4 has no HW decoder either — D3D11VA/DXVA2/VAAPI are 4:2:0-only), so
+# the macOS box is a faithful test bed for the platforms that matter.
 _PLATFORM_HWACCELS: dict[str, tuple[str, ...]] = {
-    "darwin": ("videotoolbox",),
+    "darwin": (),
     "win32": ("d3d11va", "d3d12va"),
     "*": ("vaapi", "cuda"),
 }
@@ -137,7 +144,6 @@ class _TileSlot:
 _HW_FRAME_FORMATS = frozenset({
     "vaapi", "vaapi_vld",
     "d3d11", "d3d11va", "dxva2_vld",
-    "videotoolbox_vld",
     "cuda",
     "drm_prime",
     "mediacodec",
@@ -204,34 +210,6 @@ def _av_frame_to_tile(
             uv_stride=width // 2,
             chroma_width=width // 2,
             chroma_height=chroma_h,
-        ), had_error
-
-    if fmt in ("nv24", "nv42"):
-        # Biplanar 4:4:4: Y plane + full-resolution interleaved UV. This is
-        # what VideoToolbox delivers for HEVC RExt 4:4:4 8-bit streams (the
-        # libavcodec name for the CV format `444f`/`kCVPixelFormatType_
-        # 444YpCbCr8BiPlanarFullRange`). Apple's screen-share is the
-        # canonical example. Same deinterleave as NV12 but at full chroma
-        # resolution.
-        yp = frame.planes[0]
-        uvp = frame.planes[1]
-        uv_view = (
-            np.frombuffer(bytes(uvp), dtype=np.uint8)
-            .reshape(height, uvp.line_size)[:, :width * 2]
-        )
-        if fmt == "nv24":
-            u_bytes = uv_view[:, 0::2].tobytes()
-            v_bytes = uv_view[:, 1::2].tobytes()
-        else:
-            v_bytes = uv_view[:, 0::2].tobytes()
-            u_bytes = uv_view[:, 1::2].tobytes()
-        return TileFrame(
-            y=bytes(yp), u=u_bytes, v=v_bytes,
-            width=width, height=height,
-            y_stride=yp.line_size,
-            uv_stride=width,
-            chroma_width=width,
-            chroma_height=height,
         ), had_error
 
     if fmt in ("yuv420p", "yuvj420p"):
@@ -852,11 +830,11 @@ class HevcDecoder:
     ) -> None:
         """Mid-session decode error. We do NOT fall back to software:
         whatever decoder we picked at startup is the one we keep. A
-        single bad slice — usually from packet loss — can wedge
-        VideoToolbox in `kVTVideoDecoderBadDataErr` / "reconfig
-        pending" state, after which every send_packet returns EAGAIN.
-        The fix is to flush libavcodec's buffers (which propagates a
-        reset to the hwaccel layer), drop incoming P-frames until each
+        single bad slice — usually from packet loss — can wedge a HW
+        decoder (e.g. D3D11VA/VAAPI) into a bad-data / reconfig-pending
+        state, after which every send_packet returns EAGAIN. The fix is
+        to flush libavcodec's buffers (which propagates a reset to the
+        hwaccel layer when present), drop incoming P-frames until each
         tile's IDR arrives via FIR, and resume on the same context.
         """
         err_no = getattr(exc, "errno", 0) or 0
