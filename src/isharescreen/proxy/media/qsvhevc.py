@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+from fractions import Fraction
 from typing import Callable, Optional
 
 import av
@@ -176,12 +177,13 @@ class QsvHevcDecoder:
     def _teardown(self) -> None:
         self._stop_worker()
         with self._codec_lock:
-            if self._codec is not None:
-                try:
-                    list(self._codec.decode(None))
-                except Exception:
-                    pass
-                self._codec = None
+            # Do NOT flush (decode(None)) before releasing the codec — hevc_qsv
+            # intermittently crashes (STATUS_ACCESS_VIOLATION) in avcodec_send_packet
+            # during flush when the QSV session is in certain states (e.g. after an
+            # SSRC-group adoption or on session close).  avcodec_free_context, called
+            # when the Python object is collected, performs the necessary hardware
+            # teardown without triggering the flush code path.
+            self._codec = None
         self._pts_to_tile = {}
         self._next_pts = 0
         self._au_buf = bytearray()
@@ -324,6 +326,7 @@ class QsvHevcDecoder:
             self._pts_to_tile = {k: v for k, v in self._pts_to_tile.items() if k > cutoff}
         pkt = av.Packet(au)
         pkt.pts = pkt.dts = pts
+        pkt.time_base = Fraction(1, 90000)
         try:
             with self._codec_lock:
                 if self._codec is None:

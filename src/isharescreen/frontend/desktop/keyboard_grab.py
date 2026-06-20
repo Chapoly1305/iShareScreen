@@ -379,7 +379,10 @@ class _Win32Grab:
         self._KBDLL = _KBDLLHOOKSTRUCT
 
         self._HOOKPROC = ctypes.WINFUNCTYPE(
-            ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM,
+            # LRESULT = LONG_PTR: pointer-sized on all Windows targets (32 or 64-bit).
+            # ctypes.c_long is only 32-bit on Win64, which would leave the upper 32
+            # bits of RAX undefined and could cause Windows to misread the return value.
+            ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM,
         )
         self._u32.SetWindowsHookExW.argtypes = [
             ctypes.c_int, self._HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD,
