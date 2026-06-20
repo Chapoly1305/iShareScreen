@@ -301,6 +301,12 @@ class FrameQualityGate:
         last tile-0 FIR time."""
         if not self._keyframe_required:
             return set()
+        # Cap already hit: stop emitting FIRs but keep keyframe_required
+        # so _check_stall()'s Path C can detect the persistent stuck state
+        # and escalate to a decoder restart after a cooldown.
+        # force_keyframe_all() (F12) clears this flag to re-arm the loop.
+        if self._cap_warned[0]:
+            return set()
         now = self._time.monotonic()
         if now - self._fir_last_t[0] < self._RE_ARM_INTERVAL_S:
             return set()
@@ -314,10 +320,11 @@ class FrameQualityGate:
                 self._fir_attempts[0], len(self._keyframe_required),
             )
             self._cap_warned[0] = True
-            # Give up: drop everything from keyframe_required so we
-            # stop spamming. F12 re-engages the whole set.
-            self._keyframe_required.clear()
-            self._idr_observed.clear()
+            # Do NOT clear keyframe_required or idr_observed here.
+            # Keeping them lets _check_stall() detect the persistent
+            # stall and escalate to an automatic decoder restart after
+            # 30 s (Path C).  Previously cleared here, which hid the
+            # stuck state from the session entirely.
             return set()
         return {0}
 
@@ -356,6 +363,13 @@ class FrameQualityGate:
     def force_keyframe_all(self) -> None:
         """Sets keyframe_required for every tile (single funnel for the
         F12 hotkey + any other 'just refresh everything' caller)."""
+        # Explicitly reset tile-0's cap state first.  mark_decode_error()
+        # only resets _fir_attempts / _cap_warned when the tile is NOT
+        # already in keyframe_required; if the cap fired and keyframe_required
+        # still holds the stuck tile, mark_decode_error is a no-op and FIR
+        # would never resume without this explicit reset.
+        self._fir_attempts[0] = 0
+        self._cap_warned[0] = False
         for ti in range(self._num_tiles):
             self.mark_decode_error(ti)
 

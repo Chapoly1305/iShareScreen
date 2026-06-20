@@ -3343,6 +3343,37 @@ class Session:
                         log.debug("saturation-wedge restart failed: %s", e)
                     self.request_fir()
 
+        # --- C: FIR-exhaustion escalation ---
+        # When the quality gate exhausts its FIR cap, it stops emitting
+        # FIRs but now keeps keyframe_required set so we can detect the
+        # stuck state here.  After a 30 s cooldown (long enough that a
+        # slow Apple response would have landed, short enough not to leave
+        # the user watching a frozen tile), restart the decoder to give
+        # it a fresh codec context and re-anchor via a new FIR.
+        # _fir_last_t[0] is updated only on FIR emission, so after the
+        # cap it freezes at the cap-triggering attempt's timestamp —
+        # making (now - _fir_last_t[0]) a reliable "time since cap" proxy.
+        if self._decoder is not None:
+            gate = self._decoder._gate
+            if (gate._cap_warned[0]
+                    and gate._keyframe_required
+                    and gate._fir_last_t[0] > 0.0):
+                last_restart = getattr(self, "_last_decoder_restart_t", 0.0)
+                secs_since_cap = now - gate._fir_last_t[0]
+                if gate._fir_last_t[0] > last_restart and secs_since_cap >= 30.0:
+                    self._last_decoder_restart_t = now
+                    stuck_n = len(gate._keyframe_required)
+                    log.warning(
+                        "FIR cap exhausted %.0fs ago, %d tile(s) still "
+                        "stuck — restart decoder + FIR to re-anchor",
+                        secs_since_cap, stuck_n,
+                    )
+                    try:
+                        self._decoder.restart()
+                    except Exception as e:
+                        log.debug("fir-exhaust restart failed: %s", e)
+                    self.request_fir()
+
     # ── tx-side port helpers ─────────────────────────────────────────
 
     @property
