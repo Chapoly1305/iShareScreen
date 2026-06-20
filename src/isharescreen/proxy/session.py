@@ -307,14 +307,6 @@ class Session:
         self._ctrl_q: queue.Queue[bytes] = queue.Queue(maxsize=_UDP_DRAIN_QUEUE_MAX)
         self._video_q_dropped = 0
         self._ctrl_q_dropped = 0
-        # Self-inflicted-backlog detection. When software decode can't keep
-        # up, the video receive queue overflows and drops our OWN packets;
-        # the resulting sequence gaps/gray are not network loss, so NACK/FIR
-        # retransmit requests are futile and self-amplifying (they add load to
-        # an already-overflowing queue → a multi-Mbps storm). `_decode_behind`
-        # is recomputed once per tx tick and gates the NACK/FIR drains.
-        self._last_q_drop_seen = 0
-        self._decode_behind = False
         # RX/TX byte+packet counters. _rx_msg_type_counts[type] tracks
         # inbound RFB msg-type histogram on the TCP control channel —
         # critical for diagnosing the "cursor freeze after idle" bug
@@ -2261,17 +2253,6 @@ class Session:
         while not self._stop_evt.is_set():
             self._tx_tick += 1
             try:
-                # Recompute self-inflicted-backlog state before the NACK/FIR
-                # drains. Backlogged = our receive queue is actively dropping
-                # (decode can't drain it) or already half-full. While
-                # backlogged, the gaps are our own dropped packets, not
-                # network loss, so we hold off retransmit requests.
-                dropped_now = self._video_q_dropped
-                self._decode_behind = (
-                    dropped_now > self._last_q_drop_seen
-                    or self._video_q.qsize() > _UDP_DRAIN_QUEUE_MAX // 2
-                )
-                self._last_q_drop_seen = dropped_now
                 self._send_heartbeat()
                 self._send_rr_and_maybe_sr()
                 self._drain_pending_fir()
@@ -2518,13 +2499,6 @@ class Session:
     def _drain_pending_fir(self) -> None:
         if self._decoder is None:
             return
-        # Self-inflicted backlog: the gray tiles are from our own dropped
-        # packets (decode can't keep up), not network loss. FIRing only makes
-        # the server resend full IDRs into an already-overflowing queue. Hold
-        # off — keyframe_required stays populated and fires once decode
-        # catches up (queue drains, _decode_behind clears).
-        if self._decode_behind:
-            return
         # Apple-idle suppression: if no video packet has arrived in the
         # last 1.5 s, Apple's encoder rate-controlled to silence on a
         # static screen — there's nothing to FIR productively (Apple
@@ -2617,15 +2591,6 @@ class Session:
         self._last_concealment_msg = ""
 
     def _drain_pending_nack(self) -> None:
-        # Self-inflicted backlog: the sequence gaps are our own dropped
-        # packets (receive queue overflow), not network loss. NACKing them is
-        # futile (the retransmits get dropped too) and self-amplifying — this
-        # is the dominant cause of the multi-Mbps idle storm. Discard the
-        # pending gaps until decode catches up; genuine loss (queue draining)
-        # still NACKs normally.
-        if self._decode_behind:
-            self._nack_pending.clear()
-            return
         sock = self._sock_ctrl
         enc = self._srtcp_enc
         sender = self._our_video_ssrc
