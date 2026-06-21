@@ -486,7 +486,13 @@ class _Win32Grab:
             return
         self._u32.UnhookWindowsHookEx(self._hook)
         self._hook = None
-        self._cb_ref = None
+        # Do NOT clear self._cb_ref here. WH_KEYBOARD_LL carries an OS-enforced
+        # ~200 ms removal delay: Windows may still dispatch to the hook proc after
+        # UnhookWindowsHookEx returns. Freeing the ctypes callback object now
+        # releases the function pointer while it could still be called →
+        # STATUS_ACCESS_VIOLATION. The ref is replaced safely in enable() (focus
+        # has been lost for at least one focus-in/out cycle, >> 200 ms) or
+        # released when this object is finalised.
         # Release any modifier we believe is held but won't get a key-up
         # for (because we're tearing down before the user lets go).
         for vk in list(self._mods_held):

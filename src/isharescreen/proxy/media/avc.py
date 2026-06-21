@@ -79,6 +79,14 @@ class AvcDecoder:
 
         self._codec: Optional[av.codec.context.CodecContext] = None
         self._codec_lock = threading.Lock()
+        # Serializes the whole start/restart/close/fallback lifecycle (see the
+        # matching note in hevc.py). restart() is driven from both the
+        # video-process thread and the tx-loop watchdogs; without this, two
+        # concurrent _teardown()+_create_codec() sequences corrupt codec/worker
+        # state and can double-free the native context. RLock: re-entrant-safe;
+        # the decode worker never takes it, so _stop_worker()'s join can't
+        # deadlock against a holder.
+        self._lifecycle_lock = threading.RLock()
         self._reformatter: list = [None]
         self._seen_fmts: set[str] = set()
         self._gate = FrameQualityGate(num_tiles, enabled=enable_quality_gate)
@@ -122,7 +130,8 @@ class AvcDecoder:
     def start(self) -> None:
         if not (self._sps and self._all_pps):
             raise RuntimeError("set_params() must be called before start()")
-        self._create_codec(force_software=False)
+        with self._lifecycle_lock:
+            self._create_codec(force_software=False)
 
     # -- decoder feed --------------------------------------------------
 
@@ -245,9 +254,10 @@ class AvcDecoder:
     # -- lifecycle -----------------------------------------------------
 
     def restart(self) -> None:
-        self._teardown()
-        if self._sps and self._all_pps:
-            self._create_codec(force_software=self._hw_failed)
+        with self._lifecycle_lock:
+            self._teardown()
+            if self._sps and self._all_pps:
+                self._create_codec(force_software=self._hw_failed)
 
     def soft_reset(self) -> None:
         """Reset DPB tracking without flushing the codec context.
@@ -266,7 +276,8 @@ class AvcDecoder:
         self._recovery_in_progress = False
 
     def close(self) -> None:
-        self._teardown()
+        with self._lifecycle_lock:
+            self._teardown()
 
     # -- internals: decode --------------------------------------------
 
@@ -493,20 +504,21 @@ class AvcDecoder:
 
     def _fallback_to_software(self, tile_nalu_cache: Optional[dict[int, list[bytes]]]) -> None:
         log.warning("falling back from %s to software decode", self._hw_name)
-        self._hw_failed = True
-        self._teardown()
-        self._create_codec(force_software=True)
-        if tile_nalu_cache:
-            self._sync_decode_mode = True
-            try:
-                max_burst = max((len(v) for v in tile_nalu_cache.values()), default=0)
-                for idx in range(max_burst):
-                    for ti, nalus in tile_nalu_cache.items():
-                        if idx < len(nalus):
-                            self._decode_one(nalus[idx], ti)
-                log.info("software fallback burst: %d frames", sum(t.good_count for t in self._tiles))
-            finally:
-                self._sync_decode_mode = False
+        with self._lifecycle_lock:
+            self._hw_failed = True
+            self._teardown()
+            self._create_codec(force_software=True)
+            if tile_nalu_cache:
+                self._sync_decode_mode = True
+                try:
+                    max_burst = max((len(v) for v in tile_nalu_cache.values()), default=0)
+                    for idx in range(max_burst):
+                        for ti, nalus in tile_nalu_cache.items():
+                            if idx < len(nalus):
+                                self._decode_one(nalus[idx], ti)
+                    log.info("software fallback burst: %d frames", sum(t.good_count for t in self._tiles))
+                finally:
+                    self._sync_decode_mode = False
 
     def _teardown(self) -> None:
         self._stop_worker()

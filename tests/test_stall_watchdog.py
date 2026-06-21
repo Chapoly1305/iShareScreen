@@ -10,6 +10,7 @@ bad_streak) state. Asserts the loss-aware discriminator:
 """
 from __future__ import annotations
 
+import threading
 import time
 import types
 
@@ -18,9 +19,16 @@ from isharescreen.proxy.session import Session
 
 class _FakeDecoder:
     def __init__(self, bad_streaks):
+        # Mirror the real FrameQualityGate fields _check_stall reads:
+        #   Path B    → _states[i].bad_streak
+        #   Section C → _cap_warned[0], _keyframe_required, _fir_last_t[0]
+        # _cap_warned[0]=False keeps the FIR-exhaustion path dormant so these
+        # tests exercise only Paths A/B.
         self._gate = types.SimpleNamespace(
             _states=[types.SimpleNamespace(bad_streak=b) for b in bad_streaks],
             _keyframe_required=set(),
+            _cap_warned=[False],
+            _fir_last_t=[0.0],
         )
         self.restart_calls = 0
 
@@ -42,6 +50,7 @@ def _make_session(*, gap, lost_pkts=0, loss_growing=False,
     s._loss_at_prev_stall_check = lost_pkts - (10 if loss_growing else 0)
     s._last_loss_growth_t = 0.0
     s._last_decoder_restart_t = 0.0
+    s._restart_guard = threading.Lock()  # backs the atomic restart debounce
     s._last_stuck_tile_fir_t = 0.0
     s._last_stall_fir_t = 0.0
     s.fir_calls = 0

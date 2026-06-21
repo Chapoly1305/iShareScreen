@@ -390,6 +390,15 @@ class HevcDecoder:
         # SEGVs on the next dereference. We've seen this crash named
         # `libavcodec...+0x43a9d0` from the `hevc-decode` thread.
         self._codec_lock = threading.Lock()
+        # Serializes the WHOLE start/restart/close/fallback lifecycle, distinct
+        # from _codec_lock (which only guards a single decode() vs the
+        # _codec=None swap). restart() is driven from BOTH the video-process
+        # thread (SSRC adoption / param harvest) and the tx thread (stall /
+        # saturation / FIR-exhaust watchdogs); without this, two concurrent
+        # _teardown()+_create_codec() sequences corrupt the codec/worker state.
+        # RLock so a re-entrant lifecycle call can't self-deadlock; the decode
+        # worker never takes this lock, so _stop_worker()'s join can't deadlock.
+        self._lifecycle_lock = threading.RLock()
         self._reformatter: list[Optional[av.video.reformatter.VideoReformatter]] = [None]
         self._seen_fmts: set[str] = set()
         self._gate = FrameQualityGate(num_tiles, enabled=enable_quality_gate)
@@ -492,7 +501,8 @@ class HevcDecoder:
         first `feed_nalu` outside burst mode."""
         if not (self._vps and self._sps and self._all_pps):
             raise RuntimeError("set_params() must be called before start()")
-        self._create_codec(force_software=False)
+        with self._lifecycle_lock:
+            self._create_codec(force_software=False)
 
     # -- decoder feed --------------------------------------------------
 
@@ -749,13 +759,15 @@ class HevcDecoder:
 
         Skips rebuild if `set_params` was never called — restart on an
         unconfigured decoder is just a teardown."""
-        self._teardown()
-        if self._vps and self._sps and self._all_pps:
-            self._create_codec(force_software=self._hw_failed)
+        with self._lifecycle_lock:
+            self._teardown()
+            if self._vps and self._sps and self._all_pps:
+                self._create_codec(force_software=self._hw_failed)
 
     def close(self) -> None:
         """Permanent shutdown. Stops the worker, releases the codec context."""
-        self._teardown()
+        with self._lifecycle_lock:
+            self._teardown()
 
     # -- internals: decode --------------------------------------------
 
@@ -1209,25 +1221,26 @@ class HevcDecoder:
         """Tear down the HW codec context, build SW one, optionally re-feed
         the burst NALUs."""
         log.warning("falling back from %s to software decode", self._hw_name)
-        self._hw_failed = True
-        self._teardown()
-        self._create_codec(force_software=True)
+        with self._lifecycle_lock:
+            self._hw_failed = True
+            self._teardown()
+            self._create_codec(force_software=True)
 
-        if tile_nalu_cache:
-            self._sync_decode_mode = True
-            try:
-                max_burst = max(
-                    (len(tile_nalu_cache[ti]) for ti in tile_nalu_cache),
-                    default=0,
-                )
-                for idx in range(max_burst):
-                    for ti, nalus in tile_nalu_cache.items():
-                        if idx < len(nalus):
-                            self._decode_one(nalus[idx], ti)
-                good = sum(t.good_count for t in self._tiles)
-                log.info("software fallback burst: %d frames decoded", good)
-            finally:
-                self._sync_decode_mode = False
+            if tile_nalu_cache:
+                self._sync_decode_mode = True
+                try:
+                    max_burst = max(
+                        (len(tile_nalu_cache[ti]) for ti in tile_nalu_cache),
+                        default=0,
+                    )
+                    for idx in range(max_burst):
+                        for ti, nalus in tile_nalu_cache.items():
+                            if idx < len(nalus):
+                                self._decode_one(nalus[idx], ti)
+                    good = sum(t.good_count for t in self._tiles)
+                    log.info("software fallback burst: %d frames decoded", good)
+                finally:
+                    self._sync_decode_mode = False
 
     # -- internals: shared teardown -----------------------------------
 

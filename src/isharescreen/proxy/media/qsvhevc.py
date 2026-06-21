@@ -98,6 +98,18 @@ class QsvHevcDecoder:
 
         self._codec: Optional[av.codec.context.CodecContext] = None
         self._codec_lock = threading.Lock()
+        # Serializes the WHOLE start/restart/close lifecycle. Distinct from
+        # _codec_lock, which only guards a single decode() against the
+        # _codec=None swap. This one prevents two threads — the video-process
+        # thread (SSRC adoption / param harvest) and the tx thread (stall /
+        # saturation / FIR-exhaust watchdogs) — from running
+        # _teardown()+_create_codec() concurrently. Two overlapping teardowns
+        # double-free the QSV/MFX hardware session and start two qsv-decode
+        # workers on the same D3D device → STATUS_ACCESS_VIOLATION in native
+        # code. RLock so a future re-entrant lifecycle call can't self-deadlock;
+        # the decode worker never takes this lock, so the join() in
+        # _stop_worker() can't deadlock against a holder.
+        self._lifecycle_lock = threading.RLock()
         self._hw_name: Optional[str] = "qsv"
         self._dpb_has_idr = False
 
@@ -128,9 +140,10 @@ class QsvHevcDecoder:
         self._vps, self._sps, self._all_pps = vps, sps, dict(all_pps)
 
     def start(self) -> None:
-        if self._codec is None:
-            self._create_codec()
-        self._start_worker()
+        with self._lifecycle_lock:
+            if self._codec is None:
+                self._create_codec()
+            self._start_worker()
 
     def _build_extradata(self) -> bytes:
         ed = bytearray()
@@ -166,13 +179,15 @@ class QsvHevcDecoder:
         log.debug("hevc_qsv codec (re)created")
 
     def restart(self) -> None:
-        self._teardown()
-        if self._sps:
-            self._create_codec()
-            self._start_worker()
+        with self._lifecycle_lock:
+            self._teardown()
+            if self._sps:
+                self._create_codec()
+                self._start_worker()
 
     def close(self) -> None:
-        self._teardown()
+        with self._lifecycle_lock:
+            self._teardown()
 
     def _teardown(self) -> None:
         self._stop_worker()

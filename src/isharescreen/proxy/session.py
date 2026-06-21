@@ -76,6 +76,54 @@ from .protocol.srtp import (
 log = logging.getLogger(__name__)
 
 
+def _proc_rss_mb() -> float:
+    """Current process working-set (Windows) / RSS (Linux/macOS) in MB.
+    Best-effort; returns 0.0 when the platform API is unavailable."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            import ctypes.wintypes
+
+            class _PMC(ctypes.Structure):
+                _fields_ = [
+                    ("cb",                         ctypes.wintypes.DWORD),
+                    ("PageFaultCount",             ctypes.wintypes.DWORD),
+                    ("PeakWorkingSetSize",         ctypes.c_size_t),
+                    ("WorkingSetSize",             ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage",    ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage",        ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage",     ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage",              ctypes.c_size_t),
+                    ("PeakPagefileUsage",          ctypes.c_size_t),
+                ]
+            # Explicit argtypes/restype are required: without them ctypes
+            # defaults to c_int for arguments and the 64-bit pseudo-handle
+            # from GetCurrentProcess() is silently truncated to 32 bits.
+            _gcp = ctypes.windll.kernel32.GetCurrentProcess
+            _gcp.argtypes = []
+            _gcp.restype = ctypes.c_void_p
+            _gpmi = ctypes.windll.psapi.GetProcessMemoryInfo
+            _gpmi.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.wintypes.DWORD,
+            ]
+            _gpmi.restype = ctypes.wintypes.BOOL
+            pmc = _PMC()
+            pmc.cb = ctypes.sizeof(pmc)
+            if _gpmi(_gcp(), ctypes.byref(pmc), pmc.cb):
+                return pmc.WorkingSetSize / 1_048_576
+        except Exception:
+            pass
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return 0.0
+
+
 # ── tunable constants ─────────────────────────────────────────────────
 
 # Inter-tx-pulse interval. Each tick: send PT=101 audio heartbeat, send
@@ -468,6 +516,13 @@ class Session:
         # during the burst tail.
         self._dpb_error_window: deque[float] = deque()
         self._last_decoder_restart_t: float = 0.0
+        # Guards the check-then-set of `_last_decoder_restart_t`. Restart
+        # triggers fire from TWO threads — the video-process thread (SSRC
+        # adoption / param harvest) and the tx thread (stall / saturation /
+        # FIR-exhaust watchdogs) — so the debounce must be claimed atomically
+        # (see `_claim_restart`); otherwise both threads pass a stale interval
+        # check and issue overlapping decoder.restart() calls.
+        self._restart_guard = threading.Lock()
         # AVC hardware-decode POC-wrap workaround: automatically request a
         # fresh IDR before frame_num/poc_lsb wrap, the rollover the AMD d3d11va
         # H.264 decoder mishandles. Enabled by ISS_AVC_HW_REANCHOR (any truthy
@@ -2196,9 +2251,7 @@ class Session:
                     # nearly impossible.  If we just restarted within 3 s
                     # the decoder is already fresh — skip the redundant
                     # teardown and let the FIR re-anchor the new group.
-                    last_restart = getattr(self, "_last_decoder_restart_t", 0.0)
-                    if now - last_restart >= 3.0:
-                        self._last_decoder_restart_t = now
+                    if self._claim_restart(now, 3.0):
                         self._decoder.restart()
                     self.request_fir()
 
@@ -2915,6 +2968,7 @@ class Session:
         types_str = " ".join(
             f"{t:02x}:{n}" for t, n in sorted(self._rx_msg_type_counts.items())
         )
+        rss_mb = _proc_rss_mb() if log.isEnabledFor(logging.DEBUG) else 0.0
         decoder_name = self._decoder._hw_name or "software"
         ssrc_groups = (
             len(self._video_decryptor.ssrc_counts) // 4
@@ -2935,7 +2989,7 @@ class Session:
             "udp_q=video[%d/%d drop=%d] ctrl[%d/%d drop=%d] "
             "rx_pps=video[%.1f/%dMbps] ctrl[%.1f/%.1fkbps] tcp[%.2f] "
             "tx_pps=%.2f cursor=%dms_ago/n=%d tcp_types={%s} "
-            "nalu={%s}",
+            "nalu={%s} rss=%.1fMB",
             decoder_name,
             good, rates, loss_delta,
             loss_total, loss_unmapped,
@@ -2951,6 +3005,7 @@ class Session:
             self._cursor_msgs_processed,
             types_str,
             nalu_str,
+            rss_mb,
         )
 
         # Mirror the same data, structured, onto the control socket for
@@ -3157,6 +3212,25 @@ class Session:
             except OSError as e:
                 log.debug("NACK send failed: %s", e)
 
+    def _claim_restart(self, now: float, min_interval: float) -> bool:
+        """Atomically claim the shared decoder-restart debounce.
+
+        Returns True — and records `now` as the last restart time — iff no
+        restart has been claimed within the last `min_interval` seconds.
+        The check-then-set runs under `_restart_guard` so the video-process
+        thread (SSRC adoption / param harvest) and the tx thread (stall /
+        saturation / FIR-exhaust watchdogs) can't both pass a stale interval
+        check and issue overlapping `decoder.restart()` calls — the
+        cross-thread race that double-tore-down the native QSV/MFX session
+        (STATUS_ACCESS_VIOLATION). The decoder's own `_lifecycle_lock` makes
+        a slipped-through overlap *safe*; this keeps it from happening at all.
+        """
+        with self._restart_guard:
+            if now - self._last_decoder_restart_t < min_interval:
+                return False
+            self._last_decoder_restart_t = now
+            return True
+
     def _check_stall(self) -> None:
         """Decoder-stall recovery. Two failure modes:
 
@@ -3218,9 +3292,7 @@ class Session:
                         and now - self._last_video_pkt_t < 0.5)
         if (gap > self._SATURATION_RESTART_GAP_S and self._decoder is not None
                 and not recent_loss and pkts_flowing):
-            last_restart = getattr(self, "_last_decoder_restart_t", 0.0)
-            if now - last_restart >= 3.0:
-                self._last_decoder_restart_t = now
+            if self._claim_restart(now, 3.0):
                 log.warning(
                     "decoder stuck %.1fs, packets flowing, no loss for %.0fs — "
                     "no-flush FIR didn't recover; restart decoder + FIR",
@@ -3233,25 +3305,28 @@ class Session:
                 self.request_fir()
                 return
         if gap > 15.0 and self._decoder is not None:
-            last_restart = getattr(self, "_last_decoder_restart_t", 0.0)
-            if now - last_restart >= 8.0:
+            # Non-atomic pre-check only decides whether to handle here vs fall
+            # through to the gap>3 / Path-B/C logic when still inside the
+            # debounce window; the real claim is atomic (_claim_restart).
+            if now - self._last_decoder_restart_t >= 8.0:
                 # Same Apple-idle suppression as the 3 s path: if no
                 # packets are arriving, Apple isn't encoding, restart
-                # + FIR can't help. Wait for packets to resume.
+                # + FIR can't help. Wait for packets to resume — and do NOT
+                # claim the debounce, so a real wedge isn't delayed.
                 quiet_for = (now - self._last_video_pkt_t
                              if self._last_video_pkt_t > 0.0 else 0.0)
                 if quiet_for >= 1.5:
                     return
-                self._last_decoder_restart_t = now
-                log.warning(
-                    "decoder stuck %.1fs (long); restart decoder + FIR storm",
-                    gap,
-                )
-                try:
-                    self._decoder.restart()
-                except Exception as e:
-                    log.debug("decoder.restart() failed: %s", e)
-                self.request_fir()
+                if self._claim_restart(now, 8.0):
+                    log.warning(
+                        "decoder stuck %.1fs (long); restart decoder + FIR storm",
+                        gap,
+                    )
+                    try:
+                        self._decoder.restart()
+                    except Exception as e:
+                        log.debug("decoder.restart() failed: %s", e)
+                    self.request_fir()
                 return
         if gap > 3.0:
             last_fir = getattr(self, "_last_stall_fir_t", 0.0)
@@ -3329,9 +3404,7 @@ class Session:
                 # does. Safe to restart here: with no loss there are no
                 # missing refs to orphan, so no cascade. Throttled so the
                 # decoder can re-bootstrap before another restart.
-                last_restart = getattr(self, "_last_decoder_restart_t", 0.0)
-                if now - last_restart >= 4.0:
-                    self._last_decoder_restart_t = now
+                if self._claim_restart(now, 4.0):
                     log.warning(
                         "tile stuck (worst bad_streak=%d, tiles=%s, no loss) "
                         "— VT saturation wedge; restart decoder + FIR",
@@ -3358,10 +3431,11 @@ class Session:
             if (gate._cap_warned[0]
                     and gate._keyframe_required
                     and gate._fir_last_t[0] > 0.0):
-                last_restart = getattr(self, "_last_decoder_restart_t", 0.0)
+                last_restart = self._last_decoder_restart_t
                 secs_since_cap = now - gate._fir_last_t[0]
-                if gate._fir_last_t[0] > last_restart and secs_since_cap >= 30.0:
-                    self._last_decoder_restart_t = now
+                if (gate._fir_last_t[0] > last_restart
+                        and secs_since_cap >= 30.0
+                        and self._claim_restart(now, 30.0)):
                     stuck_n = len(gate._keyframe_required)
                     log.warning(
                         "FIR cap exhausted %.0fs ago, %d tile(s) still "
