@@ -32,6 +32,11 @@ dependencies = [
     "pycryptodome>=3.20",
     "av>=12.0",
     "numpy>=1.26",
+    # WebTransport browser frontend (--frontend browser, the default): the
+    # QUIC/HTTP3 bridge + an HTTP server that serves the viewer page and
+    # pass-throughs Apple's H.264 to the browser's WebCodecs decoder.
+    "aioquic>=1.0",
+    "aiohttp>=3.9",
     # Native desktop viewer (wgpu + glfw native window)
     "wgpu>=0.31",
     "rendercanvas>=2.6",
