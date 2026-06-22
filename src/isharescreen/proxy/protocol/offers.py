@@ -22,6 +22,20 @@ from ... import __version__
 
 log = logging.getLogger(__name__)
 
+import os as _os
+
+
+def tiles_per_frame() -> int:
+    """The `tilesPerFrame` value we advertise in the media offer (field 6).
+    macOS honors it, so this is also the number of video SSRCs/tiles to expect
+    in the stream. Default 4 = Apple SS.app's byte-identical offer (4 parallel
+    H.264 sub-streams); ISS_TILES_PER_FRAME=1 asks for a single picture per
+    frame (browser-WebCodecs-decodable, no cross-tile references)."""
+    try:
+        return max(1, int(_os.environ.get("ISS_TILES_PER_FRAME", "4")))
+    except ValueError:
+        return 4
+
 
 # ── protobuf helpers ──────────────────────────────────────────────────
 
@@ -170,16 +184,38 @@ def _build_mediablob(mode: int, session_id: int, timestamp: int) -> bytes:
             + _field_bytes(3, _AVC_PARAMS)
             + _field_varint(4, 14)
         )
-        # VideoSettings fields: 2 = allowRTCPFB (host ANDs both sides to
-        # enable RTCP feedback), 7 = ltrpEnabled. Both are tied to LTRP:
-        # on by default, gated off together by ISS_LTRP=0 so disabling is a
-        # clean kill switch (no half-advertised LTRP the host might honour
-        # while we send no acks).
+        # VideoSettings fields (per CoreDevice media-stream-offer RE):
+        #   2 = allowRTCPFB, 6 = tilesPerFrame, 7 = ltrpEnabled.
+        # tilesPerFrame: macOS HONORS this — we request 4, so the server tiles
+        # the screen into 4 horizontal H.264 sub-streams (which a native ffmpeg
+        # decoder handles but browser WebCodecs can't, due to cross-tile
+        # references). ISS_TILES_PER_FRAME=1 requests a SINGLE picture per frame
+        # — decodable by any standard decoder. (iOS CoreDevice defaults to 1.)
         ltrp_on = _os.environ.get("ISS_LTRP", "1") != "0"
+        _tiles_per_frame = tiles_per_frame()
+        # Codec selection. Default "both" is byte-identical to Apple's native
+        # offer (HEVC 4:4:4 + the H.264 4:2:0 fallback bank). ISS_VIDEO_CODEC=avc
+        # advertises ONLY the H.264 bank (codec const 100 = H.264 per the GFT
+        # plist) so the server sends H.264 4:2:0 — which hardware-decodes on the
+        # GPUs that can't HW-decode HEVC 4:4:4. This is a TEST gate: confirm the
+        # server actually switches codecs (NAL types in the profile snapshot)
+        # before wiring a real H.264 decode path. ISS_VIDEO_CODEC=hevc forces
+        # HEVC-only.
+        _codec = _os.environ.get("ISS_VIDEO_CODEC", "both").lower()
+        # NOTE: the bank variables are named backwards. Live testing
+        # PROVED field1=123 (`hevc_bank`) makes the server send H.264 4:2:0 and
+        # field1=100 (`avc_bank`) makes it send HEVC 4:4:4. Select by the TRUE
+        # codec; "both" keeps Apple's byte-identical order (123 then 100).
+        if _codec == "avc":
+            _codec_banks = _field_bytes(3, hevc_bank)   # field1=123 -> H.264
+        elif _codec == "hevc":
+            _codec_banks = _field_bytes(3, avc_bank)     # field1=100 -> HEVC
+        else:
+            _codec_banks = _field_bytes(3, hevc_bank) + _field_bytes(3, avc_bank)
         desc = (
             _field_varint(1, session_id) + _field_varint(2, 1 if ltrp_on else 0)
-            + _field_bytes(3, hevc_bank) + _field_bytes(3, avc_bank)
-            + _field_varint(6, 4) + _field_varint(7, 1 if ltrp_on else 0)
+            + _codec_banks
+            + _field_varint(6, _tiles_per_frame) + _field_varint(7, 1 if ltrp_on else 0)
             + _field_varint(8, 63)
             + _field_varint(9, 1) + _field_varint(12, 1)
         )

@@ -147,6 +147,7 @@ _HW_FRAME_FORMATS = frozenset({
     "cuda",
     "drm_prime",
     "mediacodec",
+    "videotoolbox", "videotoolbox_vld",
 })
 
 

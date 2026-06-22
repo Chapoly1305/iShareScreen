@@ -41,7 +41,9 @@ from .media.tiles import TileFrame
 from .input import InputController
 from .media.aac_eld import AacEldDecoder, make_aac_eld_decoder
 from .media.hevc import HevcDecoder
+from .media.avc import AvcDecoder
 from .media.nalu import first_donl, reassemble_group
+from .media.avc_nalu import reassemble_h264
 from .media.quality_gate import TileVisState
 from .. import __version__ as _iss_version
 from .control import ControlServer
@@ -254,7 +256,13 @@ class Session:
 
         # Connection state — None when disconnected.
         self._negotiation: Optional[NegotiationResult] = None
-        self._decoder: Optional[HevcDecoder] = None
+        # Video codec: 'avc' (H.264 4:2:0) when ISS_VIDEO_CODEC=avc is offered,
+        # else 'hevc' (the byte-identical default the server answers with HEVC).
+        self._video_codec = (
+            "avc" if os.environ.get("ISS_VIDEO_CODEC", "").lower() == "avc"
+            else "hevc"
+        )
+        self._decoder: Optional[object] = None
         self._aac: Optional[AacEldDecoder] = None
         self._input: Optional[InputController] = None
         # Reassembler for multi-cipher-frame msg 0x1f (clipboard) sends.
@@ -429,6 +437,16 @@ class Session:
         # Audio sink. Set by consumer; called whenever a PCM chunk decodes.
         self._audio_callback: Optional[Callable[[np.ndarray], None]] = None
 
+        # Per-tile H.264 access-unit tap (AVC only). When set, each tile's
+        # reassembled Annex-B access unit is handed to the callback as
+        # (tile_idx, rtp_timestamp, au_bytes) from the video-process thread —
+        # this is the pass-through feed for the browser frontend, which decodes
+        # the H.264 itself (no decode/encode in iss for that path). The native
+        # decoder keeps running in parallel so its FIR/keyframe-recovery still
+        # drives the stream's health (the browser benefits from the same
+        # recovered keyframes via this forward).
+        self._video_au_callback: Optional[Callable[[int, int, bytes], None]] = None
+
         # Clipboard text from host. Optional callback; called whenever a
         # full msg 0x1f arrives and parses to a text item. The session
         # also pushes to the local OS clipboard directly (see
@@ -522,6 +540,24 @@ class Session:
         decoded PCM chunk: `(N, 2) float32` at 48 kHz. Pass None to remove."""
         self._audio_callback = cb
 
+    def set_video_au_callback(
+        self, cb: Optional[Callable[[int, int, bytes], None]],
+    ) -> None:
+        """Install a callback invoked from the video-process thread with each
+        tile's reassembled H.264 access unit: `(tile_idx, rtp_timestamp,
+        annexb_au_bytes)`. AVC codec only. Pass None to remove. The browser
+        frontend uses this to forward H.264 to a WebCodecs decoder without iss
+        decoding/encoding."""
+        self._video_au_callback = cb
+
+    def video_params(self) -> tuple[bytes, dict]:
+        """(sps, all_pps) harvested from the AVC config — what a downstream
+        WebCodecs decoder needs to configure(). Empty until the burst lands."""
+        dec = self._decoder
+        sps = getattr(dec, "_sps", b"") if dec is not None else b""
+        pps = getattr(dec, "_pps", b"") if dec is not None else b""
+        return sps, ({0: pps} if pps else {})
+
     def set_clipboard_text_callback(
         self, cb: Optional[Callable[[str], None]],
     ) -> None:
@@ -592,7 +628,8 @@ class Session:
         if observed:
             return observed
         n = self._negotiation
-        return n.canvas_tiles if n and n.canvas_tiles else 4
+        from .protocol.offers import tiles_per_frame
+        return n.canvas_tiles if n and n.canvas_tiles else tiles_per_frame()
 
     @property
     def hw_accel(self) -> Optional[str]:
@@ -658,8 +695,14 @@ class Session:
         # loop demuxes audio RTP from RTCP by RTP payload-type byte.
         ctrl_port = cfg.udp_ctrl_port or cfg.port
         video_port = cfg.udp_video_port or (cfg.port + 1)
-        self._sock_ctrl = self._bind_udp(cfg.udp_bind_host, ctrl_port)
-        self._sock_video = self._bind_udp(cfg.udp_bind_host, video_port)
+        # Bind host defaults to INADDR_ANY but can be pinned to one interface
+        # (config field or ISS_UDP_BIND_HOST env) so a client can run on a host
+        # already serving screen-share on 5900-5902 on a DIFFERENT interface IP
+        # without a clash — the ports stay default (they're symmetric with the
+        # server's), only the local interface narrows.
+        bind_host = cfg.udp_bind_host or os.environ.get("ISS_UDP_BIND_HOST", "")
+        self._sock_ctrl = self._bind_udp(bind_host, ctrl_port)
+        self._sock_video = self._bind_udp(bind_host, video_port)
         # NAT diagnostic: log the bound local address pair so a user behind
         # NAT can confirm iss is listening where they expect, and we can
         # compare with the src-address-of-first-packet log later.
@@ -767,7 +810,8 @@ class Session:
             )
 
         # 7) Decoder init.
-        num_tiles = self._negotiation.canvas_tiles or 4
+        from .protocol.offers import tiles_per_frame
+        num_tiles = self._negotiation.canvas_tiles or tiles_per_frame()
         # Size per-tile loss counters now that num_tiles is known.
         self._lost_pkts_per_tile = [0] * num_tiles
         self._last_profile_lost_per_tile = [0] * num_tiles
@@ -784,7 +828,8 @@ class Session:
         # actually works on each platform.
         import os as _os
         prefer_hwaccel = _os.environ.get("ISS_FORCE_SW_HEVC", "0") == "0"
-        self._decoder = HevcDecoder(
+        _DecoderCls = AvcDecoder if self._video_codec == "avc" else HevcDecoder
+        self._decoder = _DecoderCls(
             num_tiles=num_tiles,
             enable_quality_gate=True,
             on_frame_published=self._on_frame_published,
@@ -992,9 +1037,16 @@ class Session:
         # different starvation. Let BurstStarved propagate so the caller does
         # a clean full reconnect, which is what actually restarts the stream.
         burst_buf: list[bytes] = []
-        self._drain_socket_into(self._sock_video, burst_buf, max_seconds=2.0)
+        # H.264 needs a longer drain + higher packet floor than HEVC: its tiles
+        # are independent slice chains and the burst must gather enough to seed
+        # the shared decoder context before the streaming loop starts.
+        _is_avc = self._video_codec == "avc"
+        self._drain_socket_into(
+            self._sock_video, burst_buf, max_seconds=4.0 if _is_avc else 2.0)
         return gather_initial_burst(
             burst_buf, self._video_decryptor, quality_tier=cfg.quality_tier,
+            codec=self._video_codec,
+            min_packets=400 if _is_avc else 100,
         )
 
     def _teardown_negotiation_tcp(self) -> None:
@@ -1667,8 +1719,18 @@ class Session:
         # The access unit's DONL (decoding-order number) — the LTR ring key
         # the LTRP ack must echo. Same for every NALU in the group.
         donl = first_donl(ordered) if self._ltr_enabled else None
-        for nalu in reassemble_group(ordered):
+        _reassemble = reassemble_h264 if self._video_codec == "avc" else reassemble_group
+        au_cb = self._video_au_callback if self._video_codec == "avc" else None
+        au_parts: list[bytes] = []
+        for nalu in _reassemble(ordered):
             self._decoder.feed_nalu(nalu, ti, donl=donl)
+            if au_cb is not None:
+                au_parts.append(b"\x00\x00\x00\x01" + bytes(nalu))
+        if au_cb is not None and au_parts:
+            try:
+                au_cb(ti, key[1], b"".join(au_parts))
+            except Exception:
+                log.debug("video_au_callback raised", exc_info=True)
 
     def _evict_stale_groups(self) -> None:
         """Drop incomplete groups whose marker never arrived, and expire
@@ -1766,26 +1828,32 @@ class Session:
             and s not in self._ssrc_blacklist
             and counts[s] >= _DYNAMIC_SSRC_PACKET_THRESHOLD
         )
-        if len(candidates) < 4:
+        from .protocol.offers import tiles_per_frame
+        want = tiles_per_frame()  # SSRCs per group = tilesPerFrame we offered
+        if len(candidates) < want:
             return
-        # Apple emits 4 CONSECUTIVE SSRCs per tile group (one SSRC per
-        # tile). Picking the first 4 sorted candidates can grab SSRCs
+        # Apple emits `want` CONSECUTIVE SSRCs per tile group (one SSRC per
+        # tile). Picking the first `want` sorted candidates can grab SSRCs
         # from TWO different broadcast groups when Apple is double-
-        # publishing — the resulting Frankenstein map decodes 2 of 4
-        # tiles correctly and silently drops the others. Build runs of
-        # consecutive SSRCs and adopt the first complete-4 run.
+        # publishing — the resulting Frankenstein map decodes some tiles
+        # correctly and silently drops the others. Build runs of
+        # consecutive SSRCs and adopt the first complete run. (want=1 → a
+        # single-SSRC single-picture stream; want=4 → the tiled stream.)
         new_group: list[int] | None = None
         run = [candidates[0]]
-        for s in candidates[1:]:
-            if s - run[-1] <= 1 and len(run) < 4:
-                run.append(s)
-                if len(run) == 4:
-                    new_group = run
-                    break
-            else:
-                run = [s]
+        if want == 1:
+            new_group = run
+        else:
+            for s in candidates[1:]:
+                if s - run[-1] <= 1 and len(run) < want:
+                    run.append(s)
+                    if len(run) == want:
+                        new_group = run
+                        break
+                else:
+                    run = [s]
         if new_group is None:
-            return  # no consecutive 4-run yet — wait for more data
+            return  # no consecutive run of `want` yet — wait for more data
         new_map = {s: i for i, s in enumerate(new_group)}
         if new_map == self._ssrc_to_tile:
             return

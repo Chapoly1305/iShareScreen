@@ -19,6 +19,8 @@ from typing import Optional
 
 from ..media.bitstream import BitReader, remove_emulation_prevention
 from ..media.nalu import IDR_RANGE, NAL_PPS, NAL_SPS, NAL_VPS, reassemble_group
+from ..media.avc_nalu import (
+    APPLE_CONFIG_MARKER, NAL_SLICE_IDR, parse_avc_config, reassemble_h264)
 from .srtp import SRTPDecryptor
 
 
@@ -58,6 +60,7 @@ class InitialBurst:
     last_idr: dict[int, bytes]
     tile_nalus: dict[int, list[bytes]]
     burst_pending: dict[tuple[int, int], list[tuple[int, bool, bytes]]]
+    codec: str = "hevc"
 
 
 def gather_initial_burst(
@@ -68,6 +71,7 @@ def gather_initial_burst(
     settle_seconds: float = 0.3,
     deadline_seconds: float = 2.0,
     min_packets: int = 100,
+    codec: str = "hevc",
 ) -> InitialBurst:
     """Drain `udp_video_buf` into NAL units. Returns parameter sets, the per-
     tile NAL cache, and any incomplete groups for the streaming loop."""
@@ -142,10 +146,36 @@ def gather_initial_burst(
             else:
                 packets = sorted(grp, key=lambda x: x[0])
 
+            for _s, _t, _p in packets:
+                if _p:
+                    nonlocal_state.setdefault("raw_hdr", set()).add(_p[0])
+            if codec == "avc":
+                payloads = [p for _, _, p in packets]
+                # SPS/PPS arrive in Apple's 0x92 avc1/avcC config packet, not
+                # as Annex-B param NALs.
+                for _p in payloads:
+                    if _p and _p[0] == APPLE_CONFIG_MARKER:
+                        _cfg = parse_avc_config(_p)
+                        if _cfg:
+                            nonlocal_state["sps"] = _cfg[0]
+                            all_pps[0] = _cfg[1]
+                for nalu in reassemble_h264(payloads):
+                    if not nalu:
+                        continue
+                    nonlocal_state.setdefault("hdr_bytes", set()).add(nalu[0])
+                    t = nalu[0] & 0x1F
+                    if t == NAL_SLICE_IDR:
+                        last_idr[ti] = nalu
+                        tile_nalus[ti] = [nalu]
+                    elif 1 <= t <= 5:
+                        tile_nalus[ti].append(nalu)
+                completed.add(key)
+                continue
             for nalu in reassemble_group([p for _, _, p in packets]):
                 if len(nalu) < 2:
                     continue
                 nt = (nalu[0] >> 1) & 0x3F
+                nonlocal_state.setdefault("hdr_bytes", set()).add(nalu[0])
                 if nt == NAL_VPS:
                     nonlocal_state["vps"] = nalu
                 elif nt == NAL_SPS:
@@ -175,9 +205,26 @@ def gather_initial_burst(
         key: list(grp) for key, grp in ssrc_ts_groups.items() if key not in completed
     }
 
+    # CODEC-DETECT: the raw RTP payload header byte tells HEVC from H.264
+    # unambiguously (reassemble_group is HEVC-specific and mangles H.264, so use
+    # the raw header). HEVC: type=(b>>1)&0x3f in {VPS32,SPS33,PPS34,AP48,FU49}.
+    # H.264: forbidden bit clear and type=b&0x1f in {1,5,7,8,24,28,29}. Logged
+    # once per session so a starved HEVC harvest on an H.264 stream is legible.
+    _raw = nonlocal_state.get("raw_hdr", set())
+    _is_hevc = any(((b >> 1) & 0x3F) in (NAL_VPS, NAL_SPS, NAL_PPS, 48, 49) for b in _raw)
+    _is_h264 = any((b & 0x80) == 0 and (b & 0x1F) in (1, 5, 7, 8, 24, 28, 29) for b in _raw) and not _is_hevc
+    log.info(
+        "CODEC-DETECT: raw RTP headers=%s -> %s",
+        sorted(hex(b) for b in _raw),
+        "H.264/AVC" if _is_h264 else "HEVC" if _is_hevc else "unknown",
+    )
+
     vps_out = nonlocal_state["vps"]
     sps_out = nonlocal_state["sps"]
-    if vps_out is None or sps_out is None or not all_pps:
+    # H.264 has no VPS; only SPS+PPS are required.
+    missing_params = (sps_out is None or not all_pps) if codec == "avc" else (
+        vps_out is None or sps_out is None or not all_pps)
+    if missing_params:
         reason = "no-video-rtp" if len(udp_video_buf) < 20 else "missing-param-sets"
         raise BurstStarved(len(udp_video_buf), reason, deadline_seconds)
 
@@ -192,12 +239,13 @@ def gather_initial_burst(
     return InitialBurst(
         processed_pkt_idx=processed,
         ssrc_to_tile=ssrc_to_tile,
-        vps=vps_out,
+        vps=vps_out or b"",
         sps=sps_out,
         all_pps=all_pps,
         last_idr=last_idr,
         tile_nalus=dict(tile_nalus),
         burst_pending=burst_pending,
+        codec=codec,
     )
 
 

@@ -186,6 +186,9 @@ class Supervisor:
             "--port", str(args.port),
             "--auth", args.auth,
             "--control-socket", sock_path,
+            # The TUI wraps the native wgpu viewer; force it explicitly so the
+            # cli's default frontend (browser) doesn't hijack the TUI's child.
+            "--frontend", "desktop",
         ]
         argv += ["--audio"] if args.audio else ["--no-audio"]
         argv += ["--curtain"] if args.curtain else ["--no-curtain"]
