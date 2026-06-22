@@ -220,10 +220,14 @@ class IssTuiApp(App):
             # subscribe to. Its stderr (incl. the viewer URL + rx/decode info)
             # streams to the log panel.
             url = "http://localhost:4433/"  # cli's default --bridge-port
-            if self._session_screen is not None:
-                self._session_screen.set_state("BROWSER")
-                self._session_screen.append_log(
-                    f"info: browser frontend — opening {url}")
+            # The session screen was just pushed and isn't mounted yet, so
+            # touching its widgets now (set_state→#hdr, append_log→#log) raises
+            # NoMatches. Defer to after the next refresh, when it's mounted.
+            def _announce(screen: "SessionScreen" = self._session_screen) -> None:
+                if screen is not None:
+                    screen.set_state("BROWSER")
+                    screen.append_log(f"info: browser frontend — opening {url}")
+            self.call_after_refresh(_announce)
             self.notify(f"Browser frontend — opening {url}", timeout=10)
             if push_screen:
                 # Pop open the user's default browser at the bridge URL so they

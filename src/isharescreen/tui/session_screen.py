@@ -57,6 +57,7 @@ from typing import Any, Optional
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.message import Message
 from textual.reactive import reactive
 from textual.screen import Screen
@@ -446,7 +447,14 @@ class SessionScreen(Screen):
         self._log_ring.append(line)
         if len(self._log_ring) > self._LOG_RING_MAX:
             self._log_ring = self._log_ring[-self._LOG_RING_MAX:]
-        self.query_one("#log", LogPanel).append(line)
+        try:
+            self.query_one("#log", LogPanel).append(line)
+        except NoMatches:
+            # Called before the screen finished mounting (e.g. the browser
+            # frontend logs the viewer URL right after push_screen). The line
+            # is preserved in _log_ring above; skip the visual append + the
+            # header bump rather than crashing.
+            return
         # Bump the header chips so a normal user sees that something
         # warrants attention even if their eyes are on the wgpu window.
         lvl, _ = _classify_loglevel(line)
@@ -458,7 +466,10 @@ class SessionScreen(Screen):
             hdr.warnings = hdr.warnings + 1
 
     def set_state(self, state: str) -> None:
-        self.query_one("#hdr", HeaderBar).state = state
+        try:
+            self.query_one("#hdr", HeaderBar).state = state
+        except NoMatches:
+            pass  # called before mount; the header reflects state once mounted
 
     # ── bindings ────────────────────────────────────────────────
 
