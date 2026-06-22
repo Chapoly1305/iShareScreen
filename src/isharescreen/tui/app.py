@@ -193,6 +193,7 @@ class IssTuiApp(App):
             user=form.user,
             password=form.password,
             advertise=form.advertise,
+            frontend=form.frontend,
             audio=form.audio,
             curtain=form.curtain,
             hdr=form.hdr,
@@ -213,7 +214,19 @@ class IssTuiApp(App):
             await self.push_screen(self._session_screen)
         elif self._session_screen is not None:
             self._session_screen.set_state("CONNECTING")
-        # Subscribe to the child's control socket as soon as it's up.
+        if form.frontend == "browser":
+            # The browser bridge serves a page for the user's OWN browser; it
+            # publishes no control socket, so there are no live stats to
+            # subscribe to. Its stderr (incl. the viewer URL + rx/decode info)
+            # streams to the log panel. Point the user at the local URL.
+            url = "http://localhost:4433/"  # cli's default --bridge-port
+            if self._session_screen is not None:
+                self._session_screen.set_state("BROWSER")
+                self._session_screen.append_log(
+                    f"info: browser frontend — open {url} in Chrome/Edge")
+            self.notify(f"Browser frontend running — open {url}", timeout=10)
+            return
+        # Desktop: subscribe to the child's control socket as soon as it's up.
         sock_path = self._supervisor.control_socket
         assert sock_path is not None
         self._ctrl = ControlClient(sock_path, self._handle_ctrl_message)

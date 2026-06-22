@@ -47,6 +47,7 @@ class ViewerArgs:
     user: str
     password: str
     advertise: str         # e.g. "1920x1080" or "1920x1200@2"
+    frontend: str = "desktop"   # "browser" | "desktop" — which viewer to launch
     audio: bool = True
     curtain: bool = True
     hdr: bool = False
@@ -186,9 +187,11 @@ class Supervisor:
             "--port", str(args.port),
             "--auth", args.auth,
             "--control-socket", sock_path,
-            # The TUI wraps the native wgpu viewer; force it explicitly so the
-            # cli's default frontend (browser) doesn't hijack the TUI's child.
-            "--frontend", "desktop",
+            # Which viewer the connect button chose. Forced explicitly so the
+            # cli's default doesn't override the user's pick. "desktop" is the
+            # native wgpu child the TUI supervises; "browser" launches the
+            # WebTransport bridge (the TUI shows its log incl. the viewer URL).
+            "--frontend", args.frontend,
         ]
         argv += ["--audio"] if args.audio else ["--no-audio"]
         argv += ["--curtain"] if args.curtain else ["--no-curtain"]

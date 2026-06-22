@@ -60,6 +60,7 @@ def load_last() -> Optional[ConnectFormValues]:
         hdr=bool(data.get("hdr", False)),
         share_console=bool(data.get("share_console", False)),
         alt_session=bool(data.get("alt_session", False)),
+        frontend=str(data.get("frontend", "browser")),
     )
 
 
@@ -78,6 +79,7 @@ def save_last(values: ConnectFormValues) -> None:
             "hdr": values.hdr,
             "share_console": values.share_console,
             "alt_session": values.alt_session,
+            "frontend": values.frontend,
         }
         p.write_text(json.dumps(data, indent=2))
         try:
