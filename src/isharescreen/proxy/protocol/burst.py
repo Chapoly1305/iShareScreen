@@ -62,6 +62,7 @@ class InitialBurst:
     last_idr: dict[int, bytes]
     tile_nalus: dict[int, list[bytes]]
     burst_pending: dict[tuple[int, int], list[tuple[int, bool, bytes]]]
+    codec: str = "hevc"
 
 
 def gather_initial_burst(
@@ -187,6 +188,7 @@ def gather_initial_burst(
                 if len(nalu) < 2:
                     continue
                 nt = (nalu[0] >> 1) & 0x3F
+                nonlocal_state.setdefault("hdr_bytes", set()).add(nalu[0])
                 if nt == NAL_VPS:
                     nonlocal_state["vps"] = nalu
                 elif nt == NAL_SPS:
@@ -216,6 +218,20 @@ def gather_initial_burst(
         key: list(grp) for key, grp in ssrc_ts_groups.items() if key not in completed
     }
 
+    # CODEC-DETECT: the raw RTP payload header byte tells HEVC from H.264
+    # unambiguously (reassemble_group is HEVC-specific and mangles H.264, so use
+    # the raw header). HEVC: type=(b>>1)&0x3f in {VPS32,SPS33,PPS34,AP48,FU49}.
+    # H.264: forbidden bit clear and type=b&0x1f in {1,5,7,8,24,28,29}. Logged
+    # once per session so a starved HEVC harvest on an H.264 stream is legible.
+    _raw = nonlocal_state.get("raw_hdr", set())
+    _is_hevc = any(((b >> 1) & 0x3F) in (NAL_VPS, NAL_SPS, NAL_PPS, 48, 49) for b in _raw)
+    _is_h264 = any((b & 0x80) == 0 and (b & 0x1F) in (1, 5, 7, 8, 24, 28, 29) for b in _raw) and not _is_hevc
+    log.info(
+        "CODEC-DETECT: raw RTP headers=%s -> %s",
+        sorted(hex(b) for b in _raw),
+        "H.264/AVC" if _is_h264 else "HEVC" if _is_hevc else "unknown",
+    )
+
     vps_out = nonlocal_state["vps"]
     sps_out = nonlocal_state["sps"]
     # H.264 has no VPS; only SPS+PPS are required.
@@ -240,12 +256,13 @@ def gather_initial_burst(
     return InitialBurst(
         processed_pkt_idx=processed,
         ssrc_to_tile=ssrc_to_tile,
-        vps=vps_out,
+        vps=vps_out or b"",
         sps=sps_out,
         all_pps=all_pps,
         last_idr=last_idr,
         tile_nalus=dict(tile_nalus),
         burst_pending=burst_pending,
+        codec=codec,
     )
 
 

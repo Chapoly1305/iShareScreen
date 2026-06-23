@@ -142,7 +142,7 @@ def build_rr(
         out += struct.pack(
             ">IIIIII",
             ssrc,
-            0,            # fraction lost (24) | cumulative lost (8)
+            0,            # fraction lost (8) | cumulative lost (24)
             ext_seq,
             0,            # interarrival jitter
             lsr,

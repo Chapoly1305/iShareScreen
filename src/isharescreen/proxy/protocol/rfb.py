@@ -209,7 +209,7 @@ def build_virtual_display(
     CAUTION: an earlier reading (below) treated this byte as the "magic
     bit" that makes the daemon target the alt-user vdisplay instead of the
     *console* screen. Decompiling screensharingd + ScreensharingAgent
-    (24G231) contradicts that: +0x96 is logged as `rotations` and forwarded
+    (a recent macOS build) contradicts that: +0x96 is logged as `rotations` and forwarded
     verbatim to `SLVirtualDisplaySettings ...rotations:`, and *neither
     binary branches on +0x96/+0x99*. The console-vs-login-window choice is
     actually driven by a runtime session probe plus the `BlankScreen`

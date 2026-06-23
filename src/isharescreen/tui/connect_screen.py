@@ -83,6 +83,7 @@ class ConnectFormValues:
     share_console: bool
     alt_session: bool
     decoder: str = "auto"  # decoder name or "auto"
+    frontend: str = "desktop"  # "browser" or "desktop"
 
 
 class ConnectScreen(Screen):
@@ -108,7 +109,8 @@ class ConnectScreen(Screen):
     .switch-row { padding: 1 0 0 0; height: auto; }
     .switch-row Switch { margin-right: 2; }
     .switch-row Label { padding: 0 1 0 0; }
-    #buttons { padding-top: 1; height: auto; align-horizontal: right; }
+    #frontend-hint { padding-top: 1; text-align: right; }
+    #buttons { padding-top: 0; height: auto; align-horizontal: right; }
     Button { margin-left: 1; }
     """
 
@@ -132,6 +134,7 @@ class ConnectScreen(Screen):
             audio=True, curtain=True, hdr=False, hidpi="auto",
             share_console=False, alt_session=False,
             decoder=_DEFAULT_DECODER,
+            frontend="desktop",
         )
         self._probe_task: Optional[asyncio.Task] = None
 
@@ -180,9 +183,14 @@ class ConnectScreen(Screen):
             with Horizontal(classes="switch-row"):
                 yield Label("Share console"); yield Switch(value=self._prefill.share_console, id="share-console")
                 yield Label("Alt session"); yield Switch(value=self._prefill.alt_session, id="alt-session")
+            yield Static(
+                "[dim]Browser = open in a browser tab · Desktop = native window[/]",
+                id="frontend-hint",
+            )
             with Horizontal(id="buttons"):
                 yield Button("Quit", id="quit", variant="error")
-                yield Button("Connect", id="connect", variant="success")
+                yield Button("Desktop", id="connect-desktop")
+                yield Button("Browser", id="connect-browser", variant="success")
 
     def on_mount(self) -> None:
         # Kick a probe for whatever host was prefilled (if any).
@@ -194,7 +202,9 @@ class ConnectScreen(Screen):
             if not inp.value:
                 inp.focus()
                 return
-        self.query_one("#connect", Button).focus()
+        # All fields filled: land on the button for the last-used frontend.
+        btn = "connect-desktop" if self._prefill.frontend == "desktop" else "connect-browser"
+        self.query_one(f"#{btn}", Button).focus()
 
     @on(Input.Changed, "#host")
     def _host_changed(self, event: Input.Changed) -> None:
@@ -246,11 +256,16 @@ class ConnectScreen(Screen):
         if idx < len(order) - 1:
             self.query_one(f"#{order[idx + 1]}", Input).focus()
         else:
-            self._submit()
+            # Enter on the password field connects with the last-used frontend.
+            self._submit(self._prefill.frontend)
 
-    @on(Button.Pressed, "#connect")
-    def _connect_clicked(self) -> None:
-        self._submit()
+    @on(Button.Pressed, "#connect-browser")
+    def _connect_browser(self) -> None:
+        self._submit("browser")
+
+    @on(Button.Pressed, "#connect-desktop")
+    def _connect_desktop(self) -> None:
+        self._submit("desktop")
 
     @on(Button.Pressed, "#quit")
     def _quit_clicked(self) -> None:
@@ -259,7 +274,7 @@ class ConnectScreen(Screen):
     def action_quit(self) -> None:
         self.app.exit()
 
-    def _submit(self) -> None:
+    def _submit(self, frontend: str) -> None:
         host = self.query_one("#host", Input).value.strip()
         user = self.query_one("#user", Input).value.strip()
         password = self.query_one("#password", Input).value
@@ -282,6 +297,7 @@ class ConnectScreen(Screen):
             share_console=self.query_one("#share-console", Switch).value,
             alt_session=self.query_one("#alt-session", Switch).value,
             decoder=str(self.query_one("#decoder", Select).value or _DEFAULT_DECODER),
+            frontend=frontend,
         )
         self.post_message(self.Connect(values))
 

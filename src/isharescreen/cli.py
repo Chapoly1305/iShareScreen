@@ -26,6 +26,7 @@ import argparse
 import dataclasses
 import faulthandler
 import logging
+import os
 import signal
 import sys
 import time
@@ -80,8 +81,22 @@ def _make_parser() -> argparse.ArgumentParser:
     )
     g.add_argument("--port", type=int, default=5900, help="TCP port (default 5900)")
     g.add_argument(
+        "--codec", choices=["hevc", "avc"], default=None,
+        help="Video codec: hevc = Apple's HEVC 4:4:4 (default; best quality, "
+        "needs 4:4:4 HW or fast CPU); avc = H.264 4:2:0 (hardware-decodable on "
+        "Windows/Linux where 4:4:4 isn't, ~5x bitrate of HEVC)")
+    g.add_argument(
         "--auth", choices=("srp", "nonsrp"), default="srp",
         help="authentication mode (default srp; falls back to nonsrp on rejection)",
+    )
+    g.add_argument(
+        "--frontend", choices=("browser", "desktop"), default="browser",
+        help="browser = WebTransport+WebCodecs in a browser tab, H.264 "
+        "pass-through (default); desktop = native wgpu/Qt window",
+    )
+    g.add_argument(
+        "--bridge-port", type=int, default=4433,
+        help="browser frontend: WebTransport/HTTP3 listen port (default 4433)",
     )
 
     g = p.add_argument_group("display")
@@ -368,9 +383,29 @@ def _run_smoke(config: SessionConfig, args: argparse.Namespace) -> int:
 
 
 def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
-    """Open the desktop viewer."""
-    from isharescreen.frontend.desktop.app import run as run_desktop
-    return run_desktop(config, auto_quit_secs=args.auto_quit_secs)
+    """Open the selected frontend. Default is the browser (WebTransport +
+    WebCodecs, H.264 pass-through) since every machine has a browser; the
+    native wgpu/desktop viewer stays available via --frontend desktop."""
+    if args.frontend == "desktop":
+        from isharescreen.frontend.desktop.app import run as run_desktop
+        return run_desktop(config, auto_quit_secs=args.auto_quit_secs)
+    # browser (default): H.264 pass-through needs the AVC codec path. The
+    # Session reads ISS_VIDEO_CODEC at construction, so force it unless the
+    # user explicitly chose a codec.
+    if args.codec is None:
+        os.environ["ISS_VIDEO_CODEC"] = "avc"
+    # Use the cursor pseudo-encoding (RFB enc 1104), same as the wgpu viewer:
+    # the daemon does NOT bake the cursor into the framebuffer, it sends cursor
+    # pixmaps which the browser paints as the canvas CSS cursor. This also means
+    # moving the mouse doesn't dirty the framebuffer / wake the encoder.
+    # ISS_LEGACY_CURSOR=1 reverts to the cursor-in-framebuffer path.
+    # Request a SINGLE picture per frame (tilesPerFrame=1) instead of Apple's
+    # default 4 tiles. Browser WebCodecs can't follow the cross-tile reference
+    # structure of the 4-tile stream (drift/"fleas"); one stream decodes
+    # cleanly with one decoder, no compositing.
+    os.environ.setdefault("ISS_TILES_PER_FRAME", "1")
+    from isharescreen.frontend.wt.server import run as run_browser
+    return run_browser(config, port=args.bridge_port)
 
 
 # ── entry point ──────────────────────────────────────────────────────
@@ -383,12 +418,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         from .proxy.media import registry
         print(registry.describe())
         return 0
-    # `--decoder` feeds the registry override via the env var session.py reads
-    # (keeps the protocol layer free of a CLI dependency).
     if getattr(args, "decoder", "auto") and args.decoder != "auto":
         import os as _os
         _os.environ["ISS_DECODER"] = args.decoder
-
+    if args.codec:
+        os.environ["ISS_VIDEO_CODEC"] = args.codec
     signal.signal(signal.SIGINT, signal.default_int_handler)
 
     # Surface tracebacks for any thread that crashes — without this,

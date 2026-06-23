@@ -193,6 +193,7 @@ class IssTuiApp(App):
             user=form.user,
             password=form.password,
             advertise=form.advertise,
+            frontend=form.frontend,
             audio=form.audio,
             curtain=form.curtain,
             hdr=form.hdr,
@@ -216,7 +217,25 @@ class IssTuiApp(App):
             await self.push_screen(self._session_screen)
         elif self._session_screen is not None:
             self._session_screen.set_state("CONNECTING")
-        # Subscribe to the child's control socket as soon as it's up.
+        if form.frontend == "browser":
+            # The browser bridge serves a page for the user's OWN browser; it
+            # publishes no control socket, so there are no live stats to
+            # subscribe to. Its stderr (incl. the viewer URL + rx/decode info)
+            # streams to the log panel.
+            url = "http://localhost:4433/"  # cli's default --bridge-port
+            if self._session_screen is not None:
+                self._session_screen.set_state("BROWSER")
+                self._session_screen.append_log(
+                    f"info: browser frontend — opening {url}")
+            self.notify(f"Browser frontend — opening {url}", timeout=10)
+            if push_screen:
+                # Pop open the user's default browser at the bridge URL so they
+                # don't have to. Only on the initial connect (not reconnect,
+                # where a tab is likely already open).
+                asyncio.create_task(
+                    self._open_browser(url), name="iss-tui-open-browser")
+            return
+        # Desktop: subscribe to the child's control socket as soon as it's up.
         sock_path = self._supervisor.control_socket
         assert sock_path is not None
         self._ctrl = ControlClient(sock_path, self._handle_ctrl_message)
@@ -236,6 +255,22 @@ class IssTuiApp(App):
             log.exception("control client start failed")
             if self._session_screen is not None:
                 self._session_screen.append_log(f"warn: control client failed: {e}")
+
+    async def _open_browser(self, url: str) -> None:
+        """Best-effort: open the user's default browser at the bridge URL after
+        a short delay so the bridge has bound its port (avoids a too-early
+        connection-refused). No-ops cleanly if there's no GUI browser (e.g. a
+        headless/SSH session) — the URL is still in the log + notification."""
+        import webbrowser
+        await asyncio.sleep(2.5)
+        try:
+            loop = asyncio.get_running_loop()
+            ok = await loop.run_in_executor(None, webbrowser.open, url)
+            if not ok and self._session_screen is not None:
+                self._session_screen.append_log(
+                    f"info: couldn't auto-open a browser — open {url} yourself")
+        except Exception:
+            log.debug("auto-open browser failed", exc_info=True)
 
     async def _handle_stderr(self, line: str) -> None:
         if self._session_screen is not None:

@@ -67,11 +67,6 @@ Decode one conversation to a JSONL record ledger:
 python tools/dissector/dissector_cli.py \
   decode \
   --pcap capture.pcapng \
-  --client-ip 192.168.1.180 \
-  --server-ip 192.168.1.172 \
-  --server-port 5900 \
-  --client-port 50085 \
-  --initial-key-hex 2fa87b04f8c065a3b814efcbcdc6eba2 \
   --output records.jsonl
 ```
 
@@ -89,11 +84,6 @@ Fast-scan one session for cadence and update-driving traffic:
 python tools/dissector/dissector_cli.py \
   scan-session \
   --pcap capture.pcapng \
-  --client-ip 192.168.1.180 \
-  --server-ip 192.168.1.172 \
-  --server-port 5900 \
-  --client-port 50085 \
-  --initial-key-hex a4731ae665d2b312055e8780b7812a03 \
   --tail-seconds 3,5
 ```
 
@@ -104,11 +94,6 @@ auto-correlated with the selected TCP adaptive session and latest client `0x1c`:
 python tools/dissector/dissector_cli.py \
   analyze-udp-media \
   --pcap capture.pcapng \
-  --client-ip 192.168.1.180 \
-  --server-ip 192.168.1.172 \
-  --server-port 5900 \
-  --client-port 50085 \
-  --initial-key-hex e9213e77a87e82f2d7512e88fe7583d1 \
   --output udp_media_summary.json
 ```
 
@@ -147,11 +132,6 @@ Export every client request from one selected session as JSON or Markdown:
 python tools/dissector/dissector_cli.py \
   export-client-requests \
   --pcap capture.pcapng \
-  --client-ip 192.168.1.180 \
-  --server-ip 192.168.1.172 \
-  --server-port 5900 \
-  --client-port 50085 \
-  --initial-key-hex a4731ae665d2b312055e8780b7812a03 \
   --format markdown \
   --output native_requests.md
 ```
@@ -162,11 +142,6 @@ Render an exact-timing replay video:
 python tools/dissector/dissector_cli.py \
   render-replay \
   --pcap capture.pcapng \
-  --client-ip 192.168.1.180 \
-  --server-ip 192.168.1.172 \
-  --server-port 5900 \
-  --client-port 50085 \
-  --initial-key-hex a4731ae665d2b312055e8780b7812a03 \
   --output replay.mkv \
   --emit-frame-ledger replay_frames.json
 ```

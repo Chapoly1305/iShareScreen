@@ -23,6 +23,20 @@ from ... import __version__
 
 log = logging.getLogger(__name__)
 
+import os as _os
+
+
+def tiles_per_frame() -> int:
+    """The `tilesPerFrame` value we advertise in the media offer (field 6).
+    macOS honors it, so this is also the number of video SSRCs/tiles to expect
+    in the stream. Default 4 = Apple SS.app's byte-identical offer (4 parallel
+    H.264 sub-streams); ISS_TILES_PER_FRAME=1 asks for a single picture per
+    frame (browser-WebCodecs-decodable, no cross-tile references)."""
+    try:
+        return max(1, int(_os.environ.get("ISS_TILES_PER_FRAME", "4")))
+    except ValueError:
+        return 4
+
 
 # ── protobuf helpers ──────────────────────────────────────────────────
 
@@ -93,18 +107,17 @@ _APPLE_AUDIO_F9 = b"".join(_build_audio_f9_entry(*t) for t in _AUDIO_F9_TIERS)
 # Each video codec bank carries a semicolon-delimited feature-list string
 # (FLS, field 3). The codec a bank represents is keyed off its RTP payload
 # *number* (field 1) by the host: PT 123 → H.264/AVC, PT 100 → HEVC RExt
-# 4:4:4 (confirmed live 2026-06 against a real host — offering PT 123 alone
-# makes screensharingd stream H.264, PT 100 alone streams HEVC; matches the
-# wire PT 100=HEVC seen in captures). The two FLS strings below are Apple's
-# verbatim per-codec values. (An earlier revision had these two names
-# swapped; it never mattered because both banks were always offered.)
+# 4:4:4. `LTR;` advertises long-term-reference capability (LTRP on by default).
 _AVC_PARAMS = (
     b"FLS;MS:-1;LF:-1;LTR;CABAC;POS:0;EOD:1;HTS:2;RR:3;"
     b"AR:16/9,5/8;XR:16/9,5/8;"
 )
 _HEVC_PARAMS = (
-    b"FLS;LF:-1;POS:5;EOD:1;HTS:2;RR:3;POSE:4;"
-    b"AR:16/9,5/8;XR:16/9,5/8;"
+    (b"FLS;MS:-1;LF:-1;LTR;CABAC;POS:0;EOD:1;HTS:2;RR:3;"
+     b"AR:16/9,5/8;XR:16/9,5/8;")
+    if _os.environ.get("ISS_LTRP", "1") != "0" else
+    (b"FLS;MS:-1;LF:-1;CABAC;POS:0;EOD:1;HTS:2;RR:3;"
+     b"AR:16/9,5/8;XR:16/9,5/8;")
 )
 
 
@@ -192,23 +205,21 @@ def _build_mediablob(mode: int, session_id: int, timestamp: int) -> bytes:
             + _field_bytes(3, _HEVC_PARAMS)
             + _field_varint(4, 14)
         )
-        # ISS_VIDEO_CODEC selects which codec bank(s) to advertise. The host
-        # maps the bank's RTP payload number to a codec and, when both are
-        # offered, prefers HEVC — so to force H.264 4:2:0 (e.g. for a client
-        # whose GPU can't HW-decode HEVC RExt 4:4:4) we must advertise the AVC
-        # bank *only*. Default "both" reproduces Apple's native offer
-        # byte-for-byte (AVC bank first, then HEVC) and yields HEVC 4:4:4.
-        _codec = os.environ.get("ISS_VIDEO_CODEC", "both").lower()
+        # ISS_VIDEO_CODEC selects codec bank(s). LTRP on by default (ISS_LTRP=0 to disable).
+        ltrp_on = _os.environ.get("ISS_LTRP", "1") != "0"
+        _tiles_per_frame = tiles_per_frame()
+        _codec = _os.environ.get("ISS_VIDEO_CODEC", "both").lower()
         if _codec == "avc":
-            banks = _field_bytes(3, avc_bank)
+            _codec_banks = _field_bytes(3, hevc_bank)   # field1=123 -> H.264
         elif _codec == "hevc":
-            banks = _field_bytes(3, hevc_bank)
+            _codec_banks = _field_bytes(3, avc_bank)     # field1=100 -> HEVC
         else:
-            banks = _field_bytes(3, avc_bank) + _field_bytes(3, hevc_bank)
+            _codec_banks = _field_bytes(3, hevc_bank) + _field_bytes(3, avc_bank)
         desc = (
-            _field_varint(1, session_id) + _field_varint(2, 0)
-            + banks
-            + _field_varint(6, 4) + _field_varint(7, 1) + _field_varint(8, 63)
+            _field_varint(1, session_id) + _field_varint(2, 1 if ltrp_on else 0)
+            + _codec_banks
+            + _field_varint(6, _tiles_per_frame) + _field_varint(7, 1 if ltrp_on else 0)
+            + _field_varint(8, 63)
             + _field_varint(9, 1) + _field_varint(12, 1)
         )
         desc_field = _field_bytes(5, desc)
@@ -349,6 +360,10 @@ def extract_canvas_dims(answer_msg: bytes) -> tuple[int, int, int]:
                                 ch = v
                             elif sf == 6:
                                 ct = v
+                            elif sf == 7:
+                                # field 7 = ltrpEnabled (negotiated result).
+                                # Diagnostic: did the server accept LTRP?
+                                log.info("negotiated ltrpEnabled (answer F5.f7) = %d", v)
                         elif sw == 2:
                             sl, sp = _read_varint(sub, sp)
                             sp += sl

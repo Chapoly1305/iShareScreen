@@ -134,7 +134,7 @@ The handshake is the standard RFB cleartext exchange, extended only by Apple's s
 #### 4.1.3 Security-Type Advertisement
 
 - **Direction**: server→client. **Framing**: `u8 count || u8[count] types`.
-- Observed set: `count = 4`, types `30, 33, 36, 35` in that wire order (`04 1e 21 24 23`) — `capture.pcapng` (the 5900 stream) carries the server bytes `04 1e 21 24 23` byte-exact, preceded by both banners = `52 46 42 20 30 30 33 2e 38 38 39 0a`.
+- Observed set: `count = 4`, types `30, 33, 36, 35` in that wire order (`04 1e 21 24 23`) — the packet capture (the 5900 stream) carries the server bytes `04 1e 21 24 23` byte-exact, preceded by both banners = `52 46 42 20 30 30 33 2e 38 38 39 0a`.
 - **Validation**: `count = 0` is an RFB failure list; the client MUST close.
 - **Unknown values**: a client MUST ignore advertised types it does not implement.
 
@@ -219,7 +219,7 @@ u8    empty_opaque_len = 0
 
 ##### 4.2.4.5 Packet-2
 
-- **Direction**: client→server. RSA1 envelope with `authtype = 2`. The `aux`-position `u16` is again a **length**, not a constant: it carries `inner_len + 4` (the sampled value `0x02aa` is just that length for the captured session and shifts with the options-string length). Body: `u16 preamble = 0 || u16 inner_len || inner || trailing`. **Inner grammar**: `%m A || %o M1 || %s options || %o client_random`. On the wire the bytes are `u16(inner_len+4) || u16(0) || u16(inner_len) || inner`. In `capture.pcapng` packet-2 begins `00000434 0100 52534131 0002 02aa 0000 02a6 0200 …` — `total_len=1076`, `authtype=2`, `aux=0x02aa=682`, then `preamble=0`, `inner_len=0x02a6=678`, and 682 = 678 + 4, with a 512-byte `A` following; the server's RSA1 parser `sub_100018e60` reads the field as a length (§4.2.4.2); and the reference client computes it as `inner_len+4`.
+- **Direction**: client→server. RSA1 envelope with `authtype = 2`. The `aux`-position `u16` is again a **length**, not a constant: it carries `inner_len + 4` (the sampled value `0x02aa` is just that length for the captured session and shifts with the options-string length). Body: `u16 preamble = 0 || u16 inner_len || inner || trailing`. **Inner grammar**: `%m A || %o M1 || %s options || %o client_random`. On the wire the bytes are `u16(inner_len+4) || u16(0) || u16(inner_len) || inner`. In the packet capture packet-2 begins `00000434 0100 52534131 0002 02aa 0000 02a6 0200 …` — `total_len=1076`, `authtype=2`, `aux=0x02aa=682`, then `preamble=0`, `inner_len=0x02a6=678`, and 682 = 678 + 4, with a 512-byte `A` following; the server's RSA1 parser `sub_100018e60` reads the field as a length (§4.2.4.2); and the reference client computes it as `inner_len+4`.
 - Observed: `A` = 512 bytes (4096-bit), `M1` = 64 bytes (SHA-512), `options` = the verbatim challenge echo, `client_random` = 16 bytes.
 - **Trailing bytes**: present and non-zero in the capture, but the bounded `inner` is authoritative; receivers MUST NOT require the trailing bytes.
 
@@ -483,7 +483,7 @@ Corresponding **client→server** control messages absent from §8.2: `0x06` Cli
 - **Direction**: server→client. **Transport**: framebuffer-update rectangle with server-assigned `x,y,w,h`. **Receiver behavior: action** (framebuffer sizing). **Length rule**: the rectangle body begins with a `u16` payload-length prefix; a payload does not exceed 65535 bytes.
 - The leading fields are interpretable: after the `u16` payload-length prefix and a `u16 version` (observed `5`), the body carries `u16 scaled_width`, `u16 scaled_height`, `u16 backing_width`, `u16 backing_height` (e.g. `1920, 1080, 3840, 2160`). `scaled_*` is the logical display geometry; `backing_*` is the pixel geometry the encoder renders at (HiDPI is `backing = 2 × scaled`).
 
-**Provider-blob layout** from the sender `AppleVNCServer::EncodeDisplayInfo` → `AddNextDisplay_DisplayInf2Encoding` (`0x10004ef80`; `EncodeDisplayInfo.c`, build 24G624 — version skew vs 24G231, wire layout believed stable). After the rectangle header + encoding tag the blob is:
+**Provider-blob layout** from the sender `AppleVNCServer::EncodeDisplayInfo` → `AddNextDisplay_DisplayInf2Encoding` (`0x10004ef80`; `EncodeDisplayInfo.c`, a recent macOS build (minor version skew observed across builds; wire layout believed stable)). After the rectangle header + encoding tag the blob is:
 
 ```text
 u16   payload_len      (= n_displays × 0x38 + 0x14)
@@ -503,7 +503,7 @@ display_record[n_displays]   -- 0x38 (56) bytes each:
   +0x32 u8 redShift | u8 greenShift | u8 blueShift (+pad to 0x38)
 ```
 
-The leading `scaled_w/h`, `backing_w/h` are the first record's bounds rects; the two `3ff0000000000000` doubles in the live sample are the **scale factors (1.0)**, not refresh-Hz. The record body model comes from the sender. There is a minor offset discrepancy between the 24G624 disassembly and the live-host bytes near the geometry leader (likely version skew) — treat the live `0x451` geometry as authoritative and the record body as the field model.
+The leading `scaled_w/h`, `backing_w/h` are the first record's bounds rects; the two `3ff0000000000000` doubles in the live sample are the **scale factors (1.0)**, not refresh-Hz. The record body model comes from the sender. There is a minor offset discrepancy between the a recent macOS build disassembly and the live-host bytes near the geometry leader (likely version skew) — treat the live `0x451` geometry as authoritative and the record body as the field model.
 - **Media-path obligation.** When this message arrives mid-session **on the media (HEVC) path** as the answer to a viewer-initiated resolution change (§10.9), framebuffer sizing is **not sufficient** — the viewer MUST follow it with a `MediaStreamOptions` (`0x1c`) re-offer to make the server resize the encoder canvas. A viewer that resizes its local framebuffer but never re-offers will see the media stream stall (the server emits the `0x451` and then stops sending media). On the pure framebuffer path this message is purely a sizing action with no re-offer.
 - **Cursor re-arm obligation.** Independently of the media re-offer above — and on **every** `0x451`, including no-geometry-change layout events emitted at a login/lock/agent transition — a client MUST re-arm the server's framebuffer sender by re-sending `AutoFrameBufferUpdate` (`0x09`, §8.11) + a non-incremental `FramebufferUpdateRequest` (`0x03`). Without this the server stops emitting cursor (`0x450`) SELECTs after the transition and the cursor shape freezes on its last value (§8.3, §8.11). Unlike the media re-offer, the re-arm fires on every layout, not only on a geometry change.
 - **Unknown fields**: receiver MUST tolerate and ignore trailing fields it does not interpret.
@@ -738,7 +738,7 @@ The switch to compressed media is gated on completion of the `0x1c` MediaStreamO
 - **Not a protobuf.** The body is a **fixed-layout binary struct** — no varint / field-number decoding. All multi-byte fields are big-endian **except** the host-endian `flags` word (see the Flags bullet below). `screensharingd::sub_1000352ac` `case 0x1c` (`HandleServerMediaStreamConfiguration`) reads the 20-byte header (byteswapping `message_size`/`version`/the three offer-length `u16`s at +0x0a/+0x0c/+0x0e), lifts the `flags` `u32` at +0x06, and forwards the whole body plus the flags to ScreensharingAgent via the `SetMediaStreamConfiguration` MIG RPC. The Agent's `sub_10001c7e4` then re-reads the offer lengths (+0x0a/+0x0c/+0x0e), the UUID (+0x14), and the six 46-byte keys directly from the forwarded body — but takes the flags from the MIG argument, never from body +0x06.
 - **Three streams, not two:** the message carries **audio + video1 + video2** offer blocks (a second video stream, tied to the second-60fps flag bit below). Each stream carries **two 46-byte SRTP key blobs** `key1` then `key2` (six `NSData …length:0x2e` reads in the Agent parser).
 - `key2` is the receive (server→client) key; `key1` is the client→server key. `-[SSUDPSender sendToRemoteAddress:]` sets `setSendMediaKey:` = the ServerToViewer (2nd) blob and `setReceiveMediaKey:` = the ViewerToServer (1st) blob (`0x100008bdc`/`0x100008be8`). Also independently: decrypting captured server→client media with the video `key2` authenticates every packet; `key1` does not.
-- **Flags** are a `u32` at body **+0x06**, read in **host (little-endian) byte order** — *not* big-endian like the `message_size`/`message_version`/offer-length fields. The daemon `screensharingd::sub_1000352ac` (`case 0x1c`) lifts it with an un-byteswapped word load (`ldur w3, [body+6]` @ `0x10003ce84`) and forwards it to ScreensharingAgent as a `SetMediaStreamConfiguration` MIG **argument** (`arg4`), not as part of the body the Agent re-parses; the Agent (`sub_10001c7e4`) then tests it `& 1 / & 2 / & 4 / & 8`. Bit `0x01` = stream-1 60 fps supported; `0x02` = stream-2 60 fps supported (second video stream); `0x04` = do-not-send-cursor; `0x08` = AVC client-name selector (`RemoteDesktopScreenSharing` vs `AppleRemoteDesktop`). Because the field is host-endian, the meaningful bits occupy the **byte at +0x06**: a conforming little-endian client writes `07 00 00 00`, **not** `00 00 00 07`. When `messageVersion ≤ 1` the daemon forces legacy 60 fps by OR-ing `|= 0x03` into that word in place (`orr w8, w8, #3; stur w8, [body+6]` @ `0x10003cdfc`). *(Offset corrected from an earlier revision that placed `flags` at +0x0c — that position is `video1_offer_len`. Confirmed against the 24G231 `screensharingd` (`sub_1000352ac`) and `ScreensharingAgent` (`sub_10001c7e4`) binaries via headless Binary Ninja, plus a packet capture whose length closes exactly at `0x80 + audio_offer_len + 0x5c + video1_offer_len`.)*
+- **Flags** are a `u32` at body **+0x06**, read in **host (little-endian) byte order** — *not* big-endian like the `message_size`/`message_version`/offer-length fields. The daemon `screensharingd::sub_1000352ac` (`case 0x1c`) lifts it with an un-byteswapped word load (`ldur w3, [body+6]` @ `0x10003ce84`) and forwards it to ScreensharingAgent as a `SetMediaStreamConfiguration` MIG **argument** (`arg4`), not as part of the body the Agent re-parses; the Agent (`sub_10001c7e4`) then tests it `& 1 / & 2 / & 4 / & 8`. Bit `0x01` = stream-1 60 fps supported; `0x02` = stream-2 60 fps supported (second video stream); `0x04` = do-not-send-cursor; `0x08` = AVC client-name selector (`RemoteDesktopScreenSharing` vs `AppleRemoteDesktop`). Because the field is host-endian, the meaningful bits occupy the **byte at +0x06**: a conforming little-endian client writes `07 00 00 00`, **not** `00 00 00 07`. When `messageVersion ≤ 1` the daemon forces legacy 60 fps by OR-ing `|= 0x03` into that word in place (`orr w8, w8, #3; stur w8, [body+6]` @ `0x10003cdfc`). *(Offset corrected from an earlier revision that placed `flags` at +0x0c — that position is `video1_offer_len`. Confirmed against the a recent macOS build `screensharingd` (`sub_1000352ac`) and `ScreensharingAgent` (`sub_10001c7e4`) binaries via static disassembly, plus a packet capture whose length closes exactly at `0x80 + audio_offer_len + 0x5c + video1_offer_len`.)*
 - **One UUID, dual-purpose:** there is a single 16-byte UUID at body **+0x14**; it serves as **both** the session identifier and the CallID (the per-stream audio/video CallIDs are derived from it by the Agent, not carried separately). `NSUUID initWithUUIDBytes:` → `setMediaStreamSessionID:`.
 - **Top-level layout** (offsets from the body's first byte = message type):
 
@@ -759,13 +759,13 @@ The switch to compressed media is gated on completion of the `0x1c` MediaStreamO
        46B  video2 key1 ; 46B video2 key2 ; video2_offer (video2_offer_len bytes; present only if non-zero)
 ```
 
-- **Offer/answer state**: client sends `0x1c` offer → server returns `0x1c` answer → media transport begins. The per-stream `*_offer` blobs are passed to AVConference's `AVCMediaStreamNegotiator`; the video offer is a protobuf carrying one codec bank per offered codec, and the server selects the codec by the bank's RTP payload number (§10.7.1) — this is the knob a client uses to choose HEVC vs. AVC. The full answer layout (beyond the canvas geometry the client reads back) remains a **revision gap**. (The `u32` at +0x06 is the `flags` field above, not an unknown word; the `u32` at +0x10 is reserved/zero in every captured offer.)
+- **Offer/answer state**: client sends `0x1c` offer → server returns `0x1c` answer → media transport begins. The per-stream `*_offer` blobs are opaque to the screen-sharing code (passed to AVConference's `AVCMediaStreamNegotiator`); their internal format and the full answer layout remain a **revision gap**. (The `u32` at +0x06 is the `flags` field above, not an unknown word; the `u32` at +0x10 is reserved/zero in every captured offer.)
 
 ### 10.4 UDP Flows and RTP Framing
 
 Two UDP flows relative to the control port `P` (default 5900):
 
-- **`P+1` (5901): video** — RTP payload type `100` (HEVC) **or** `123` (H.264/AVC), depending on the negotiated codec (§10.7.1); the video stream's RTCP is multiplexed on the same port;
+- **`P+1` (5901): video** — RTP payload type `100` (HEVC), with the video stream's RTCP multiplexed on the same port;
 - **`P` (5900): audio** — RTP payload type `101` (AAC-ELD-SBR), with the audio stream's RTCP multiplexed on the same port.
 
 RTCP is rtcp-muxed onto each media port alongside that port's RTP; there is no separate RTCP port. RTCP (PT 200–207) is seen on both 5901 and 5900. Video is delivered as **four RTP streams** on four consecutive SSRCs, each a horizontal tile (§10.7). Each SSRC has an independent sequence space; receivers MUST track the SRTP rollover counter (ROC) **per SSRC**.
@@ -805,37 +805,6 @@ NAL units are ordered across SSRCs by decoding-order number to feed a single dec
 - IDR access units appear only on the **base SSRC** (tile 0); a client SHOULD treat any IDR as a DPB reset for all tiles. Presentation recomposites the four tiles vertically in SSRC order.
 - The exact tile-to-screen geometry rules (strip ordering, CTU padding) beyond the observed four-strip model are a **revision gap**.
 
-### 10.7.1 Codec Negotiation and the AVC / H.264 Alternative (4:2:0)
-
-The video MediaBlob (§10.3) advertises one **codec bank per offered codec**, each keyed by an RTP payload number. The server selects a codec by that number and, when more than one is offered, **prefers HEVC**. Two banks are defined:
-
-- payload **`100` → HEVC** Range Extensions, 4:4:4, 8-bit (§10.7);
-- payload **`123` → H.264 / AVC**.
-
-A client therefore selects the codec by **which bank(s) it advertises**: offering both yields HEVC; offering only the `123` bank forces H.264. The server's H.264 encoder emits **High profile @ L4.2, 4:2:0** — it exposes only the H.264 `Main` / `ConstrainedBaseline` profile levels plus this High path, **none of which is 4:4:4**, so the AVC stream is always 4:2:0. This is the interop path for receivers whose GPU cannot hardware-decode HEVC 4:4:4 (most consumer GPUs decode H.264 / HEVC-Main 4:2:0 in hardware but not HEVC RExt 4:4:4). Confidence: **confirmed** (static analysis of `AVConference` codec/profile tables + live negotiation + live decode of a standalone client).
-
-**Capability-based selection.** Because the choice is made before any video arrives (at offer time), a conforming client SHOULD pick the codec from its own decode capability rather than offer-then-discover: probe whether the local GPU hardware-decodes HEVC 4:4:4 — e.g. attempt a hardware decode of a small 4:4:4 sample with software fallback **disabled**, treating success as support — and advertise the HEVC bank when it does, the AVC bank when it does not. This matters most on Windows (D3D11VA) and Linux (VAAPI), where 4:4:4 decode support varies by GPU generation; macOS VideoToolbox decodes Apple's 4:4:4 stream on all supported Macs.
-
-**Offer protobuf schema.** Each codec bank is a `VCMediaNegotiationBlobVideoPayloadSettings`: field 1 = RTP payload number (`123`/`100`); field 2 = a repeated per-resolution rule sub-message; field 3 = the feature-list string (`FLS;…`); field 4 = `parameterSet`, a 4-bit codec profile-capability mask (AVC = `1`, HEVC = `14`) — **not** a bitrate/resolution/quality knob. Each repeated rule (field 2) is a `VCMediaNegotiationBlobVideoRuleCollection`:
-
-| field | name | meaning |
-|---|---|---|
-| f1 | `transport` | enum, range-checked to `1` (Wi-Fi) or `2` (cellular) |
-| f2 | `operation` | enum, range-checked to `1` (encode) or `2` (decode) |
-| f3 | `formats` | bitmap of supported `(width, fps)` formats; the native screen value is `0xC3C3` |
-| f4 | `preferredFormat` | index into the formats set (`0` natively) |
-| f5 / f6 | `formatsExt1` / `preferredFormatExt1` | optional extension words |
-
-The `formats` bitmap is **field 3, not field 1** — only `transport`/`operation` are the `{1,2}` enums, and `formats` is a free varint (an easy parser mis-read swaps f1/f3). A native screen-share offer emits **only** `transport=1` (no cellular rules): the AVC bank carries four rules `[encode, decode, encode, decode]` and the HEVC bank two rules `[encode, decode]`, every rule with `formats=0xC3C3, preferredFormat=0`. Confidence: **confirmed** — the field map is read from the `AVConference` `VCMediaNegotiationBlobVideoRuleCollection` parser IVAR table (`0x1ecd7a140`) plus its accessors/validator, and a decrypted native "Screen Sharing 5.3" offer is byte-for-byte identical to a conforming client's offer.
-
-The H.264 RTP framing is an Apple variant of RFC 6184 that mirrors the HEVC variant's decoding-order numbering:
-
-- **Parameter sets** are NOT sent as Annex-B SPS/PPS NALs. They arrive once, up front, as an Apple-wrapped **`avc1` sample description embedding an `avcC` box** (the MP4 `AVCDecoderConfigurationRecord`, carrying SPS+PPS). This packet's first byte has the H.264 forbidden-zero-bit set, so it is never confused with a slice NAL; a receiver parses the `avcC` to seed its decoder. A client that assumes in-band Annex-B parameter sets never starts.
-- **Slices** ride in **Fragmentation Unit B (type 29)** with a **2-byte DON** after the FU header (the H.264 analogue of HEVC's DONL). STAP-A/STAP-B aggregation and single-NAL packets follow RFC 6184 with the same DON placement.
-- The four-tile / four-SSRC model, base-SSRC-only IDRs, and single shared-decoder requirement are the **same** as HEVC (§10.7). A shared H.264 decoder fed all four tiles in decoding order decodes every tile; libav emits benign "reference frames exceed max" warnings because the shared DPB pools four tiles' references.
-
-Residual gap: AVC behaviour under mid-session dynamic resolution (§10.9) — re-harvesting a fresh `avcC` after a resize — is unverified.
-
 ### 10.8 RTCP Feedback and Loss Recovery
 
 The captured native client's feedback differs from an alternative client's; both interoperate with the server.
@@ -852,7 +821,7 @@ A client without a live feedback loop (e.g. replaying a capture) cannot recover 
 
 ### 10.9 Dynamic Resolution in Media Mode
 
-The media canvas geometry is **not** fixed for the lifetime of a media session. A viewer changes the resolution mid-session **in-band on the existing connection** — no TCP reconnect, no re-authentication, no record-layer rekey, and the UDP media flow is never torn down. A native resize capture is a single TCP stream over its lifetime with zero additional SYN/RST and continuous UDP video; a Frida trace of the native client shows one RSA operation and one record-layer key setup for the whole session; and an independent client reproduces the exchange live.
+The media canvas geometry is **not** fixed for the lifetime of a media session. A viewer changes the resolution mid-session **in-band on the existing connection** — no TCP reconnect, no re-authentication, no record-layer rekey, and the UDP media flow is never torn down. A native resize capture is a single TCP stream over its lifetime with zero additional SYN/RST and continuous UDP video; a runtime trace of the native client shows one RSA operation and one record-layer key setup for the whole session; and an independent client reproduces the exchange live.
 
 The exchange is **viewer-driven**:
 
@@ -921,9 +890,7 @@ Profile A plus the Adaptive media transport.
 | R-C4 | Decrypt SRTP with AES-256-CTR + HMAC-SHA1-80, tracking ROC per SSRC | MUST | C | decrypt-verify |
 | R-C5 | Depayload HEVC per the Apple RFC 7798 variant (DONL on single/AP/FU) | MUST | C | decode |
 | R-C6 | Feed all four tile SSRCs to a single HEVC decoder; treat any IDR as a DPB reset; composite tiles vertically | MUST | C | decode |
-| R-C7 | Decode HEVC RExt 4:4:4 8-bit (the default-negotiated codec) | MUST | C | decode |
-| R-C7a | Optionally negotiate the AVC bank (payload `123`) and decode H.264 High 4:2:0 — depay per RFC 6184 + Apple DON, seed the decoder from the up-front `avc1`/`avcC` config (§10.7.1) — for receivers without HEVC 4:4:4 hardware decode | MAY | C | decode |
-| R-C7b | When supporting both codecs, select between them from a GPU HEVC-4:4:4 hardware-decode capability probe (§10.7.1) rather than offering both and discovering the result | SHOULD | C | interop |
+| R-C7 | Decode HEVC RExt 4:4:4 8-bit | MUST | C | decode |
 | R-C8 | Emit RTCP receiver feedback and a keyframe request (legacy FIR PT 192 or AVPF FIR) on loss | SHOULD | C | interop |
 | R-C9 | Emit a media keepalive | MAY | C | interop |
 | R-C10 | On media negotiation failure or sustained decode failure, fall back to the framebuffer path (§12) | MUST | C | negative |
@@ -1128,7 +1095,7 @@ EXPECT:
 
 ## Change Log
 
-Derived from packet captures, runtime traces, and static analysis of `screensharingd`, `ScreensharingAgent`, and `AppleVNCServer` (baseline 24G231). Fields not yet established are marked as a revision gap or as unspecified.
+Derived from packet captures, runtime traces, and static analysis of `screensharingd`, `ScreensharingAgent`, and `AppleVNCServer` (baseline a recent macOS build). Fields not yet established are marked as a revision gap or as unspecified.
 
 ### Remaining Revision Gaps
 
