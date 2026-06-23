@@ -40,6 +40,7 @@ _PROBE_TIMEOUT_S: float = 1.5
 # (label, "WxH", optional hidpi). Keep in sync with the old
 # `connect_prompt._RESOLUTION_PRESETS`.
 _RESOLUTION_PRESETS: list[tuple[str, str]] = [
+    ("Auto — track window size",  "auto"),
     ("3840 × 2160 (4K UHD)",   "3840x2160"),
     ("3440 × 1440 (UWQHD)",    "3440x1440"),
     ("2560 × 1600 (WQXGA)",    "2560x1600"),
@@ -72,6 +73,11 @@ class ConnectFormValues:
     # tab) or "desktop" (native wgpu window). Chosen by which Connect button the
     # user presses; persisted so reconnect reuses the same one.
     frontend: str = "browser"
+    # Dynamic resolution: re-render the host to match the viewer window on
+    # resize (the "Auto" resolution pick). When True, `advertise` is only the
+    # initial size. HiDPI scale: "auto" (match local display) / "on" / "off".
+    dynamic_resolution: bool = False
+    hidpi: str = "auto"
 
 
 class ConnectScreen(Screen):
@@ -84,6 +90,8 @@ class ConnectScreen(Screen):
     #form-card {
         width: 70;
         height: auto;
+        max-height: 100%;
+        overflow-y: auto;
         padding: 1 2;
         background: $panel;
         border: round $primary;
@@ -140,8 +148,17 @@ class ConnectScreen(Screen):
             yield Label("Resolution")
             yield Select(
                 options=[(label, key) for label, key in _RESOLUTION_PRESETS],
-                value=self._prefill.advertise,
+                value=("auto" if self._prefill.dynamic_resolution
+                       else self._prefill.advertise),
                 id="resolution",
+                allow_blank=False,
+            )
+            yield Label("HiDPI")
+            yield Select(
+                options=[("Auto (match display)", "auto"),
+                         ("On (2×)", "on"), ("Off (1×)", "off")],
+                value=self._prefill.hidpi,
+                id="hidpi",
                 allow_blank=False,
             )
             with Horizontal(classes="switch-row"):
@@ -252,18 +269,24 @@ class ConnectScreen(Screen):
                 severity="warning", timeout=4,
             )
             return
-        advertise = self.query_one("#resolution", Select).value or _DEFAULT_RESOLUTION
+        res = self.query_one("#resolution", Select).value or _DEFAULT_RESOLUTION
+        # "Auto" = dynamic resolution: track the viewer window. `advertise`
+        # then carries only the initial size (the host re-renders on resize).
+        dynamic = res == "auto"
+        advertise = _DEFAULT_RESOLUTION if dynamic else str(res)
         values = ConnectFormValues(
             host=host,
             user=user,
             password=password,
-            advertise=str(advertise),
+            advertise=advertise,
             audio=self.query_one("#audio", Switch).value,
             curtain=self.query_one("#curtain", Switch).value,
             hdr=self.query_one("#hdr", Switch).value,
             share_console=self.query_one("#share-console", Switch).value,
             alt_session=self.query_one("#alt-session", Switch).value,
             frontend=frontend,
+            dynamic_resolution=dynamic,
+            hidpi=str(self.query_one("#hidpi", Select).value or "auto"),
         )
         self.post_message(self.Connect(values))
 

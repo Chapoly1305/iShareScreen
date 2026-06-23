@@ -61,6 +61,8 @@ def load_last() -> Optional[ConnectFormValues]:
         share_console=bool(data.get("share_console", False)),
         alt_session=bool(data.get("alt_session", False)),
         frontend=str(data.get("frontend", "browser")),
+        dynamic_resolution=bool(data.get("dynamic_resolution", False)),
+        hidpi=str(data.get("hidpi", "auto")),
     )
 
 
@@ -80,6 +82,8 @@ def save_last(values: ConnectFormValues) -> None:
             "share_console": values.share_console,
             "alt_session": values.alt_session,
             "frontend": values.frontend,
+            "dynamic_resolution": values.dynamic_resolution,
+            "hidpi": values.hidpi,
         }
         p.write_text(json.dumps(data, indent=2))
         try:

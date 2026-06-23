@@ -199,6 +199,8 @@ class IssTuiApp(App):
             hdr=form.hdr,
             share_console=form.share_console,
             alt_session=form.alt_session,
+            dynamic_resolution=form.dynamic_resolution,
+            hidpi=form.hidpi,
             verbose=int(self._cli_viewer_flags.get("verbose", 0) or 0),
             log_file=self._cli_viewer_flags.get("log_file"),
         )

@@ -53,6 +53,8 @@ class ViewerArgs:
     hdr: bool = False
     share_console: bool = False
     alt_session: bool = False
+    dynamic_resolution: bool = False  # "Auto" resolution: re-render host on resize
+    hidpi: str = "auto"               # "auto" | "on" | "off"
     port: int = 5900
     auth: str = "srp"
     verbose: int = 0           # -v count to forward to worker
@@ -195,6 +197,10 @@ class Supervisor:
         ]
         argv += ["--audio"] if args.audio else ["--no-audio"]
         argv += ["--curtain"] if args.curtain else ["--no-curtain"]
+        # "Auto" resolution → --dynamic (host re-renders to the viewer window);
+        # a fixed WxH → --no-dynamic. HiDPI scale forwarded explicitly.
+        argv += ["--dynamic"] if args.dynamic_resolution else ["--no-dynamic"]
+        argv += ["--hidpi", args.hidpi]
         if args.hdr:
             argv.append("--hdr")
         if args.share_console:
