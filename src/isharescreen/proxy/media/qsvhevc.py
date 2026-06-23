@@ -131,6 +131,8 @@ class QsvHevcDecoder:
         # regardless of decode latency or any reordering.
         self._next_pts = 0
         self._pts_to_tile: dict[int, int] = {}
+        self._pts_submit_t: dict[int, float] = {}
+        self._decode_latency_ms: float = 0.0   # EMA; 0.0 until first frame
 
         self._queue: Optional[queue.Queue] = None
         self._worker: Optional[threading.Thread] = None
@@ -216,6 +218,8 @@ class QsvHevcDecoder:
             # teardown without triggering the flush code path.
             self._codec = None
         self._pts_to_tile = {}
+        self._pts_submit_t = {}
+        self._decode_latency_ms = 0.0
         self._next_pts = 0
         self._au_buf = bytearray()
         self._gate.reset()
@@ -344,12 +348,15 @@ class QsvHevcDecoder:
         codec = self._codec
         if codec is None:
             return
+        import time as _time
         pts = self._next_pts
         self._next_pts += 1
         self._pts_to_tile[pts] = tile_idx
+        self._pts_submit_t[pts] = _time.monotonic()
         if len(self._pts_to_tile) > 256:
             cutoff = pts - 128
             self._pts_to_tile = {k: v for k, v in self._pts_to_tile.items() if k > cutoff}
+            self._pts_submit_t = {k: v for k, v in self._pts_submit_t.items() if k > cutoff}
         pkt = av.Packet(au)
         pkt.pts = pkt.dts = pts
         pkt.time_base = Fraction(1, 90000)
@@ -370,9 +377,16 @@ class QsvHevcDecoder:
             log.debug("qsv decode error (tile %d): %s", tile_idx, e)
 
     def _publish_frame(self, frame: av.VideoFrame) -> None:
+        import time as _time
         ti = self._pts_to_tile.pop(frame.pts, None)
+        submit_t = self._pts_submit_t.pop(frame.pts, None)
         if ti is None:
             return
+        if submit_t is not None:
+            latency_ms = (_time.monotonic() - submit_t) * 1000
+            # EMA with α=0.1 — ~10-frame smoothing window (~42 ms at 240 AU/s).
+            self._decode_latency_ms = (0.1 * latency_ms
+                                       + 0.9 * self._decode_latency_ms)
         if not self._dpb_has_idr:
             self._dpb_has_idr = True
         # Convert av.VideoFrame → TileFrame (pure Python bytes) while still
@@ -425,6 +439,26 @@ class QsvHevcDecoder:
 
     def tile_state(self, tile_idx: int) -> TileVisState:
         return self._gate.tile_state(tile_idx)
+
+    @property
+    def decode_latency_ms(self) -> float:
+        """EMA of time from AU submit to frame output (ms). Reflects async
+        pipeline depth: async_depth=1 ≈ hardware decode time; higher values
+        ≈ hardware decode time + (depth-1) × frame interval."""
+        return self._decode_latency_ms
+
+    @property
+    def decode_queue_depth(self) -> int:
+        q = self._queue
+        return q.qsize() if q is not None else 0
+
+    @property
+    def decode_queue_cap(self) -> int:
+        return _QUEUE_MAX
+
+    @property
+    def decode_queue_drops(self) -> int:
+        return self._queue_full_drops
 
     @property
     def hw_accel(self) -> Optional[str]:

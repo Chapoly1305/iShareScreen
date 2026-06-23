@@ -110,6 +110,9 @@ class AvcDecoder:
 
         self._next_pts = 0
         self._pts_to_tile: dict[int, int] = {}
+        self._pts_submit_t: dict[int, float] = {}
+        self._decode_latency_ms: float = 0.0
+        self._queue_full_drops: int = 0
         self._eagain_streak = 0
         self._dpb_has_idr = False
         self._burst_cache: dict[int, list[bytes]] = {}
@@ -248,6 +251,23 @@ class AvcDecoder:
         return self._hw_name
 
     @property
+    def decode_latency_ms(self) -> float:
+        return self._decode_latency_ms
+
+    @property
+    def decode_queue_depth(self) -> int:
+        q = self._queue
+        return q.qsize() if q is not None else 0
+
+    @property
+    def decode_queue_cap(self) -> int:
+        return _QUEUE_MAX
+
+    @property
+    def decode_queue_drops(self) -> int:
+        return self._queue_full_drops
+
+    @property
     def good_counts(self) -> list[int]:
         return [t.good_count for t in self._tiles]
 
@@ -317,10 +337,13 @@ class AvcDecoder:
         pts = self._next_pts
         pkt.pts = pkt.dts = pts
         self._pts_to_tile[pts] = tile_idx
+        import time as _time
+        self._pts_submit_t[pts] = _time.monotonic()
         self._next_pts += 1
         if len(self._pts_to_tile) > _PTS_MAP_SOFT_MAX:
             cutoff = pts - _PTS_MAP_PRUNE_KEEP
             self._pts_to_tile = {k: v for k, v in self._pts_to_tile.items() if k > cutoff}
+            self._pts_submit_t = {k: v for k, v in self._pts_submit_t.items() if k > cutoff}
 
         try:
             with self._codec_lock:
@@ -349,8 +372,13 @@ class AvcDecoder:
 
     def _publish_frame(self, frame: av.VideoFrame) -> None:
         ti = self._pts_to_tile.pop(frame.pts, None)
+        submit_t = self._pts_submit_t.pop(frame.pts, None)
         if ti is None:
             return
+        if submit_t is not None:
+            import time as _time
+            latency_ms = (_time.monotonic() - submit_t) * 1000
+            self._decode_latency_ms = 0.1 * latency_ms + 0.9 * self._decode_latency_ms
         slot = self._tiles[ti]
         with slot.lock:
             slot.raw_frame = frame
@@ -497,6 +525,8 @@ class AvcDecoder:
         self._seen_fmts.clear()
         self._next_pts = 0
         self._pts_to_tile = {}
+        self._pts_submit_t = {}
+        self._decode_latency_ms = 0.0
         log.info("H.264 decoder: shared context (%s)", hw_name or "software")
         if _nalu_dump_f is not None:
             _nalu_dump_f.write(self._build_extradata())
@@ -544,6 +574,8 @@ class AvcDecoder:
         self._reformatter[0] = None
         self._next_pts = 0
         self._pts_to_tile = {}
+        self._pts_submit_t = {}
+        self._decode_latency_ms = 0.0
         self._dpb_has_idr = False
         self._pre_idr_drops = 0
 
