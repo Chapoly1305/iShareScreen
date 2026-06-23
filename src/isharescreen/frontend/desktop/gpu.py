@@ -183,6 +183,14 @@ class Renderer:
             "visibility": wgpu.ShaderStage.FRAGMENT,
             "texture": {"sample_type": wgpu.TextureSampleType.float, "view_dimension": "2d"},
         }
+        # Captured for the lazy nv24 (biplanar) pipeline build — see
+        # _ensure_biplanar. It's deferred until the first nv24 tile so platforms
+        # that only ever hit the planar yuv444p path (every non-Mac build, where
+        # libav emits yuv444p) never compile WGSL_BIPLANAR — whose nv24 shader
+        # some GPU backends (notably d3d on Windows) can't translate.
+        self._surface_format = surface_format
+        self._sampler = sampler
+        self._tex_entry = tex_entry
 
         # ── planar pipeline: Y + U + V (3× r8unorm) ─────────────────────
         planar_shader = device.create_shader_module(code=WGSL)
@@ -211,11 +219,24 @@ class Renderer:
             ],
         )
 
-        # ── biplanar pipeline: Y (r8) + interleaved UV (rg8) ────────────
+        # nv24 (biplanar) pipeline is built lazily on the first nv24 tile —
+        # see _ensure_biplanar. Stays None on platforms that never see nv24.
+        self._pipeline_biplanar = None
+        self._bind_biplanar = None
+
+    def _ensure_biplanar(self) -> None:
+        """Lazily build the nv24 (Y r8 + interleaved-UV rg8) render pipeline on
+        first use. Deferred from __init__ so platforms that only ever hit the
+        planar yuv444p path never compile WGSL_BIPLANAR — some GPU backends
+        (notably d3d on Windows) can't translate its nv24 shader, and failing
+        there for a pipeline they'll never use is pointless. Idempotent."""
+        if self._pipeline_biplanar is not None:
+            return
+        device = self._device
         biplanar_shader = device.create_shader_module(code=WGSL_BIPLANAR)
         biplanar_layout = device.create_bind_group_layout(entries=[
-            {"binding": 0, **tex_entry},
-            {"binding": 1, **tex_entry},
+            {"binding": 0, **self._tex_entry},
+            {"binding": 1, **self._tex_entry},
             {"binding": 2, "visibility": wgpu.ShaderStage.FRAGMENT, "sampler": {}},
         ])
         self._pipeline_biplanar = device.create_render_pipeline(
@@ -223,7 +244,7 @@ class Renderer:
             vertex={"module": biplanar_shader, "entry_point": "vs"},
             fragment={
                 "module": biplanar_shader, "entry_point": "fs",
-                "targets": [{"format": surface_format}],
+                "targets": [{"format": self._surface_format}],
             },
             primitive={"topology": wgpu.PrimitiveTopology.triangle_list},
         )
@@ -232,7 +253,7 @@ class Renderer:
             entries=[
                 {"binding": 0, "resource": self._y_tex.create_view()},
                 {"binding": 1, "resource": self._uv_tex.create_view()},
-                {"binding": 2, "resource": sampler},
+                {"binding": 2, "resource": self._sampler},
             ],
         )
 
@@ -260,6 +281,8 @@ class Renderer:
         # flips mid-stream.
         if self._mode is None:
             self._mode = "biplanar" if tile.is_nv12_passthrough else "planar"
+            if self._mode == "biplanar":
+                self._ensure_biplanar()
         origin = (0, origin_y, 0)
 
         y = np.frombuffer(tile.y, dtype=np.uint8)
