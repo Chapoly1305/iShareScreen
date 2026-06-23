@@ -81,11 +81,6 @@ def _make_parser() -> argparse.ArgumentParser:
     )
     g.add_argument("--port", type=int, default=5900, help="TCP port (default 5900)")
     g.add_argument(
-        "--codec", choices=["hevc", "avc"], default=None,
-        help="Video codec: hevc = Apple's HEVC 4:4:4 (default; best quality, "
-        "needs 4:4:4 HW or fast CPU); avc = H.264 4:2:0 (hardware-decodable on "
-        "Windows/Linux where 4:4:4 isn't, ~5x bitrate of HEVC)")
-    g.add_argument(
         "--auth", choices=("srp", "nonsrp"), default="srp",
         help="authentication mode (default srp; falls back to nonsrp on rejection)",
     )
@@ -392,7 +387,7 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
     # browser (default): H.264 pass-through needs the AVC codec path. The
     # Session reads ISS_VIDEO_CODEC at construction, so force it unless the
     # user explicitly chose a codec.
-    if args.codec is None:
+    if args.codec == "auto":
         os.environ["ISS_VIDEO_CODEC"] = "avc"
     # Use the cursor pseudo-encoding (RFB enc 1104), same as the wgpu viewer:
     # the daemon does NOT bake the cursor into the framebuffer, it sends cursor
@@ -421,7 +416,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if getattr(args, "decoder", "auto") and args.decoder != "auto":
         import os as _os
         _os.environ["ISS_DECODER"] = args.decoder
-    if args.codec:
+    if args.codec and args.codec != "auto":
         os.environ["ISS_VIDEO_CODEC"] = args.codec
     signal.signal(signal.SIGINT, signal.default_int_handler)
 
