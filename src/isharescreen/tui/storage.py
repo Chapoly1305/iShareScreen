@@ -61,6 +61,7 @@ def load_last() -> Optional[ConnectFormValues]:
         hidpi=str(data.get("hidpi", "auto")),
         share_console=bool(data.get("share_console", False)),
         alt_session=bool(data.get("alt_session", False)),
+        decoder=str(data.get("decoder", "auto")),
     )
 
 
@@ -80,6 +81,7 @@ def save_last(values: ConnectFormValues) -> None:
             "hidpi": values.hidpi,
             "share_console": values.share_console,
             "alt_session": values.alt_session,
+            "decoder": values.decoder,
         }
         p.write_text(json.dumps(data, indent=2))
         try:
