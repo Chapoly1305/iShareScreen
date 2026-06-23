@@ -951,11 +951,12 @@ class HevcDecoder:
         self._eagain_streak = 0
         q = self._queue
         if q is not None:
-            try:
-                while True:
+            n = q.qsize()
+            for _ in range(n):
+                try:
                     q.get_nowait()
-            except queue.Empty:
-                pass
+                except queue.Empty:
+                    break
 
     def _drain_codec_to_slots(self) -> None:
         """Pull any frames libavcodec has buffered (None packet flush)."""

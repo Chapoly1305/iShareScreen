@@ -9,6 +9,7 @@ daemon thread, folds leaf frames, and splits on-CPU work from blocking waits
 
 Prints a leaf-function histogram (on-CPU only) + a hot-stack list at exit.
 """
+import os
 import sys
 import time
 import threading
@@ -38,7 +39,7 @@ def _sampler():
         for f in list(sys._current_frames().values()):
             if f is None:
                 continue
-            fn = f.f_code.co_filename.rsplit("/", 1)[-1]
+            fn = os.path.basename(f.f_code.co_filename)
             name = f.f_code.co_name
             _leaf_all[(fn, name)] += 1
             if not _is_blocking(fn, name):
@@ -78,7 +79,7 @@ def main():
         return iss_main(sys.argv[1:])
     finally:
         _stop.set()
-        t.join(timeout=1.0)
+        t.join()
         _dump()
 
 
