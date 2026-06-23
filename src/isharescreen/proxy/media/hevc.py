@@ -28,6 +28,7 @@ escalation) lives in `quality_gate.py`.
 """
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import queue
@@ -563,10 +564,14 @@ class HevcDecoder:
         try:
             q.put_nowait((nalu, tile_idx))
         except queue.Full:
-            # Queue overflow — drop. The IDR cache is already loaded so
-            # losing a TRAIL_R rarely matters; the gate will request a
-            # fresh IDR if the lost slice causes a visible artefact.
-            pass
+            # Queue overflow — drop. DIAGNOSTIC: a dropped slice that a
+            # later P-frame references (Apple uses refs ≤8 back) is a
+            # silent wedge trigger, so count + surface it.
+            self._queue_full_drops = getattr(self, "_queue_full_drops", 0) + 1
+            n = self._queue_full_drops
+            if n in (1, 10, 100, 1000) or n % 1000 == 0:
+                log.warning("decoder queue FULL — dropped slice for tile %d "
+                            "(drop count=%d) — worker not keeping up", tile_idx, n)
 
     # -- consumer API --------------------------------------------------
 
@@ -772,7 +777,7 @@ class HevcDecoder:
                 ):
                     log.warning(
                         "%s silent for %d NALUs without output; "
-                        "flushing + waiting for fresh IDRs",
+                        "dropping P-frames + waiting for fresh IDRs (no flush)",
                         self._hw_name or "software", self._silent_nalus,
                     )
                     self._recovery_in_progress = True
@@ -830,13 +835,36 @@ class HevcDecoder:
         self, tile_idx: int, nalu: bytes, exc: Exception,
     ) -> None:
         """Mid-session decode error. We do NOT fall back to software:
-        whatever decoder we picked at startup is the one we keep. A
-        single bad slice — usually from packet loss — can wedge a HW
-        decoder (e.g. D3D11VA/VAAPI) into a bad-data / reconfig-pending
-        state, after which every send_packet returns EAGAIN. The fix is
-        to flush libavcodec's buffers (which propagates a reset to the
-        hwaccel layer when present), drop incoming P-frames until each
-        tile's IDR arrives via FIR, and resume on the same context.
+        whatever decoder we picked at startup is the one we keep.
+
+        Two very different events surface here as a `decode()` raise:
+
+          1. **Transient broken reference chain** (the common case).
+             Runtime traces (`ISS_DPB_TRACE`) show the trigger is a
+             single recent frame from ONE tile that never reached the
+             decoder — a reorder / in-pipeline gap, with `loss_total=0`,
+             *not* an aged-out reference (the missing POC sits ~2 frames
+             behind head). libavcodec conceals it, the sibling tiles keep
+             decoding, and the FIR we raise here pulls a fresh IDR that
+             re-roots the chain within ~one round-trip. Flushing in this
+             case is actively harmful: `flush_buffers()` wipes the whole
+             SHARED DPB — destroying the other three tiles' good
+             references — and `_try_recovery` then drops every P-frame
+             until an IDR that, for tiles 1-3, architecturally never
+             comes, turning a one-frame blip into a multi-second all-tile
+             freeze (the exact restart-loop seen in the field).
+
+          2. **Genuine hwaccel wedge.** A bad slice *can* wedge a HW
+             decoder in a bad-data / reconfig-pending state, after which
+             every send_packet raises with zero output. Only this warrants
+             the escalation to `_try_recovery`.
+
+        We distinguish them by output: any successful publish resets
+        `_eagain_streak` (see `_decode_one`), so a wedge is the only thing
+        that can accumulate `_HWACCEL_SILENT_NALU_LIMIT` consecutive
+        raises with nothing decoded in between. Below that, we just FIR
+        and let the codec conceal — same policy the libav-concealment
+        fast path already uses ("deliberately do NOT call flush_buffers").
         """
         err_no = getattr(exc, "errno", 0) or 0
         log.debug(
@@ -844,43 +872,91 @@ class HevcDecoder:
             tile_idx, err_no, len(nalu), (nalu[0] >> 1) & 0x3F if nalu else -1, exc,
         )
 
-        # First error since the last good publish triggers a recovery
-        # cycle. Subsequent errors during the same cycle are expected
-        # (more EAGAINs land while we wait for the FIR-driven IDRs);
-        # they don't kick off another flush.
-        if not self._recovery_in_progress:
+        # `errno=35` (EAGAIN) from `avcodec_send_packet()` is pure
+        # BACKPRESSURE — the decoder's input queue is full because it hasn't
+        # produced output yet (it is simply slower than real time on this
+        # content, e.g. incompressible 4:4:4 above the HW decoder's
+        # throughput). It is NOT a broken reference chain, so FIR-ing on it
+        # is actively harmful: a FIR pulls a fresh IDR, the single heaviest
+        # NALU to decode, which deepens the backlog → a death spiral that
+        # locks the stream at 0 fps (observed: ~7500 EAGAINs in 45 s under a
+        # 60 Mbps noise load, each spawning a giant-IDR FIR). So on EAGAIN we
+        # do NOT FIR and do NOT pollute `bad_streak`/the gate; we only bump
+        # `_eagain_streak` so a *genuine* wedge — sustained EAGAIN with ZERO
+        # output, since any publish resets the streak in `_decode_one` —
+        # still escalates to the no-flush recovery below.
+        is_backpressure = err_no == errno.EAGAIN
+        if not is_backpressure:
+            # Genuine decode error (bad data / VT malfunction such as
+            # -17694 / -12909): re-root the broken reference chain with a
+            # fresh IDR.
+            self._gate.mark_decode_error(tile_idx)
+        self._eagain_streak += 1
+
+        # Only a sustained wedge (no output for a full source frame's
+        # worth of NALUs) escalates to the DPB-wiping flush.
+        if (not self._recovery_in_progress
+                and self._eagain_streak >= _HWACCEL_SILENT_NALU_LIMIT):
             self._recovery_in_progress = True
+            # A genuine wedge (sustained EAGAIN, zero output) needs a fresh
+            # IDR to re-root. We deliberately did NOT FIR on the individual
+            # EAGAINs above (that storms giant IDRs), so request exactly ONE
+            # here on wedge-entry — otherwise nothing pulls a recovery IDR
+            # until the 15 s session watchdog, leaving a ~14 s freeze.
+            self._gate.mark_decode_error(tile_idx)
             log.warning(
-                "%s decode error (errno=%d) — flushing codec, dropping "
-                "P-frames until fresh IDRs arrive",
-                self._hw_name or "software", err_no,
+                "%s wedged (errno=%d, %d consecutive decode errors, no "
+                "output) — draining backlog + one FIR for a fresh IDR "
+                "(no flush)",
+                self._hw_name or "software", err_no, self._eagain_streak,
             )
             self._try_recovery()
 
-        self._gate.mark_decode_error(tile_idx)
-        self._eagain_streak += 1
-
 
     def _try_recovery(self) -> None:
-        """Reset the codec to a clean state without losing the active
-        decoder context. Calls `flush_buffers()` to clear libavcodec's
-        internal queue (and the hwaccel's wedge state, if any), then
-        clears our per-tile IDR-seen flags so `_decode_one` will drop
-        every P-frame until the next IDR for that tile arrives. The
-        `mark_decode_error` calls in `_handle_decode_error` already
-        triggered FIRs for each tile, so fresh IDRs are on the way."""
-        with self._codec_lock:
-            codec = self._codec
-            if codec is not None:
-                try:
-                    codec.flush_buffers()
-                except Exception as e:
-                    log.debug("flush_buffers failed: %s", e)
+        """Native-aligned wedge recovery — do NOT flush the codec.
+
+        Apple's own viewer (AVConference) never flushes or invalidates
+        its VTDecompressionSession on a decode error: it flags the bad
+        frame, keeps the one session alive, and requests a keyframe
+        (FIR/PLI). We mirror that. `flush_buffers()` wipes the SHARED
+        DPB; because Apple emits IDRs only on tile 0 — and a tile-0 IDR
+        does NOT in practice evict tiles 1-3's reference pictures from
+        the working DPB (see `HevcRpsTracker.commit_decoded`) — wiping
+        the DPB ourselves orphans those tiles: their refs are gone, no
+        per-tile IDR re-roots them, and feeding their next P-frames
+        re-wedges the just-flushed decoder → flush → re-wedge → flush, a
+        self-sustaining cascade (observed: ~13 s of back-to-back
+        `errno=35` flushes that even a full `restart()` couldn't break).
+
+        Instead we just stop feeding P-frames until the next IDR re-roots
+        the DPB (`_dpb_has_idr = False`); the caller has requested a fresh
+        keyframe (FIR) on wedge-entry. The codec's existing reference
+        frames survive, so the tiles that weren't hit resume from their own
+        intact history once the keyframe lands. (No `flush_buffers()`, so
+        the RPS tracker still mirrors the live DPB and must NOT be reset
+        here.)
+
+        We also DRAIN the worker queue: at high bitrate the wedge is a
+        backlog of hundreds of stale P-frames (each re-EAGAIN-ing), and
+        grinding through them all before the incoming IDR is reached is
+        what stretches recovery to ~15 s. Dropping the backlog lets the
+        worker reach the recovery IDR in ~1 RTT. Safe to empty here: this
+        runs on the decode worker thread (via `_decode_one`), the queue's
+        only consumer."""
         self._dpb_has_idr = False
         for slot in self._tiles:
             with slot.lock:
                 slot.saw_idr_since_reset = False
         self._eagain_streak = 0
+        q = self._queue
+        if q is not None:
+            n = q.qsize()
+            for _ in range(n):
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
 
     def _drain_codec_to_slots(self) -> None:
         """Pull any frames libavcodec has buffered (None packet flush)."""

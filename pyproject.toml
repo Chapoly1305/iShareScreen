@@ -57,6 +57,11 @@ dependencies = [
     "rich>=13",
 ]
 
+[project.optional-dependencies]
+# Local test suite — fast, deterministic unit tests that need no remote host,
+# no real decode and no network. `pip install -e .[test]` then `pytest`.
+test = ["pytest>=8"]
+
 [project.scripts]
 iss = "isharescreen.tui.entry:main"
 isharescreen = "isharescreen.tui.entry:main"
@@ -64,6 +69,10 @@ isharescreen = "isharescreen.tui.entry:main"
 [project.urls]
 Homepage = "https://github.com/renegadelink/iShareScreen"
 Issues = "https://github.com/renegadelink/iShareScreen/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/isharescreen"]
