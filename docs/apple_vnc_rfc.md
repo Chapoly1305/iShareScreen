@@ -816,6 +816,18 @@ A client therefore selects the codec by **which bank(s) it advertises**: offerin
 
 **Capability-based selection.** Because the choice is made before any video arrives (at offer time), a conforming client SHOULD pick the codec from its own decode capability rather than offer-then-discover: probe whether the local GPU hardware-decodes HEVC 4:4:4 — e.g. attempt a hardware decode of a small 4:4:4 sample with software fallback **disabled**, treating success as support — and advertise the HEVC bank when it does, the AVC bank when it does not. This matters most on Windows (D3D11VA) and Linux (VAAPI), where 4:4:4 decode support varies by GPU generation; macOS VideoToolbox decodes Apple's 4:4:4 stream on all supported Macs.
 
+**Offer protobuf schema.** Each codec bank is a `VCMediaNegotiationBlobVideoPayloadSettings`: field 1 = RTP payload number (`123`/`100`); field 2 = a repeated per-resolution rule sub-message; field 3 = the feature-list string (`FLS;…`); field 4 = `parameterSet`, a 4-bit codec profile-capability mask (AVC = `1`, HEVC = `14`) — **not** a bitrate/resolution/quality knob. Each repeated rule (field 2) is a `VCMediaNegotiationBlobVideoRuleCollection`:
+
+| field | name | meaning |
+|---|---|---|
+| f1 | `transport` | enum, range-checked to `1` (Wi-Fi) or `2` (cellular) |
+| f2 | `operation` | enum, range-checked to `1` (encode) or `2` (decode) |
+| f3 | `formats` | bitmap of supported `(width, fps)` formats; the native screen value is `0xC3C3` |
+| f4 | `preferredFormat` | index into the formats set (`0` natively) |
+| f5 / f6 | `formatsExt1` / `preferredFormatExt1` | optional extension words |
+
+The `formats` bitmap is **field 3, not field 1** — only `transport`/`operation` are the `{1,2}` enums, and `formats` is a free varint (an easy parser mis-read swaps f1/f3). A native screen-share offer emits **only** `transport=1` (no cellular rules): the AVC bank carries four rules `[encode, decode, encode, decode]` and the HEVC bank two rules `[encode, decode]`, every rule with `formats=0xC3C3, preferredFormat=0`. Confidence: **confirmed** — the field map is read from the `AVConference` `VCMediaNegotiationBlobVideoRuleCollection` parser IVAR table (`0x1ecd7a140`) plus its accessors/validator, and a decrypted native "Screen Sharing 5.3" offer is byte-for-byte identical to a conforming client's offer.
+
 The H.264 RTP framing is an Apple variant of RFC 6184 that mirrors the HEVC variant's decoding-order numbering:
 
 - **Parameter sets** are NOT sent as Annex-B SPS/PPS NALs. They arrive once, up front, as an Apple-wrapped **`avc1` sample description embedding an `avcC` box** (the MP4 `AVCDecoderConfigurationRecord`, carrying SPS+PPS). This packet's first byte has the H.264 forbidden-zero-bit set, so it is never confused with a slice NAL; a receiver parses the `avcC` to seed its decoder. A client that assumes in-band Annex-B parameter sets never starts.

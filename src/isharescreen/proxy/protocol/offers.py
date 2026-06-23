@@ -155,6 +155,24 @@ def _build_mediablob(mode: int, session_id: int, timestamp: int) -> bytes:
     """Build the MediaBlob protobuf. mode 7 = video, mode 8 = audio. Output
     matches Apple's createOffer modulo the dynamic fields."""
     if mode == 7:
+        # Per-resolution VideoRuleCollection sub-message. Field map CONFIRMED
+        # against AVConference.arm64e (15.7.5/24G624): the readFrom: parser's
+        # IVAR-offset table at 0x1ecd7a140 maps each wire field to an IVAR, and
+        # the accessors + dictionaryRepresentation range-checks pin the names:
+        #   f1 = transport       enum, validated != 1 && != 2  (1=wifi, 2=cellular)
+        #   f2 = operation       enum, validated != 1 && != 2  (1=encode, 2=decode)
+        #   f3 = formats         the (width,fps) bitmap; NOT range-checked
+        #   f4 = preferredFormat varint
+        # 0xC3C3 is the formats bitmap, so it belongs in f3 — exactly as below.
+        # Do NOT "move" it to f1: f1 is the transport enum, and any value other
+        # than 1/2 makes selectBestVideoRuleForTransport: find no matching rule
+        # and breaks video. (f1/f3 are easy to read swapped from the parser; the
+        # IVAR table is authoritative.) The two variants differ only in
+        # operation (encode vs decode). Confirmed byte-for-byte against a
+        # decrypted NATIVE Screen Sharing 5.3 offer: AVC bank = 4 rules
+        # [op1,op2,op1,op2], HEVC bank = 2 rules [op1,op2], all transport=1,
+        # formats=0xC3C3 — i.e. native does NOT emit transport=2 (cellular)
+        # rules for screen share, so this layout is verbatim, not a deviation.
         res_entry = _field_varint(1, 1) + _field_varint(2, 1) + _field_varint(3, 50115) + _field_varint(4, 0)
         res_entry_alt = _field_varint(1, 1) + _field_varint(2, 2) + _field_varint(3, 50115) + _field_varint(4, 0)
         # AVC/H.264 bank — RTP PT 123. (4 res entries + field4=1, verbatim
