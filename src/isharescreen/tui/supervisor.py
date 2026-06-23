@@ -47,15 +47,19 @@ class ViewerArgs:
     user: str
     password: str
     advertise: str         # e.g. "1920x1080" or "1920x1200@2"
+    frontend: str = "desktop"   # "browser" | "desktop" — which viewer to launch
     audio: bool = True
     curtain: bool = True
     hdr: bool = False
+    hidpi: str = "auto"        # "auto" | "on" | "off"
     share_console: bool = False
     alt_session: bool = False
     port: int = 5900
     auth: str = "srp"
     verbose: int = 0           # -v count to forward to worker
     log_file: Optional[str] = None  # --log-file to forward to worker
+    codec: Optional[str] = None     # --codec to forward to worker
+    decoder: Optional[str] = None   # --decoder to forward to worker ("auto" → omit)
     extra_env: dict[str, str] = field(default_factory=dict)
 
 
@@ -186,9 +190,15 @@ class Supervisor:
             "--port", str(args.port),
             "--auth", args.auth,
             "--control-socket", sock_path,
+            # Which viewer the connect button chose. Forced explicitly so the
+            # cli's default doesn't override the user's pick. "desktop" is the
+            # native wgpu child the TUI supervises; "browser" launches the
+            # WebTransport bridge (the TUI shows its log incl. the viewer URL).
+            "--frontend", args.frontend,
         ]
         argv += ["--audio"] if args.audio else ["--no-audio"]
         argv += ["--curtain"] if args.curtain else ["--no-curtain"]
+        argv += ["--hidpi", args.hidpi]
         if args.hdr:
             argv.append("--hdr")
         if args.share_console:
@@ -202,6 +212,10 @@ class Supervisor:
         argv += ["-v"] * max(0, args.verbose)
         if args.log_file:
             argv += ["--log-file", args.log_file]
+        if args.codec:
+            argv += ["--codec", args.codec]
+        if args.decoder and args.decoder != "auto":
+            argv += ["--decoder", args.decoder]
         return argv
 
     async def _pump_stderr(self) -> None:

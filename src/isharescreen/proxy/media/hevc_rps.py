@@ -245,11 +245,12 @@ def parse_slice_header_for_rps(
     pps_dependent_slice_segments_enabled: bool = False,
     pps_num_extra_slice_header_bits: int = 0,
     pps_output_flag_present: bool = False,
-) -> Optional[tuple[int, list[tuple[int, bool]]]]:
-    """Parse a slice header up through the short-term RPS. Returns
-    (poc_lsb, list_of_(delta_poc, used_by_curr)). Returns None if the
-    slice is a dependent segment or if parsing fails — callers treat
-    that conservatively (no opinion).
+) -> Optional[tuple[int, list[tuple[int, bool]], int]]:
+    """Parse a slice header up through the short- and long-term RPS.
+    Returns (poc_lsb, list_of_(delta_poc, used_by_curr), num_long_term).
+    `num_long_term` > 0 means the slice references a long-term picture
+    (LTRP in use). Returns None if the slice is a dependent segment or
+    parsing fails — callers treat that conservatively (no opinion).
     """
     try:
         br = BitReader(rbsp_after_nal_header)
@@ -291,7 +292,7 @@ def parse_slice_header_for_rps(
             br.read(2)
 
         if nal_unit_type in IDR_RANGE:
-            return (0, [])  # IDR resets POC; no references
+            return (0, [], 0)  # IDR resets POC; no references
 
         slice_pic_order_cnt_lsb = br.read(sps.log2_max_pic_order_cnt_lsb)
         short_term_ref_pic_set_sps_flag = br.read1()
@@ -309,15 +310,21 @@ def parse_slice_header_for_rps(
             rps = sps.short_term_rps_sets[idx]
         else:
             if not sps.short_term_rps_sets:
-                return (slice_pic_order_cnt_lsb, [])
+                return (slice_pic_order_cnt_lsb, [], 0)
             rps = sps.short_term_rps_sets[0]
-        # We deliberately stop here — long-term refs and the rest of
-        # the slice header don't matter for our missing-reference
-        # check (LTRs are signaled separately and Apple's stream
-        # doesn't seem to use them; if it did we'd just over-FIR).
+        # Long-term reference picture set. Reading just the two LT
+        # counts is enough to detect whether this slice references a
+        # long-term picture — the on-the-wire signal that Apple's
+        # encoder has switched to LTRP (i.e. it is honouring our
+        # RTCP_APP_LTRP acks). num_lt > 0 == "server used an LTR here".
+        num_lt = 0
+        if sps.long_term_ref_pics_present_flag:
+            num_lt_sps = br.read_ue() if sps.num_long_term_ref_pics_sps > 0 else 0
+            num_lt_pics = br.read_ue()
+            num_lt = num_lt_sps + num_lt_pics
         if slice_type == 2:
-            return (slice_pic_order_cnt_lsb, [])  # I-slice, no refs
-        return (slice_pic_order_cnt_lsb, list(rps.deltas))
+            return (slice_pic_order_cnt_lsb, [], num_lt)  # I-slice, no st refs
+        return (slice_pic_order_cnt_lsb, list(rps.deltas), num_lt)
     except Exception as e:
         log.debug("slice header parse failed: %s", e)
         return None
@@ -343,6 +350,9 @@ class HevcRpsTracker:
         self._last_checked_poc: Optional[int] = None
         self.checks = 0
         self.missing_ref_events = 0
+        self.ltr_ref_events = 0  # slices that referenced a long-term picture
+        self.far_ref_events = 0  # slices referencing a POC >=16 frames back
+        self.max_ref_distance = 0  # largest back-distance seen (frames)
 
     def reset(self) -> None:
         self._seen_pocs.clear()
@@ -357,11 +367,14 @@ class HevcRpsTracker:
             stripped = remove_emulation_prevention(sps_rbsp)
             self.sps = parse_sps(stripped)
             log.info(
-                "hevc_rps: SPS log2_max_poc_lsb=%d pic=%dx%d num_st_rps=%d",
+                "hevc_rps: SPS log2_max_poc_lsb=%d pic=%dx%d num_st_rps=%d "
+                "long_term_present=%s num_lt_sps=%d",
                 self.sps.log2_max_pic_order_cnt_lsb,
                 self.sps.pic_width_in_luma_samples,
                 self.sps.pic_height_in_luma_samples,
                 self.sps.num_short_term_ref_pic_sets,
+                self.sps.long_term_ref_pics_present_flag,
+                self.sps.num_long_term_ref_pics_sps,
             )
         except Exception as e:
             log.warning("hevc_rps: SPS parse failed: %s", e)
@@ -395,7 +408,15 @@ class HevcRpsTracker:
         )
         if result is None:
             return set()
-        poc_lsb, deltas = result
+        poc_lsb, deltas, num_lt = result
+        if num_lt > 0:
+            self.ltr_ref_events += 1
+            if self.ltr_ref_events in (1, 10, 50, 200, 1000, 5000):
+                log.info(
+                    "server is using LTRP: %d slices referenced a long-term "
+                    "picture (encoder honouring our LTR acks)",
+                    self.ltr_ref_events,
+                )
         max_poc_lsb = 1 << self.sps.log2_max_pic_order_cnt_lsb
         # POC MSB derivation (ITU-T H.265 8.3.1). Update parser state
         # so the next slice's MSB derivation is consistent.
@@ -428,6 +449,26 @@ class HevcRpsTracker:
                 missing.add(ref_poc)
         if missing:
             self.missing_ref_events += 1
+        # LTRP-via-short-term detection: Apple's SPS disables HEVC long-term
+        # refs (long_term_present=False), so a recovery that points at an
+        # acked older frame must show up as a short-term ref with an
+        # unusually large back-distance. Normal Apple P-slices reference the
+        # last ~7 POCs; a back-distance well beyond that is the signature of
+        # the encoder reaching for an older (LTR-style) reference.
+        used_dists = [abs(d) for d, used in deltas if used]
+        if used_dists:
+            far = max(used_dists)
+            if far > self.max_ref_distance:
+                self.max_ref_distance = far
+            if far >= 16:
+                self.far_ref_events += 1
+                if self.far_ref_events in (1, 10, 50, 200, 1000):
+                    log.info(
+                        "long-distance reference: %d slices referenced a POC "
+                        ">=16 frames back (max back-distance=%d) — LTR-style "
+                        "recovery reference",
+                        self.far_ref_events, self.max_ref_distance,
+                    )
         return missing
 
     def commit_decoded(self) -> None:

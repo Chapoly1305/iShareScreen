@@ -23,11 +23,20 @@ shows up in ``ps`` and shell history.
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import faulthandler
 import logging
+import os
 import signal
 import sys
 import time
 from typing import Optional
+
+# Enable faulthandler early so that native-thread crashes (e.g. QSV worker,
+# GPU renderer) print a Python traceback (or at least register the fault) to
+# stderr before the process dies. Works best for faults on a thread that holds
+# the GIL; for pure-native-thread crashes it at least lets WER catch the dump.
+faulthandler.enable()
 
 from . import __version__
 from .proxy.protocol.negotiation import AdvertiseDims
@@ -75,20 +84,77 @@ def _make_parser() -> argparse.ArgumentParser:
         "--auth", choices=("srp", "nonsrp"), default="srp",
         help="authentication mode (default srp; falls back to nonsrp on rejection)",
     )
+    g.add_argument(
+        "--frontend", choices=("browser", "desktop"), default="browser",
+        help="browser = WebTransport+WebCodecs in a browser tab, H.264 "
+        "pass-through (default); desktop = native wgpu/Qt window",
+    )
+    g.add_argument(
+        "--bridge-port", type=int, default=4433,
+        help="browser frontend: WebTransport/HTTP3 listen port (default 4433)",
+    )
 
     g = p.add_argument_group("display")
     g.add_argument(
-        "--advertise", metavar="WxH[@HIDPI]", default=None,
+        "--advertise", metavar="WxH[@HIDPI]|auto", default=None,
         help=(
             "virtual display geometry advertised to the host "
-            "(e.g. '2560x1440' or '1920x1200@2'). When omitted, the "
-            "interactive prompt asks for a resolution preset "
-            "(default 1920x1200)."
+            "(e.g. '2560x1440' or '1920x1200@2'). 'auto' (the default "
+            "when omitted) sizes the virtual display to the local viewer "
+            "window/monitor and tracks resizes (see --dynamic)."
+        ),
+    )
+    g.add_argument(
+        "--dynamic", action=argparse.BooleanOptionalAction, default=None,
+        help=(
+            "re-advertise the host's virtual display to match the viewer "
+            "window whenever it's resized, so the remote re-renders sharp "
+            "instead of stretching. Each change is a brief media-session "
+            "restart. Defaults on when --advertise is 'auto'/omitted, off "
+            "for an explicit WxH (use --dynamic to force-enable, "
+            "--no-dynamic to pin a fixed canvas)."
         ),
     )
     g.add_argument(
         "--hdr", action="store_true",
         help="advertise HDR-capable viewer to the host",
+    )
+    g.add_argument(
+        "--hidpi", choices=("auto", "on", "off"), default="auto",
+        help=(
+            "HiDPI (Retina) rendering of the host display. 'on' = Retina 2x, "
+            "full quality (up to ~300 Mbps); 'off' = flat 1x quality (up to "
+            "~60 Mbps); 'auto' (default) = match the local display (2x on a "
+            "Retina client, 1x otherwise; downgrades to 1x when 2x wouldn't fit "
+            "the host backing cap)"
+        ),
+    )
+    g.add_argument(
+        "--codec", choices=("auto", "hevc", "avc"), default="auto",
+        help=(
+            "video codec to negotiate with the host. 'auto' (default) probes "
+            "whether this GPU can hardware-decode HEVC 4:4:4 and uses it if so, "
+            "otherwise falls back to H.264 4:2:0. 'hevc' = force Apple HEVC RExt "
+            "4:4:4 (best quality; slow CPU fallback on GPUs without 4:4:4 HW "
+            "decode). 'avc' = force H.264 High 4:2:0 (lower quality, but "
+            "hardware-decodes on virtually any GPU: D3D11VA / VAAPI / "
+            "VideoToolbox)."
+        ),
+    )
+    g.add_argument(
+        "--decoder", metavar="NAME", default="auto",
+        help=(
+            "video decoder to use. 'auto' (default) picks the best available "
+            "decoder for the negotiated codec; or force one by name — "
+            "vt-hevc444 / libav-hevc444 / qsv-hevc444 / libav-avc420 (legacy "
+            "aliases vt / qsv / libav also accepted). Run --list-decoders to "
+            "see the matrix and which are available on this machine."
+        ),
+    )
+    g.add_argument(
+        "--list-decoders", action="store_true",
+        help=("print the decoder capability matrix (with live availability on "
+              "this machine) and exit"),
     )
     g.add_argument(
         "--curtain", action=argparse.BooleanOptionalAction, default=True,
@@ -145,6 +211,17 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
     g.add_argument(
+        "--record", metavar="PATH", default=None,
+        help=(
+            "capture the whole session to a libpcap file at PATH. Every byte "
+            "on the TCP control socket and the two UDP media sockets is "
+            "written exactly as it goes on the wire (still encrypted), with "
+            "synthetic Ethernet/IP/TCP|UDP framing — byte-identical to a "
+            "tcpdump capture. Open it in Wireshark or feed it to the Python "
+            "dissector (the connect log prints the exact decode command)."
+        ),
+    )
+    g.add_argument(
         "--auto-quit-secs", type=int, default=0,
         help=(
             "exit after N seconds. In --headless mode, this is the smoke-test "
@@ -158,13 +235,15 @@ def _make_parser() -> argparse.ArgumentParser:
 # ── value parsing ────────────────────────────────────────────────────
 
 def _parse_advertise(spec: Optional[str]) -> Optional[AdvertiseDims]:
-    if not spec:
+    # None / "" / "auto" all mean "no fixed geometry" — the desktop viewer
+    # auto-detects from the local monitor and (by default) tracks resizes.
+    if not spec or spec.strip().lower() == "auto":
         return None
     geom_part, _, hidpi_part = spec.partition("@")
     try:
         w_str, h_str = geom_part.lower().split("x", 1)
         width, height = int(w_str), int(h_str)
-        hidpi = int(hidpi_part) if hidpi_part else 1
+        hidpi = int(hidpi_part) if hidpi_part else 2
     except ValueError as e:
         raise SystemExit(
             f"invalid --advertise value {spec!r}: expected 'WxH' or 'WxH@HIDPI' ({e})"
@@ -213,6 +292,25 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
     use goes through `isharescreen.tui` instead."""
     cli_password = _password_from_args(args)
     cli_advertise = _parse_advertise(args.advertise)
+    # For a fixed --advertise WxH, the --hidpi mode determines the backing
+    # scale (the auto/dynamic path resolves this in the frontend instead).
+    # 'on' → 2×, 'off' → 1×, 'auto' → 2× when the 2× backing fits the host's
+    # 3840×2160 cap (logical ≤ 1920×1080), else 1×.
+    if cli_advertise is not None:
+        w, h = cli_advertise.width, cli_advertise.height
+        if args.hidpi == "off":
+            scale = 1
+        elif args.hidpi == "on":
+            scale = 2
+        else:  # auto
+            scale = 2 if (w * 2 <= 3840 and h * 2 <= 2160) else 1
+        cli_advertise = dataclasses.replace(cli_advertise, hidpi_scale=scale)
+    # Dynamic resolution: explicit --dynamic/--no-dynamic wins; otherwise
+    # default it on exactly when no fixed geometry was given (advertise is
+    # 'auto'/omitted ⇒ cli_advertise is None).
+    dynamic_resolution = (
+        args.dynamic if args.dynamic is not None else cli_advertise is None
+    )
     missing = [
         label for label, value in
         (("--host", args.host), ("-u/--user", args.user),
@@ -229,11 +327,15 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
         username=args.user, password=cli_password or "",
         auth_mode=args.auth,
         advertise=cli_advertise,
+        dynamic_resolution=dynamic_resolution,
         hdr=args.hdr,
+        hidpi=args.hidpi,
+        video_codec=args.codec,
         curtain=args.curtain,
         audio=args.audio,
         share_console=args.share_console, alt_session=args.alt_session,
         control_socket=args.control_socket,
+        record_pcap=args.record,
     )
 
 
@@ -276,9 +378,29 @@ def _run_smoke(config: SessionConfig, args: argparse.Namespace) -> int:
 
 
 def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
-    """Open the desktop viewer."""
-    from isharescreen.frontend.desktop.app import run as run_desktop
-    return run_desktop(config, auto_quit_secs=args.auto_quit_secs)
+    """Open the selected frontend. Default is the browser (WebTransport +
+    WebCodecs, H.264 pass-through) since every machine has a browser; the
+    native wgpu/desktop viewer stays available via --frontend desktop."""
+    if args.frontend == "desktop":
+        from isharescreen.frontend.desktop.app import run as run_desktop
+        return run_desktop(config, auto_quit_secs=args.auto_quit_secs)
+    # browser (default): H.264 pass-through needs the AVC codec path. The
+    # Session reads ISS_VIDEO_CODEC at construction, so force it unless the
+    # user explicitly chose a codec.
+    if args.codec == "auto":
+        os.environ["ISS_VIDEO_CODEC"] = "avc"
+    # Use the cursor pseudo-encoding (RFB enc 1104), same as the wgpu viewer:
+    # the daemon does NOT bake the cursor into the framebuffer, it sends cursor
+    # pixmaps which the browser paints as the canvas CSS cursor. This also means
+    # moving the mouse doesn't dirty the framebuffer / wake the encoder.
+    # ISS_LEGACY_CURSOR=1 reverts to the cursor-in-framebuffer path.
+    # Request a SINGLE picture per frame (tilesPerFrame=1) instead of Apple's
+    # default 4 tiles. Browser WebCodecs can't follow the cross-tile reference
+    # structure of the 4-tile stream (drift/"fleas"); one stream decodes
+    # cleanly with one decoder, no compositing.
+    os.environ.setdefault("ISS_TILES_PER_FRAME", "1")
+    from isharescreen.frontend.wt.server import run as run_browser
+    return run_browser(config, port=args.bridge_port)
 
 
 # ── entry point ──────────────────────────────────────────────────────
@@ -286,6 +408,16 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
 def main(argv: Optional[list[str]] = None) -> int:
     args = _make_parser().parse_args(argv)
     _setup_logging(args)
+
+    if args.list_decoders:
+        from .proxy.media import registry
+        print(registry.describe())
+        return 0
+    if getattr(args, "decoder", "auto") and args.decoder != "auto":
+        import os as _os
+        _os.environ["ISS_DECODER"] = args.decoder
+    if args.codec and args.codec != "auto":
+        os.environ["ISS_VIDEO_CODEC"] = args.codec
     signal.signal(signal.SIGINT, signal.default_int_handler)
 
     # Surface tracebacks for any thread that crashes — without this,

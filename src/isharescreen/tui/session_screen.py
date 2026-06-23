@@ -19,12 +19,39 @@ Layout (full-screen):
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
+import sys
 import time
+from collections import deque
+
+_SELECT_HINT = "M to select/copy text"
+
+
+def _copy_to_system_clipboard(text: str) -> bool:
+    """Put `text` on the LOCAL system clipboard via the OS clipboard tool."""
+    if sys.platform == "darwin":
+        tool = ["pbcopy"]
+    elif sys.platform == "win32":
+        tool = ["clip"]
+    else:
+        tool = next(([t] for t in (["wl-copy"], ["xclip", "-selection", "clipboard"])
+                     if shutil.which(t[0])), None) or None
+        if tool is None:
+            return False
+    if not shutil.which(tool[0]):
+        return False
+    try:
+        subprocess.run(tool, input=text.encode("utf-8"), check=True, timeout=5)
+        return True
+    except Exception:
+        return False
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Deque, Optional, Tuple
 
 from textual.app import ComposeResult
 from textual.binding import Binding
+from textual.css.query import NoMatches
 from textual.containers import Container, Horizontal, Vertical
 from textual.message import Message
 from textual.reactive import reactive
@@ -163,8 +190,25 @@ class RatesPanel(Container):
         self.query_one("#rates-text", Static).update("\n".join(lines))
 
 
+_HISTORY_WINDOW_S: float = 30.0
+
+
+def _stats(window: "Deque[Tuple[float, float]]", now: float) -> Optional[Tuple[float, float, float]]:
+    """Return (min, avg, max) of values in the last 30 s, or None if empty."""
+    vals = [v for t, v in window if now - t <= _HISTORY_WINDOW_S]
+    if not vals:
+        return None
+    return min(vals), sum(vals) / len(vals), max(vals)
+
+
 class HealthPanel(Container):
     """UDP queue depth, drops, cursor age, last-publish age."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        # Rolling 30-second history: (monotonic_time, value)
+        self._lat_hist: Deque[Tuple[float, float]] = deque()
+        self._dq_hist: Deque[Tuple[float, float]] = deque()
 
     def compose(self) -> ComposeResult:
         yield Label("[b]Health[/]")
@@ -177,7 +221,10 @@ class HealthPanel(Container):
         last_publish_age_s: float,
         loss_total: int,
         loss_unmapped: int,
+        decode_latency_ms: Optional[float] = None,
+        decode_queue: Optional[dict] = None,
     ) -> None:
+        now = time.monotonic()
         v = udp_q.get("video", {}); c = udp_q.get("ctrl", {})
         v_drop = v.get("drop", 0); c_drop = c.get("drop", 0)
         cur_age = cursor.get("age_ms", -1)
@@ -186,12 +233,53 @@ class HealthPanel(Container):
         )
         drop_style = "red" if (v_drop + c_drop) > 0 else "green"
         loss_style = "red" if loss_total > 0 else "green"
+
+        # ── dec pipe latency ────────────────────────────────────────
+        if decode_latency_ms is not None and decode_latency_ms > 0:
+            self._lat_hist.append((now, decode_latency_ms))
+        # prune old samples
+        while self._lat_hist and now - self._lat_hist[0][0] > _HISTORY_WINDOW_S:
+            self._lat_hist.popleft()
+        lat_stats = _stats(self._lat_hist, now)
+        if decode_latency_ms is not None and decode_latency_ms > 0:
+            lat_style = "yellow" if decode_latency_ms > 30 else "green"
+            cur_str = f"[{lat_style}]{decode_latency_ms:.1f}[/] ms"
+            if lat_stats:
+                lo, avg, hi = lat_stats
+                cur_str += f"  [dim]↓{lo:.1f} ⌀{avg:.1f} ↑{hi:.1f}[/]"
+            lat_str = cur_str
+        else:
+            lat_str = "[dim]—[/]"
+
+        # ── dec queue depth ─────────────────────────────────────────
+        if decode_queue is not None:
+            dq_depth = decode_queue.get("depth", 0)
+            dq_cap = decode_queue.get("cap", 512)
+            dq_drop = decode_queue.get("drop", 0)
+            self._dq_hist.append((now, float(dq_depth)))
+            while self._dq_hist and now - self._dq_hist[0][0] > _HISTORY_WINDOW_S:
+                self._dq_hist.popleft()
+            pct = dq_depth / dq_cap if dq_cap > 0 else 0
+            filled = round(pct * 10)
+            bar = "█" * filled + "░" * (10 - filled)
+            bar_style = "red" if pct > 0.5 else ("yellow" if pct > 0.1 else "green")
+            drop_str = f"  drop [red]{dq_drop}[/]" if dq_drop > 0 else ""
+            dq_str = f"[{bar_style}]{bar}[/] {dq_depth}/{dq_cap}{drop_str}"
+            dq_stats = _stats(self._dq_hist, now)
+            if dq_stats:
+                lo, avg, hi = dq_stats
+                dq_str += f"  [dim]↓{int(lo)} ⌀{avg:.1f} ↑{int(hi)}[/]"
+        else:
+            dq_str = "[dim]—[/]"
+
         lines = [
             f"udp_q     video [b]{v.get('depth', 0):>4}/{v.get('cap', 0)}[/]  ctrl [b]{c.get('depth', 0):>4}/{c.get('cap', 0)}[/]",
             f"drops     video [{drop_style}]{v_drop}[/]  ctrl [{drop_style}]{c_drop}[/]",
             f"loss      total [{loss_style}]{loss_total}[/]  unmapped [{loss_style}]{loss_unmapped}[/]",
             f"cursor    [b]{cur_age_s}[/] ago  (count {cursor.get('count', 0)})",
             f"publish   {last_publish_age_s:.1f}s ago",
+            f"dec pipe  {lat_str}",
+            f"dec q     {dq_str}",
         ]
         self.query_one("#health-text", Static).update("\n".join(lines))
 
@@ -205,11 +293,10 @@ class _AutoPauseRichLog(RichLog):
 
     Earlier versions tried to detect user scroll-up via mouse / key
     handlers on the widget and auto-pause when scroll_y dropped below
-    max. Both approaches interfered with the terminal's own selection
-    behaviour (Textual receives any mouse event the widget claims, so
-    Shift+drag stops working) — so this widget intentionally adds NO
-    event handlers. Selection works exactly as it does on a stock
-    RichLog: hold Shift and drag.
+    max. That claimed mouse events and broke text selection — so this
+    widget intentionally adds NO event handlers, leaving Textual's native
+    text selection (a plain mouse drag, App.ALLOW_SELECT) intact. Copy the
+    selection with C (SessionScreen.action_copy_log_selection).
 
     The parent `SessionScreen` provides a screen-level key (default
     `space`) that toggles `auto_scroll` directly. `_pending_while_paused`
@@ -217,6 +304,19 @@ class _AutoPauseRichLog(RichLog):
     paused so the title can surface "↓ N new" as a nudge."""
 
     _pending_while_paused: int = 0
+
+    def get_selection(self, selection):
+        """Extract text under a mouse selection. RichLog renders line Strips
+        (not a single Text/Content), so Textual's base Widget.get_selection
+        returns None — meaning drag-select yields nothing. Override it to pull
+        plain text from the rendered strips, the way the Log widget does for
+        its lines. This is what makes click-drag selection actually work in
+        the log window."""
+        try:
+            text = "\n".join(strip.text for strip in self.lines)
+        except Exception:
+            return None
+        return selection.extract(text), "\n"
 
 
 class LogPanel(Container):
@@ -264,18 +364,14 @@ class LogPanel(Container):
             suffix = f"  [reverse yellow] {pending} new — End to jump [/]"
         else:
             suffix = ""
-        # Terminal apps capture the mouse, so in-app drag-select isn't
-        # possible. Most terminals (Windows Terminal, iTerm2, kitty,
-        # gnome-terminal) let you bypass capture with Shift+drag — that
-        # selects text in the terminal layer where the OS copy paths
-        # work. We also surface the P pause key so users with terminals
-        # that *do* let the app capture wheel/drag still have a way to
-        # freeze the stream while they read.
+        # Textual selects text natively on a plain mouse drag (no modifier);
+        # C copies the selection (see action_copy_log_selection). P pauses the
+        # live stream so you can scroll back and select without it scrolling.
         paused = not view.auto_scroll
         state = "[reverse yellow] PAUSED [/]  " if paused else ""
         self.query_one("#log-title", Label).update(
             f"[b]Log[/] {state}[dim](level: {lvl} — L to cycle, "
-            f"P to pause, End to jump, Shift+drag to select)[/]{suffix}"
+            f"P to pause, End to jump, {_SELECT_HINT})[/]{suffix}"
         )
 
     def jump_to_bottom(self) -> None:
@@ -313,6 +409,8 @@ class SessionScreen(Screen):
         Binding("l", "cycle_log_level", "Log level"),
         Binding("p", "toggle_log_pause", "Pause log"),
         Binding("end", "log_bottom", "Log → bottom"),
+        Binding("c", "copy_log_selection", "Copy selection"),
+        Binding("m", "toggle_mouse", "Select mode"),
         Binding("ctrl+b", "bug_snapshot", "Bug snapshot"),
     ]
 
@@ -353,6 +451,8 @@ class SessionScreen(Screen):
         # bloating the snapshot file.
         self._log_ring: list[str] = []
         self._LOG_RING_MAX: int = 1000
+        # Whether we've released the terminal mouse (M) for native selection.
+        self._mouse_released: bool = False
 
     def compose(self) -> ComposeResult:
         yield HeaderBar(id="hdr")
@@ -387,6 +487,8 @@ class SessionScreen(Screen):
             float(data.get("last_publish_age_s", -1)),
             int(data.get("loss_total", 0)),
             int(data.get("loss_unmapped", 0)),
+            decode_latency_ms=data.get("decode_latency_ms"),
+            decode_queue=data.get("decode_q"),
         )
 
     def apply_event(self, kind: str, fields: dict[str, Any]) -> None:
@@ -403,19 +505,30 @@ class SessionScreen(Screen):
         self._log_ring.append(line)
         if len(self._log_ring) > self._LOG_RING_MAX:
             self._log_ring = self._log_ring[-self._LOG_RING_MAX:]
-        self.query_one("#log", LogPanel).append(line)
-        # Bump the header chips so a normal user sees that something
-        # warrants attention even if their eyes are on the wgpu window.
-        lvl, _ = _classify_loglevel(line)
-        if lvl in ("ERROR", "CRITICAL", "FATAL"):
-            hdr = self.query_one("#hdr", HeaderBar)
-            hdr.errors = hdr.errors + 1
-        elif lvl == "WARNING":
-            hdr = self.query_one("#hdr", HeaderBar)
-            hdr.warnings = hdr.warnings + 1
+        # The viewer's exit / stderr callbacks can fire while this screen is
+        # still mounting or already being torn down, when #log / #hdr aren't
+        # in the DOM. The ring above already captured the line; the live
+        # panel + header chips are best-effort, so swallow NoMatches rather
+        # than let it escape the supervisor's on_exit handler.
+        try:
+            self.query_one("#log", LogPanel).append(line)
+            # Bump the header chips so a normal user sees that something
+            # warrants attention even if their eyes are on the wgpu window.
+            lvl, _ = _classify_loglevel(line)
+            if lvl in ("ERROR", "CRITICAL", "FATAL"):
+                hdr = self.query_one("#hdr", HeaderBar)
+                hdr.errors = hdr.errors + 1
+            elif lvl == "WARNING":
+                hdr = self.query_one("#hdr", HeaderBar)
+                hdr.warnings = hdr.warnings + 1
+        except NoMatches:
+            pass
 
     def set_state(self, state: str) -> None:
-        self.query_one("#hdr", HeaderBar).state = state
+        try:
+            self.query_one("#hdr", HeaderBar).state = state
+        except NoMatches:
+            pass
 
     # ── bindings ────────────────────────────────────────────────
 
@@ -437,6 +550,58 @@ class SessionScreen(Screen):
             log_tail=list(self._log_ring),
         ))
 
+    def action_toggle_mouse(self) -> None:
+        """`M` → release / re-grab the terminal mouse. The TUI normally captures
+        the mouse (for scroll/click), which suppresses the terminal's own text
+        selection — and terminals like macOS Terminal.app don't feed Textual the
+        drag events it would need to select itself. Releasing the mouse hands it
+        back to the terminal so you can select log text the normal way (drag,
+        then the terminal's copy — Cmd+C in Terminal.app), exactly like you can
+        anywhere else. Press M again to restore TUI mouse control."""
+        drv = getattr(self.app, "_driver", None)
+        enable = getattr(drv, "_enable_mouse_support", None)
+        disable = getattr(drv, "_disable_mouse_support", None)
+        if enable is None or disable is None:
+            self.notify("mouse toggle not supported on this build", timeout=3)
+            return
+        try:
+            if self._mouse_released:
+                enable()
+                self._mouse_released = False
+                self.notify("mouse restored — TUI controls active", timeout=3)
+            else:
+                disable()
+                self._mouse_released = True
+                self.notify(
+                    "mouse released — select log text with drag + Cmd/Ctrl+C; "
+                    "press M to restore TUI control", timeout=6)
+        except Exception as e:
+            self.notify(f"mouse toggle failed: {e}", timeout=3)
+
+    def action_copy_log_selection(self) -> None:
+        """`C` → copy the mouse-selected text to the clipboard. Drag over the
+        log to select first (RichLog selection works now via the subclass's
+        get_selection). Copies through the local OS clipboard tool (pbcopy on
+        macOS) because Terminal.app has no OSC52, so Textual's own ⌘C copy
+        can't reach the clipboard; we also fire OSC52 for the remote/SSH case."""
+        try:
+            text = self.get_selected_text()
+        except Exception:
+            text = None
+        if not text:
+            self.notify("nothing selected — drag over the log first", timeout=2)
+            return
+        clipped = _copy_to_system_clipboard(text)
+        try:
+            self.app.copy_to_clipboard(text)
+        except Exception:
+            pass
+        self.notify(
+            f"copied {len(text)} chars to clipboard" if clipped
+            else f"selected {len(text)} chars (clipboard tool unavailable)",
+            timeout=2,
+        )
+
     def action_log_bottom(self) -> None:
         """End → jump the log panel back to the latest line and re-arm
         auto-scroll. Used after you've paused + read / selected text and
@@ -445,7 +610,7 @@ class SessionScreen(Screen):
 
     def action_toggle_log_pause(self) -> None:
         """`P` → pause / resume the log panel's auto-scroll. Pausing
-        lets you scroll, read, and Shift+drag-select without the live
+        lets you scroll, read, and bypass-select text without the live
         stream yanking you back to the bottom. Resume snaps to the end
         and clears the pending counter."""
         panel = self.query_one("#log", LogPanel)

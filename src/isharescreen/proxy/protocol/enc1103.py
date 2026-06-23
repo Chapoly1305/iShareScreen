@@ -4,7 +4,9 @@ After non-SRP / SRP authentication the server emits a `1103` encoding entry
 containing 32 cipher-text bytes ECB-wrapped under the auth-derived key. We
 unwrap to a 16-byte AES key + 16-byte CBC IV; from then on every RFB control
 message in either direction is framed and AES-128-CBC encrypted with a
-counter-keyed HMAC-SHA1-160 tag.
+counter-keyed SHA-1-160 tag. NOTE: this is **plain SHA-1**, not HMAC —
+the tag is `SHA1(u32_be(counter) || plaintext-before-tag)` (see
+`encrypt_message`). The "HMAC" naming below was a misnomer.
 
 Wire format on the encrypted channel:
 
@@ -16,7 +18,7 @@ Plaintext payload inside the cipher block:
     u16 BE  msg_length
     bytes   msg
     bytes   pad             (zero pad to 16-byte alignment after the 20-byte mac)
-    bytes   mac             (HMAC-SHA1(counter || everything-before-mac))
+    bytes   mac             (plain SHA1(u32_be(counter) || everything-before-mac); NOT HMAC)
 
 Counter is per-direction, starts at 0, increments on each successful decrypt
 or each encrypt. Decryption tolerates a small lookahead window because Apple
@@ -36,7 +38,7 @@ from Crypto.Cipher import AES
 
 log = logging.getLogger(__name__)
 
-_MAC_LEN = 20  # HMAC-SHA1-160
+_MAC_LEN = 20  # plain SHA-1-160 tag (not HMAC)
 _BLOCK = 16    # AES-128 block size
 _DECRYPT_COUNTER_WINDOW = 6  # forgive up to 6-message gaps from server
 
@@ -67,17 +69,36 @@ class StreamCipher:
         self._dec_ctr = 0
         self._lock = threading.Lock()
 
+    def _encrypt_locked(self, plaintext: bytes) -> bytes:
+        """Encrypt one record. Caller MUST hold `self._lock` — the record
+        counter increment and the returned bytes must stay paired."""
+        counter = self._enc_ctr
+        pad = (-(2 + len(plaintext) + _MAC_LEN)) % _BLOCK
+        framed = struct.pack(">H", len(plaintext)) + plaintext + b"\x00" * pad
+        mac = hashlib.sha1(struct.pack(">I", counter) + framed).digest()
+        block = framed + mac
+        ciphertext = self._enc.encrypt(block)
+        self._enc_ctr = counter + 1
+        return struct.pack(">H", len(ciphertext)) + ciphertext
+
     def encrypt_message(self, plaintext: bytes) -> bytes:
         """Wrap a control-channel message (RFB body) for sending."""
         with self._lock:
-            counter = self._enc_ctr
-            pad = (-(2 + len(plaintext) + _MAC_LEN)) % _BLOCK
-            framed = struct.pack(">H", len(plaintext)) + plaintext + b"\x00" * pad
-            mac = hashlib.sha1(struct.pack(">I", counter) + framed).digest()
-            block = framed + mac
-            ciphertext = self._enc.encrypt(block)
-            self._enc_ctr = counter + 1
-        return struct.pack(">H", len(ciphertext)) + ciphertext
+            return self._encrypt_locked(plaintext)
+
+    def encrypt_and_send(self, sock, plaintext: bytes) -> None:
+        """Encrypt and write to `sock` atomically under the cipher lock.
+
+        Multiple threads send on the same control socket (the input
+        forwarder, the render thread's dynamic-resolution requests, and
+        the TCP-rx thread's post-layout re-offer). `encrypt_message`
+        already serialises the record counter, but if the `sendall` is
+        outside the lock two records can interleave their bytes on the
+        wire under backpressure and desync the server's record framing.
+        Holding the lock across both keeps counter order == wire order."""
+        with self._lock:
+            enc = self._encrypt_locked(plaintext)
+            sock.sendall(enc)
 
     def decrypt_message(self, ciphertext: bytes) -> Optional[bytes]:
         """Decrypt one ciphertext block. Returns the inner RFB body, or None

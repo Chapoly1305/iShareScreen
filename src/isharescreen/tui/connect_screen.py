@@ -2,11 +2,12 @@
 options and posts a `Connect` message when the user submits. Replaces the
 old stdin/stdout `connect_prompt.py`.
 
-Resolution presets mirror the ones the old prompt offered, so users with
-muscle memory for "1920×1080 (FHD)" find the same picks here. The
-default is the same too (`1600 × 900`); the form is laid out so Enter
-on a freshly opened screen connects with sensible defaults the moment
-the host field is filled in.
+The Resolution field defaults to "Auto" — the host's virtual display is
+sized to the local viewer window/monitor and tracks resizes, so users no
+longer have to pick a number to get a good fit. The fixed presets remain
+for anyone who wants to pin one. The form is laid out so Enter on a
+freshly opened screen connects with sensible defaults the moment the host
+field is filled in.
 """
 from __future__ import annotations
 
@@ -37,9 +38,12 @@ _PROBE_DEBOUNCE_S: float = 0.5
 _PROBE_TIMEOUT_S: float = 1.5
 
 
-# (label, "WxH", optional hidpi). Keep in sync with the old
-# `connect_prompt._RESOLUTION_PRESETS`.
+# (label, value). The "auto" value means: size the host's virtual
+# display to the local viewer window/monitor and track resizes (dynamic
+# resolution) — the friendly default, so users no longer have to guess a
+# fixed number. The fixed presets remain for anyone who wants to pin one.
 _RESOLUTION_PRESETS: list[tuple[str, str]] = [
+    ("Auto — match window (dynamic)", "auto"),
     ("3840 × 2160 (4K UHD)",   "3840x2160"),
     ("3440 × 1440 (UWQHD)",    "3440x1440"),
     ("2560 × 1600 (WQXGA)",    "2560x1600"),
@@ -53,7 +57,16 @@ _RESOLUTION_PRESETS: list[tuple[str, str]] = [
     ("1024 ×  768 (XGA)",      "1024x768"),
     (" 800 ×  600 (SVGA)",     "800x600"),
 ]
-_DEFAULT_RESOLUTION = "1920x1080"  # native-FHD = the safest pick
+_DEFAULT_RESOLUTION = "auto"  # auto-detect + dynamic = the friendly default
+
+_DECODER_PRESETS: list[tuple[str, str]] = [
+    ("Auto — best available",                      "auto"),
+    ("Intel QSV  (hevc_qsv, HW)",                 "qsv-hevc444"),
+    ("Generic HW  (d3d11va / vaapi / cuda)",       "libav-hevc444"),
+    ("Software  (CPU, slow)",                      "libav-hevc444-sw"),
+    ("H.264 4:2:0  (AVC legacy)",                 "libav-avc420"),
+]
+_DEFAULT_DECODER = "auto"
 
 
 @dataclass(slots=True)
@@ -66,8 +79,11 @@ class ConnectFormValues:
     audio: bool
     curtain: bool
     hdr: bool
+    hidpi: str          # "auto" | "on" | "off"
     share_console: bool
     alt_session: bool
+    decoder: str = "auto"  # decoder name or "auto"
+    frontend: str = "desktop"  # "browser" or "desktop"
 
 
 class ConnectScreen(Screen):
@@ -93,7 +109,8 @@ class ConnectScreen(Screen):
     .switch-row { padding: 1 0 0 0; height: auto; }
     .switch-row Switch { margin-right: 2; }
     .switch-row Label { padding: 0 1 0 0; }
-    #buttons { padding-top: 1; height: auto; align-horizontal: right; }
+    #frontend-hint { padding-top: 1; text-align: right; }
+    #buttons { padding-top: 0; height: auto; align-horizontal: right; }
     Button { margin-left: 1; }
     """
 
@@ -114,8 +131,10 @@ class ConnectScreen(Screen):
         self._prefill = prefill or ConnectFormValues(
             host="", user="", password="",
             advertise=_DEFAULT_RESOLUTION,
-            audio=True, curtain=True, hdr=False,
+            audio=True, curtain=True, hdr=False, hidpi="auto",
             share_console=False, alt_session=False,
+            decoder=_DEFAULT_DECODER,
+            frontend="desktop",
         )
         self._probe_task: Optional[asyncio.Task] = None
 
@@ -139,6 +158,24 @@ class ConnectScreen(Screen):
                 id="resolution",
                 allow_blank=False,
             )
+            yield Label("HiDPI")
+            yield Select(
+                options=[
+                    ("Auto — match this display (Retina → full, else flat)", "auto"),
+                    ("On — Retina, full quality (up to ~300 Mbps)", "on"),
+                    ("Off — flat quality (up to ~60 Mbps)", "off"),
+                ],
+                value=self._prefill.hidpi,
+                id="hidpi",
+                allow_blank=False,
+            )
+            yield Label("Decoder")
+            yield Select(
+                options=_DECODER_PRESETS,
+                value=self._prefill.decoder,
+                id="decoder",
+                allow_blank=False,
+            )
             with Horizontal(classes="switch-row"):
                 yield Label("Audio"); yield Switch(value=self._prefill.audio, id="audio")
                 yield Label("Curtain"); yield Switch(value=self._prefill.curtain, id="curtain")
@@ -146,9 +183,14 @@ class ConnectScreen(Screen):
             with Horizontal(classes="switch-row"):
                 yield Label("Share console"); yield Switch(value=self._prefill.share_console, id="share-console")
                 yield Label("Alt session"); yield Switch(value=self._prefill.alt_session, id="alt-session")
+            yield Static(
+                "[dim]Browser = open in a browser tab · Desktop = native window[/]",
+                id="frontend-hint",
+            )
             with Horizontal(id="buttons"):
                 yield Button("Quit", id="quit", variant="error")
-                yield Button("Connect", id="connect", variant="success")
+                yield Button("Desktop", id="connect-desktop")
+                yield Button("Browser", id="connect-browser", variant="success")
 
     def on_mount(self) -> None:
         # Kick a probe for whatever host was prefilled (if any).
@@ -160,7 +202,9 @@ class ConnectScreen(Screen):
             if not inp.value:
                 inp.focus()
                 return
-        self.query_one("#connect", Button).focus()
+        # All fields filled: land on the button for the last-used frontend.
+        btn = "connect-desktop" if self._prefill.frontend == "desktop" else "connect-browser"
+        self.query_one(f"#{btn}", Button).focus()
 
     @on(Input.Changed, "#host")
     def _host_changed(self, event: Input.Changed) -> None:
@@ -212,11 +256,16 @@ class ConnectScreen(Screen):
         if idx < len(order) - 1:
             self.query_one(f"#{order[idx + 1]}", Input).focus()
         else:
-            self._submit()
+            # Enter on the password field connects with the last-used frontend.
+            self._submit(self._prefill.frontend)
 
-    @on(Button.Pressed, "#connect")
-    def _connect_clicked(self) -> None:
-        self._submit()
+    @on(Button.Pressed, "#connect-browser")
+    def _connect_browser(self) -> None:
+        self._submit("browser")
+
+    @on(Button.Pressed, "#connect-desktop")
+    def _connect_desktop(self) -> None:
+        self._submit("desktop")
 
     @on(Button.Pressed, "#quit")
     def _quit_clicked(self) -> None:
@@ -225,7 +274,7 @@ class ConnectScreen(Screen):
     def action_quit(self) -> None:
         self.app.exit()
 
-    def _submit(self) -> None:
+    def _submit(self, frontend: str) -> None:
         host = self.query_one("#host", Input).value.strip()
         user = self.query_one("#user", Input).value.strip()
         password = self.query_one("#password", Input).value
@@ -244,8 +293,11 @@ class ConnectScreen(Screen):
             audio=self.query_one("#audio", Switch).value,
             curtain=self.query_one("#curtain", Switch).value,
             hdr=self.query_one("#hdr", Switch).value,
+            hidpi=str(self.query_one("#hidpi", Select).value),
             share_console=self.query_one("#share-console", Switch).value,
             alt_session=self.query_one("#alt-session", Switch).value,
+            decoder=str(self.query_one("#decoder", Select).value or _DEFAULT_DECODER),
+            frontend=frontend,
         )
         self.post_message(self.Connect(values))
 

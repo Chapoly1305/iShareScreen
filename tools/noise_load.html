@@ -1,0 +1,12 @@
+<html><head><meta charset="utf-8"><title>noise load</title><style>
+html,body{margin:0;overflow:hidden;background:#000}canvas{display:block;width:100vw;height:100vh;image-rendering:pixelated}
+</style></head><body><canvas id=c width=1600 height=900></canvas>
+<script>
+// Full-window incompressible RGB noise to saturate the HEVC encoder.
+// setInterval(0) (not rAF) so it keeps running even if the tab is occluded
+// by a screen-sharing display reconfigure during headless tests.
+const c=document.getElementById('c'),x=c.getContext('2d',{willReadFrequently:true});
+const img=x.createImageData(1600,900),a=img.data;
+for(let i=3;i<a.length;i+=4)a[i]=255;
+setInterval(function(){for(let i=0;i<a.length;i+=4){a[i]=Math.random()*256|0;a[i+1]=Math.random()*256|0;a[i+2]=Math.random()*256|0;}x.putImageData(img,0,0);},0);
+</script></body></html>

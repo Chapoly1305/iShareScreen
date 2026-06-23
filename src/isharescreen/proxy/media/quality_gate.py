@@ -84,10 +84,19 @@ class FrameQualityGate:
     # before we conclude the response was lost, while still feeling
     # snappy when a retry is genuinely needed.
     _RE_ARM_INTERVAL_S: float = 1.00
-    # After this many re-emits without seeing recovery, log a warning.
-    # Doesn't stop the loop — a stuck tile can still recover late, and
-    # the user has the F12 manual fallback. ~8 s of attempts.
+    # After this many fast re-emits without seeing recovery, log a warning
+    # once and BACK OFF to the slow interval below — but keep retrying
+    # forever. This is the key to surviving WiFi loss bursts: the host IS
+    # responding (sending IDRs), they're just getting lost, so the moment
+    # the loss subsides the next slow retry recovers automatically. The
+    # old behaviour gave up here (cleared keyframe_required, waited for a
+    # manual force-IDR) which left the stream gray for good after a loss
+    # burst even once the network was fine again. ~8 s of fast attempts.
     _RE_ARM_CAP: int = 8
+    # Retry cadence after the cap: slow enough to not be a FIR storm
+    # (~15/min vs the 1/s fast rate), fast enough to auto-recover within
+    # a few seconds of the loss clearing.
+    _RE_ARM_SLOW_INTERVAL_S: float = 4.00
     # After observing an IDR for a tile, ignore decode errors on that
     # tile for this long. Apple's P-frames already in flight when our
     # FIR was processed reference pre-IDR POCs and will error on
@@ -98,6 +107,22 @@ class FrameQualityGate:
     # forever. 500 ms covers Apple's typical pre-IDR P-frame queue
     # drain on a LAN.
     _POST_IDR_GRACE_S: float = 0.50
+    # Don't declare a tile recovered while the decoder is still actively
+    # concealing. `mark_clean` looks unreliable on HW decoders (d3d11va /
+    # VideoToolbox emit a gray frame with NO per-frame error flag), so a
+    # single "clean"-looking frame after an IDR isn't trustworthy. The
+    # trustworthy signal is libav's "Could not find ref" log, which fires
+    # continuously during gray (dozens / 100 ms, confirmed on d3d11va). So
+    # require that no concealment has been seen for this long before
+    # clearing the recovery flag — which also means we keep FIRing for this
+    # long *after* the concealment log goes quiet. That post-quiet window is
+    # the best-effort handle on the d3d11va "silent wedge" (decoder grays on
+    # VALID 4:4:4 input with NO error signal): the extra IDRs we send in this
+    # window are the only thing that un-wedges it (same as a manual force-IDR).
+    # Kept modest (not seconds) on purpose — a large window would FIR-storm on
+    # the lossy WiFi that triggers this and make loss worse. This is a
+    # mitigation, NOT a cure; the wedge is fundamentally undetectable here.
+    _RECOVERY_QUIET_S: float = 1.50
 
     def __init__(
         self,
@@ -147,6 +172,12 @@ class FrameQualityGate:
         # an IDR are noise from in-flight pre-IDR P-frames draining,
         # not real recovery failures.
         self._idr_observed_at: list[float] = [0.0] * num_tiles
+        # Time of the most recent concealment/decode-error mark, across all
+        # tiles (the shared decoder context recovers as a unit). Powers
+        # `_RECOVERY_QUIET_S`. Updated at the top of `mark_decode_error` —
+        # before the post-IDR grace early-return — so concealment that
+        # continues *through* a failed IDR still counts.
+        self._last_concealment_t: float = 0.0
 
     # -- main "publish" hook --------------------------------------------
     # Always publishes. Kept as a callable for API compatibility with
@@ -165,11 +196,16 @@ class FrameQualityGate:
         """
         if tile_idx < 0 or tile_idx >= self._num_tiles:
             return
+        now = self._time.monotonic()
+        # Record concealment time BEFORE the post-IDR grace return below,
+        # so gray that persists through a failed IDR keeps pushing back the
+        # recovery-quiet window in mark_clean — this is what makes recovery
+        # robust on HW decoders that don't flag concealed frames.
+        self._last_concealment_t = now
         # Post-IDR grace: errors right after the tile's IDR are
         # almost always in-flight pre-IDR P-frames decoding against
         # the freshly-reset DPB. Suppress them so they don't trigger
         # an immediate re-FIR cycle.
-        now = self._time.monotonic()
         if (self._idr_observed_at[tile_idx] > 0
                 and now - self._idr_observed_at[tile_idx]
                     < self._POST_IDR_GRACE_S):
@@ -216,7 +252,8 @@ class FrameQualityGate:
         that parses as `nt=20` but doesn't actually clear the decoder's
         accumulated drift. iss treated those as recovery and stopped
         FIRing, leaving the stream visually stuck on a gray placeholder
-        until F12. When the decoder flags an IDR as suspicious we
+        until a manual force-IDR. When the decoder flags an IDR as
+        suspicious we
         deliberately do NOT add the tile to `_idr_observed`, so
         `mark_clean`'s two-condition discard won't trigger and the
         sticky FIR loop keeps firing until a real IDR arrives.
@@ -232,11 +269,12 @@ class FrameQualityGate:
         if suspicious:
             # Don't add to `_idr_observed` -- `mark_clean`'s two-condition
             # discard won't fire, `keyframe_required` stays sticky, and
-            # `consume_fir_request` keeps issuing FIRs at the natural
-            # `_RE_ARM_INTERVAL_S` cadence until either a real IDR
-            # arrives (recovered) or `_RE_ARM_CAP` attempts are spent
-            # (cap fires, single "gave up" warning, `keyframe_required`
-            # cleared -- user F12 re-arms; next natural IDR also recovers).
+            # `consume_fir_request` keeps issuing FIRs at the
+            # `_RE_ARM_INTERVAL_S` cadence until a real IDR arrives
+            # (recovered); past `_RE_ARM_CAP` attempts it backs off to
+            # the slow cadence but keeps retrying, so a later real IDR
+            # (ours or the encoder's natural one) still recovers it
+            # without any manual force-IDR.
             # We intentionally do NOT reset `_fir_attempts` here: doing so
             # produced an infinite-FIR storm when Apple kept emitting
             # small IDRs (observed in the field as ~60 FIRs/min). The
@@ -259,13 +297,20 @@ class FrameQualityGate:
         state = self._states[tile_idx]
         state.bad_streak = 0
         state.needs_real_frame = False
+        now = self._time.monotonic()
+        # Clear requires THREE things now: an IDR was observed, a frame
+        # published since, AND the decoder has not logged concealment for
+        # `_RECOVERY_QUIET_S`. The quiet gate is what stops a HW decoder's
+        # unflagged gray frame from being mistaken for recovery — while the
+        # screen is gray the "Could not find ref" log keeps firing, so the
+        # window never goes quiet until a real IDR actually lands.
         if (tile_idx in self._keyframe_required
-                and tile_idx in self._idr_observed):
+                and tile_idx in self._idr_observed
+                and now - self._last_concealment_t >= self._RECOVERY_QUIET_S):
             self._keyframe_required.discard(tile_idx)
             self._idr_observed.discard(tile_idx)
             self._fir_attempts[tile_idx] = 0
             self._cap_warned[tile_idx] = False
-            now = self._time.monotonic()
             if now - self._last_rec_log_t[tile_idx] >= self._LOG_THROTTLE_S:
                 log.debug("tile %d recovered (IDR + clean decode)", tile_idx)
                 self._last_rec_log_t[tile_idx] = now
@@ -301,27 +346,48 @@ class FrameQualityGate:
         last tile-0 FIR time."""
         if not self._keyframe_required:
             return set()
+        # Cap already hit: stop emitting FIRs but keep keyframe_required
+        # so _check_stall()'s Path C can detect the persistent stuck state
+        # and escalate to a decoder restart after a cooldown.
+        # force_keyframe_all() (F12) clears this flag to re-arm the loop.
+        if self._cap_warned[0]:
+            return set()
         now = self._time.monotonic()
-        if now - self._fir_last_t[0] < self._RE_ARM_INTERVAL_S:
+        # Past the cap, retry at the slow cadence instead of giving up, so
+        # a stream grayed by a loss burst self-heals the moment the loss
+        # clears (no manual force-IDR needed). `mark_clean` resets `_fir_attempts` on
+        # recovery, dropping us back to the fast cadence.
+        capped = self._fir_attempts[0] >= self._RE_ARM_CAP
+        interval = (self._RE_ARM_SLOW_INTERVAL_S if capped
+                    else self._RE_ARM_INTERVAL_S)
+        if now - self._fir_last_t[0] < interval:
             return set()
         self._fir_last_t[0] = now
         self._fir_attempts[0] += 1
-        if (self._fir_attempts[0] >= self._RE_ARM_CAP
-                and not self._cap_warned[0]):
+        if capped and not self._cap_warned[0]:
             log.warning(
-                "Apple not responding to FIR after %d attempts "
-                "(%d tiles still need recovery); press F12 to retry",
-                self._fir_attempts[0], len(self._keyframe_required),
+                "Host slow to respond to FIR after %d attempts (%d tiles "
+                "still need recovery); backing off to a %.0fs retry until "
+                "it recovers",
+                self._fir_attempts[0] - 1, len(self._keyframe_required),
+                self._RE_ARM_SLOW_INTERVAL_S,
             )
             self._cap_warned[0] = True
-            # Give up: drop everything from keyframe_required so we
-            # stop spamming. F12 re-engages the whole set.
-            self._keyframe_required.clear()
-            self._idr_observed.clear()
+            # Do NOT clear keyframe_required or idr_observed here.
+            # Keeping them lets _check_stall() detect the persistent stall.
             return set()
         return {0}
 
     # -- introspection ---------------------------------------------------
+    @property
+    def bad_tiles(self) -> set[int]:
+        """Tiles the gate currently considers broken (concealing/gray and
+        awaiting recovery). Driven by mark_decode_error, which fires on both
+        the per-frame decode-error flag AND the 'could not find ref' libav
+        log — so this is reliable even on HW decoders that don't set the
+        per-frame flag. The honest 'which tiles are gray' signal."""
+        return set(self._keyframe_required)
+
     def tile_state(self, tile_idx: int) -> TileVisState:
         return self._states[tile_idx].vis
 
@@ -352,10 +418,13 @@ class FrameQualityGate:
             self._last_rec_log_t[tile_idx] = 0.0
             self._idr_observed_at[tile_idx] = 0.0
 
-    # -- F12 manual fallback funnel -------------------------------------
+    # -- force-IDR manual fallback funnel -------------------------------
     def force_keyframe_all(self) -> None:
         """Sets keyframe_required for every tile (single funnel for the
-        F12 hotkey + any other 'just refresh everything' caller)."""
+        TUI's force-IDR ('f') action + any other 'just refresh everything' caller)."""
+        # Explicitly reset tile-0's cap state first.
+        self._fir_attempts[0] = 0
+        self._cap_warned[0] = False
         for ti in range(self._num_tiles):
             self.mark_decode_error(ti)
 

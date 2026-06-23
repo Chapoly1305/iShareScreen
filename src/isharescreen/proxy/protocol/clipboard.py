@@ -163,7 +163,13 @@ def decompress_clipboard_payload(payload: bytes) -> bytes:
 
 
 def parse_clipboard_items(decompressed: bytes) -> List[ClipboardItem]:
-    """Decode the inner NSPasteboard archive. See module docstring."""
+    """Decode the inner NSPasteboard archive. See module docstring.
+
+    An empty clipboard is sent as a 0x1f with uncompressed_size=0 (the
+    7-byte deflate stream decompresses to nothing). Treat a buffer too
+    short to hold the item_count u32 as "no items" rather than raising."""
+    if len(decompressed) < 4:
+        return []
     p = 0
 
     def u32() -> int:

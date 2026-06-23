@@ -58,8 +58,11 @@ def load_last() -> Optional[ConnectFormValues]:
         audio=bool(data.get("audio", True)),
         curtain=bool(data.get("curtain", True)),
         hdr=bool(data.get("hdr", False)),
+        hidpi=str(data.get("hidpi", "auto")),
         share_console=bool(data.get("share_console", False)),
         alt_session=bool(data.get("alt_session", False)),
+        decoder=str(data.get("decoder", "auto")),
+        frontend=str(data.get("frontend", "desktop")),
     )
 
 
@@ -76,8 +79,11 @@ def save_last(values: ConnectFormValues) -> None:
             "audio": values.audio,
             "curtain": values.curtain,
             "hdr": values.hdr,
+            "hidpi": values.hidpi,
             "share_console": values.share_console,
             "alt_session": values.alt_session,
+            "decoder": values.decoder,
+            "frontend": values.frontend,
         }
         p.write_text(json.dumps(data, indent=2))
         try:

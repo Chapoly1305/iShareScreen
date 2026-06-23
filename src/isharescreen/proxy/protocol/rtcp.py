@@ -31,6 +31,14 @@ def build_fir(sender_ssrc: int, target_ssrc: int, seq_nr: int) -> bytes:
     )
 
 
+def build_fir_legacy(target_ssrc: int) -> bytes:
+    """Legacy Full-INTRA-frame Request (RFC 2032 §5.2.1, PT=192). This is the
+    keyframe request the *native* Screen Sharing viewer sends; Apple's
+    screensharingd answers it with a fresh IDR, where it often ignores the
+    AVPF PT=206 FIR. 8 bytes: header + the SSRC of the source to refresh."""
+    return struct.pack(">BBHI", 0x80, 192, 1, target_ssrc & 0xFFFFFFFF)
+
+
 def build_pli(sender_ssrc: int, media_ssrc: int) -> bytes:
     """Picture Loss Indication (RFC 4585 §6.3.1). Lighter than FIR."""
     return (
@@ -134,7 +142,7 @@ def build_rr(
         out += struct.pack(
             ">IIIIII",
             ssrc,
-            0,            # fraction lost (24) | cumulative lost (8)
+            0,            # fraction lost (8) | cumulative lost (24)
             ext_seq,
             0,            # interarrival jitter
             lsr,

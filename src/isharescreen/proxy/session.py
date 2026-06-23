@@ -41,7 +41,8 @@ from .media.tiles import TileFrame
 from .input import InputController
 from .media.aac_eld import AacEldDecoder, make_aac_eld_decoder
 from .media.hevc import HevcDecoder
-from .media.nalu import reassemble_group
+from .media.registry import resolve_codec
+from .media.nalu import first_donl, reassemble_group, reassemble_group_h264, is_avc_config
 from .media.quality_gate import TileVisState
 from .. import __version__ as _iss_version
 from .control import ControlServer
@@ -56,6 +57,7 @@ from .protocol.rfb import warmup_tcp
 from .protocol.rtcp import (
     build_empty_sr,
     build_fir,
+    build_fir_legacy,
     build_nack,
     build_pli,
     build_rr,
@@ -72,6 +74,54 @@ from .protocol.srtp import (
 
 
 log = logging.getLogger(__name__)
+
+
+def _proc_rss_mb() -> float:
+    """Current process working-set (Windows) / RSS (Linux/macOS) in MB.
+    Best-effort; returns 0.0 when the platform API is unavailable."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            import ctypes.wintypes
+
+            class _PMC(ctypes.Structure):
+                _fields_ = [
+                    ("cb",                         ctypes.wintypes.DWORD),
+                    ("PageFaultCount",             ctypes.wintypes.DWORD),
+                    ("PeakWorkingSetSize",         ctypes.c_size_t),
+                    ("WorkingSetSize",             ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage",    ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage",        ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage",     ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage",              ctypes.c_size_t),
+                    ("PeakPagefileUsage",          ctypes.c_size_t),
+                ]
+            # Explicit argtypes/restype are required: without them ctypes
+            # defaults to c_int for arguments and the 64-bit pseudo-handle
+            # from GetCurrentProcess() is silently truncated to 32 bits.
+            _gcp = ctypes.windll.kernel32.GetCurrentProcess
+            _gcp.argtypes = []
+            _gcp.restype = ctypes.c_void_p
+            _gpmi = ctypes.windll.psapi.GetProcessMemoryInfo
+            _gpmi.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.wintypes.DWORD,
+            ]
+            _gpmi.restype = ctypes.wintypes.BOOL
+            pmc = _PMC()
+            pmc.cb = ctypes.sizeof(pmc)
+            if _gpmi(_gcp(), ctypes.byref(pmc), pmc.cb):
+                return pmc.WorkingSetSize / 1_048_576
+        except Exception:
+            pass
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return 0.0
 
 
 # ── tunable constants ─────────────────────────────────────────────────
@@ -106,9 +156,17 @@ _BURST_RETRY_SLEEP_S = 0.8
 # packets aren't dropped by the kernel (RcvbufErrors). The process thread
 # does decrypt + dispatch from the queue. If the process thread can't keep
 # up the queue fills and we drop packets at the app layer instead — same
-# end result as a kernel drop, but moved to a place we can measure. 4096
-# packets at ~1500 bytes is ~6 MB worst-case memory.
-_UDP_DRAIN_QUEUE_MAX = 4096
+# end result as a kernel drop, but moved to a place we can measure.
+#
+# 16384 (~24 MB worst-case at ~1500 B) absorbs the bursts a HiDPI/2x stream
+# produces: at ~300 Mbps the packet rate is ~28k pps, and the old 4096 cap
+# was only ~0.15 s of buffer — measured overflowing in bursts (snapshot
+# showed depth≈1 but drop=15197, i.e. the process thread keeps up on average
+# but spikes blew past the shallow queue, breaking the ref chain). The deeper
+# queue is ~0.6 s, enough for the encoder's per-frame/IDR bursts; the process
+# thread drains it back to ~empty between spikes so the added latency only
+# appears during a genuine overload, not steady state.
+_UDP_DRAIN_QUEUE_MAX = 16384
 
 # Stall threshold — if no decoded video frame in this long, mark the
 # session as soft-dead. Consumer reconnects by calling close() + connect().
@@ -186,6 +244,33 @@ class SessionConfig:
     hdr: bool = False
     audio: bool = True
 
+    # Video codec to negotiate with the host:
+    #   "auto" (default) → probe whether this GPU can hardware-decode HEVC 4:4:4
+    #          (media/hwcaps.py) and use "hevc" if so, else "avc". This is what
+    #          makes Windows/Linux clients with no HEVC-4:4:4 HW decode fall back
+    #          to H.264 4:2:0 instead of grinding on a CPU HEVC decode.
+    #   "hevc" → force Apple HEVC RExt 4:4:4 — best quality, but HW-decodes only
+    #          on GPUs that support HEVC 4:4:4 (else a slow CPU fallback).
+    #   "avc"  → force H.264 High 4:2:0 (the host's only H.264 chroma). Lower
+    #          quality, but HW-decodes on essentially every GPU.
+    # The resolved codec is advertised by offering only that codec's bank in the
+    # 0x1c offer (offers.py keys off ISS_VIDEO_CODEC); the matching depay +
+    # decoder are selected here in the Session (see self._resolved_codec).
+    video_codec: Literal["auto", "hevc", "avc"] = "auto"
+    # HiDPI mode for the host's virtual display, resolved to a backing:point
+    # ratio by the frontend (which knows the window size):
+    #   "on"   → always 2× (Retina): crisp, but ~4× the pixels = more
+    #            bandwidth, and UI renders half-size on a non-Retina client.
+    #   "off"  → always 1× (flat, backing == logical): far less bandwidth,
+    #            correctly-sized UI on non-Retina (Linux/Windows) clients.
+    #   "auto" → match the LOCAL display: 2× on a Retina client, 1× on a
+    #            non-Retina one (so the stream maps 1:1 to the client's pixels);
+    #            2× is downgraded to 1× when it wouldn't fit the host's
+    #            3840×2160 cap (window logical > 1920×1080).
+    # The frontend passes the resolved scale into send_dynamic_resolution and
+    # the initial AdvertiseDims; the proxy itself only carries the mode.
+    hidpi: str = "auto"
+
     # When auth user differs from the console user, ask the console user
     # to share their existing session (Apple's "Ask to share" choice in
     # the Screen Sharing.app prompt). On accept, the viewer joins the
@@ -235,6 +320,25 @@ class SessionConfig:
     # commands. None = no control server.
     control_socket: Optional[str] = None
 
+    # Dynamic resolution: the frontend issues a mid-session resize (via
+    # Session.send_dynamic_resolution) whenever the viewer window changes
+    # size, so the host's virtual display re-renders sharp at the new size
+    # instead of stretching a fixed canvas. This is an IN-BAND change on
+    # the existing connection — 0x1d → server 0x451 → 0x1c re-offer →
+    # encoder restart — no reconnect. Purely a frontend concern; the
+    # protocol layer doesn't read this flag, it rides along with the rest
+    # of the config to the desktop viewer. Off ⇒ classic fixed canvas
+    # (the window just stretches the stream on resize).
+    dynamic_resolution: bool = False
+
+    # Packet capture: when set, every byte that crosses the TCP control
+    # socket and the two UDP media sockets is written — exactly as it goes
+    # on the wire (still enc1103/SRTP encrypted) — to a classic `.pcap` at
+    # this path, with synthetic Ethernet/IPv4/TCP|UDP framing. The result is
+    # byte-identical to a tcpdump capture and feeds straight into the
+    # workspace Python dissector (which derives the keys from the cleartext
+    # handshake it sees) or Wireshark. None ⇒ no capture; zero overhead.
+    record_pcap: Optional[str] = None
 
 # ── internal RTP packet group ────────────────────────────────────────
 
@@ -251,10 +355,32 @@ class Session:
 
     def __init__(self, config: SessionConfig) -> None:
         self._config = config
+        # Resolve "auto" to a concrete codec now (probes the GPU once for HEVC
+        # 4:4:4 hardware-decode support; cached). "hevc"/"avc" pass through.
+        # Used for the offer, the burst harvest, the decoder choice, and the
+        # streaming-path depay — everywhere instead of config.video_codec.
+        self._resolved_codec: str = resolve_codec(config.video_codec)
 
         # Connection state — None when disconnected.
         self._negotiation: Optional[NegotiationResult] = None
+        # Runtime-updated canvas dimensions from AppleDisplayLayout (0x451).
+        # `_runtime_canvas_*` = backing/pixel size (decoded frame dimensions).
+        # `_runtime_scaled_*` = logical/scaled size (window/client coordinate space).
+        self._runtime_canvas_w: int = 0
+        self._runtime_canvas_h: int = 0
+        self._runtime_scaled_w: int = 0
+        self._runtime_scaled_h: int = 0
+        self._needs_post_layout_fir: bool = False
+        self._needs_param_harvest: bool = False
+        # Cross-RTP-group accumulators for the post-resize param harvest.
+        self._harvest_vps: Optional[bytes] = None
+        self._harvest_sps: Optional[bytes] = None
+        self._harvest_pps: dict[int, bytes] = {}
         self._decoder: Optional[HevcDecoder] = None
+        self._video_codec = (
+            "avc" if os.environ.get("ISS_VIDEO_CODEC", "").lower() == "avc"
+            else "hevc"
+        )
         self._aac: Optional[AacEldDecoder] = None
         self._input: Optional[InputController] = None
         # Reassembler for multi-cipher-frame msg 0x1f (clipboard) sends.
@@ -262,9 +388,15 @@ class Session:
         from .protocol.clipboard import ClipboardReassembler
         self._clipboard_reassembler = ClipboardReassembler()
         self._ssrc_to_tile: dict[int, int] = {}
+        # Per-tile received coded bytes — to see which screen band (tile)
+        # eats the bandwidth (tile 0 = top/menu-bar strip, 1-3 down the
+        # screen). Surfaced as KB/s in the profile log.
+        self._tile_bytes: dict[int, int] = {}
+        self._last_tile_bytes: dict[int, int] = {}
         self._last_ssrc_adopt_ts: float = 0.0
         self._ssrc_blacklist: set[int] = set()
         self._last_profile_good: list[int] = []
+        self._last_profile_clean: list[int] = []
 
         # Cipher state for the TX channel.
         self._video_decryptor: Optional[SRTPDecryptor] = None
@@ -286,6 +418,12 @@ class Session:
         self._dest_host: str = self._config.host
         # Optional control server (TUI subscribers); see `control.py`.
         self._control: Optional[ControlServer] = None
+        # Optional packet capture; see `util/pcap_recorder.py`. Created on
+        # connect when cfg.record_pcap is set, finalised on teardown.
+        # `_record_cycle` counts connect() cycles so a reconnect writes a
+        # fresh file instead of truncating the previous session's capture.
+        self._recorder = None  # Optional[PcapRecorder]
+        self._record_cycle = 0
         # Wall-clock instant the current session went LIVE (post-burst).
         # Used to compute uptime for control-snapshot consumers.
         self._connect_wall_ts: float = 0.0
@@ -365,19 +503,23 @@ class Session:
         self._last_publish_t = 0.0
         self._tx_tick = 0
 
-        # LTRP fast-recovery — measurably better recovery under packet loss
-        # (~4× more frames decoded over a stress test). Default on; disable
-        # with `ISS_LTRP=0` if you hit decoder artifacts attributable to it.
-        #
-        # The LTR-ID we advertise is `min(per-tile decoded counts)` — i.e.
-        # we only claim "I have frame N" once every tile has decoded ≥ N
-        # frames. Acking a global counter the moment any tile publishes
-        # was the original bug: the server would pick an LTR ref that
-        # tiles other than the publisher hadn't actually decoded, and the
-        # next P-frame would error on those tiles, forcing repeated FIRs.
+        # LTRP fast-recovery: ack each cleanly-decoded base-tile frame by its
+        # DONL (decoding-order number) so the host's encoder can use it as a
+        # long-term reference. The DONL acks resolve to real encoder reference
+        # tokens, keeping the encoder's references near (within our decoder's
+        # picture buffer) instead of reaching far back and forcing a full IDR.
+        # ON by default; set ISS_LTRP=0 to disable.
         self._ltr_enabled = os.environ.get("ISS_LTRP", "1") != "0"
-        self._ltr_tile_counts: dict[int, int] = {}
         self._ltr_last_acked: int = 0
+        self._ltr_acks_sent: int = 0
+        # The per-ack LTR log fires at frame rate and drowns the debug log
+        # (a `tail` then only covers a few seconds, hiding real events like
+        # gray-outs). Off by default; ISS_LOG_LTR=1 re-enables it for LTRP
+        # debugging. Acks-flowing is otherwise visible via the profile line.
+        self._log_ltr_acks = os.environ.get("ISS_LOG_LTR") == "1"
+        # Dedup state for the misc-status (0x14) push log — only emit when
+        # the cmd value changes, not on every repeat.
+        self._last_misc_status_cmd: object = None
 
         # DPB-break detection state. `_dpb_error_window` is a sliding
         # ring of monotonic timestamps for libav "Could not find ref"
@@ -388,11 +530,47 @@ class Session:
         # during the burst tail.
         self._dpb_error_window: deque[float] = deque()
         self._last_decoder_restart_t: float = 0.0
+        # Guards the check-then-set of `_last_decoder_restart_t`. Restart
+        # triggers fire from TWO threads — the video-process thread (SSRC
+        # adoption / param harvest) and the tx thread (stall / saturation /
+        # FIR-exhaust watchdogs) — so the debounce must be claimed atomically
+        # (see `_claim_restart`); otherwise both threads pass a stale interval
+        # check and issue overlapping decoder.restart() calls.
+        self._restart_guard = threading.Lock()
+        # AVC hardware-decode POC-wrap workaround: automatically request a
+        # fresh IDR before frame_num/poc_lsb wrap, the rollover the AMD d3d11va
+        # H.264 decoder mishandles. Enabled by ISS_AVC_HW_REANCHOR (any truthy
+        # value — keeps hardware decode on instead of the software fallback).
+        # Frame-count driven, not time-based; see _maybe_reanchor.
+        import os as _os0
+        _reanchor_env = (_os0.environ.get("ISS_AVC_HW_REANCHOR", "") or "").strip()
+        self._avc_reanchor_enabled: bool = _reanchor_env not in ("", "0", "false", "no")
+        self._last_reanchor_t: float = 0.0
+        # Throttle for the per-tile stuck-tile FIR backstop (`_check_stall`
+        # Path B). Separate from `_last_decoder_restart_t` so it never
+        # blocks the 15 s total-freeze restart (Path A).
+        self._last_stuck_tile_fir_t: float = 0.0
+        # Escalation state: when a "Could not find ref" storm persists
+        # through repeated targeted FIRs, the tile-0 IDR fan-out doesn't
+        # clear it (tiles 1-3 are P-only; the host won't send them their own
+        # IDR). Count consecutive storm FIRs; past the threshold, escalate to
+        # a force-IDR of ALL tiles (the manual force-IDR action), which does
+        # clear the gray.
+        self._dpb_fir_count: int = 0
+        self._last_dpb_error_t: float = 0.0
+        # Gray-out event aggregator. Multiple paths (per-tile gate FIR,
+        # batched DPB-break FIR) can emit FIRs within a few ms. Buffer
+        # the tile indices and the most recent libav concealment message
+        # so a single INFO summary line lands per event instead of 4
+        # DEBUG lines the user can't see at default verbosity.
+        self._grayout_window_t: float = 0.0
+        self._grayout_window_tiles: set[int] = set()
+        self._last_concealment_msg: str = ""
 
         # Per-tile FIR rate limit, applied at the wire layer in
         # `_send_fir_for_tile` so it coalesces requests from every
         # caller (SSRC adoption, quality_gate, libav concealment fast
-        # path, soft concealment, F12, stall watchdog) into one FIR
+        # path, soft concealment, force-IDR, stall watchdog) into one FIR
         # per tile per `_FIR_MIN_INTERVAL_S` window. Without this,
         # multiple recovery paths firing within ~500 ms during an
         # SSRC restart caused Apple to send several IDRs per tile,
@@ -402,6 +580,16 @@ class Session:
 
         # Audio sink. Set by consumer; called whenever a PCM chunk decodes.
         self._audio_callback: Optional[Callable[[np.ndarray], None]] = None
+
+        # Per-tile H.264 access-unit tap (AVC only). When set, each tile's
+        # reassembled Annex-B access unit is handed to the callback as
+        # (tile_idx, rtp_timestamp, au_bytes) from the video-process thread —
+        # this is the pass-through feed for the browser frontend, which decodes
+        # the H.264 itself (no decode/encode in iss for that path). The native
+        # decoder keeps running in parallel so its FIR/keyframe-recovery still
+        # drives the stream's health (the browser benefits from the same
+        # recovered keyframes via this forward).
+        self._video_au_callback: Optional[Callable[[int, int, bytes], None]] = None
 
         # Clipboard text from host. Optional callback; called whenever a
         # full msg 0x1f arrives and parses to a text item. The session
@@ -427,6 +615,11 @@ class Session:
         self._cursor_callback: Optional[
             Callable[[Optional["_CursorImage"]], None]
         ] = None
+        # Safety counter for the cursor-keepalive: any video/raw rect arriving
+        # over the RFB channel means an FBU request pulled video (the old
+        # full-screen-request bug). Stays 0 with the 1x1 keepalive; surfaced
+        # in the profile log so a regression is visible.
+        self._fbu_video_rects = 0
 
     # ── public lifecycle ─────────────────────────────────────────────
 
@@ -491,6 +684,24 @@ class Session:
         decoded PCM chunk: `(N, 2) float32` at 48 kHz. Pass None to remove."""
         self._audio_callback = cb
 
+    def set_video_au_callback(
+        self, cb: Optional[Callable[[int, int, bytes], None]],
+    ) -> None:
+        """Install a callback invoked from the video-process thread with each
+        tile's reassembled H.264 access unit: `(tile_idx, rtp_timestamp,
+        annexb_au_bytes)`. AVC codec only. Pass None to remove. The browser
+        frontend uses this to forward H.264 to a WebCodecs decoder without iss
+        decoding/encoding."""
+        self._video_au_callback = cb
+
+    def video_params(self) -> tuple[bytes, dict]:
+        """(sps, all_pps) harvested from the AVC config — what a downstream
+        WebCodecs decoder needs to configure(). Empty until the burst lands."""
+        dec = self._decoder
+        sps = getattr(dec, "_sps", b"") if dec is not None else b""
+        pps = getattr(dec, "_pps", b"") if dec is not None else b""
+        return sps, ({0: pps} if pps else {})
+
     def set_clipboard_text_callback(
         self, cb: Optional[Callable[[str], None]],
     ) -> None:
@@ -517,7 +728,7 @@ class Session:
 
     def request_fir(self, tile_idx: Optional[int] = None) -> None:
         """Externally trigger an FIR (forces a fresh IDR). Without args,
-        targets every tile. Used by the F12 manual refresh hotkey, the
+        targets every tile. Used by the TUI's force-IDR ('f') action, the
         SSRC-adoption restart path, and tests.
 
         Funnels through the gate's `keyframe_required` set so the
@@ -537,6 +748,39 @@ class Session:
             gate.mark_decode_error(tile_idx)
             self._send_fir_for_tile(tile_idx)
 
+    def send_dynamic_resolution(
+        self, width: int, height: int, hidpi_scale: int = 2,
+    ) -> None:
+        """Request a mid-session display resize without reconnecting.
+
+        Sends a runtime SetDisplayConfiguration (0x1d) on the existing
+        encrypted TCP channel with display_flags=DYNAMIC_RESOLUTION.
+        The server responds with AppleDisplayLayout (0x451) and
+        restarts the HEVC encoder at the new resolution — new SSRCs,
+        new SPS/PPS, new IDR burst. The 0x451 handler updates canvas
+        dims; the frontend polls `canvas_dims` to detect the change.
+        No reconnect, no re-authentication.
+        """
+        from .protocol.rfb import build_virtual_display
+        from .protocol.negotiation import build_fbu_request
+
+        neg = self._negotiation
+        if neg is None:
+            raise RuntimeError("Not connected")
+        log.info("send_dynamic_resolution: requesting %dx%d", width, height)
+        msg = build_virtual_display(
+            width=width, height=height, hidpi_scale=hidpi_scale, hdr=False,
+        )
+        neg.cipher.encrypt_and_send(neg.sock, msg)
+        # Re-arm TCP and nudge encoder with FIRs for fresh IDRs.
+        try:
+            neg.cipher.encrypt_and_send(
+                neg.sock, build_fbu_request(incremental=False)
+            )
+        except OSError:
+            pass
+        self.request_fir()
+
     # ── public state inspection ──────────────────────────────────────
 
     @property
@@ -550,6 +794,22 @@ class Session:
 
     @property
     def canvas_dims(self) -> tuple[int, int]:
+        """Backing/pixel dimensions of the HEVC decoder output — the size
+        the GPU textures must be allocated at. May be larger than
+        `scaled_dims` on HiDPI virtual displays."""
+        rw, rh = self._runtime_canvas_w, self._runtime_canvas_h
+        if rw and rh:
+            return (rw, rh)
+        n = self._negotiation
+        return (n.canvas_width, n.canvas_height) if n else (0, 0)
+
+    @property
+    def scaled_dims(self) -> tuple[int, int]:
+        """Logical/scaled display dimensions — the coordinate space the
+        client uses for window sizing and input mapping."""
+        sw, sh = self._runtime_scaled_w, self._runtime_scaled_h
+        if sw and sh:
+            return (sw, sh)
         n = self._negotiation
         return (n.canvas_width, n.canvas_height) if n else (0, 0)
 
@@ -561,7 +821,8 @@ class Session:
         if observed:
             return observed
         n = self._negotiation
-        return n.canvas_tiles if n and n.canvas_tiles else 4
+        from .protocol.offers import tiles_per_frame
+        return n.canvas_tiles if n and n.canvas_tiles else tiles_per_frame()
 
     @property
     def hw_accel(self) -> Optional[str]:
@@ -619,6 +880,31 @@ class Session:
             log.info("resolved %s -> %s (IPv4 for HP UDP transport)",
                      cfg.host, self._dest_host)
 
+        # Packet capture: open the recorder now that the server IPv4 is
+        # known, so the TCP/UDP socket taps below can stamp real endpoints.
+        # On a reconnect cycle (_recorder kept across handshake retries) we
+        # keep the existing one; a full close() finalises it.
+        if cfg.record_pcap and self._recorder is None:
+            from pathlib import Path
+            from ..util.pcap_recorder import PcapRecorder, local_ip_towards
+            # First connect uses the path verbatim (matching the CLI's
+            # expectation, truncating any stale file like tcpdump -w). Each
+            # subsequent connect() in this Session — i.e. a reconnect — adds
+            # a "-N" suffix so the prior session's capture (often the one
+            # holding the failure that triggered the reconnect) is preserved.
+            path = cfg.record_pcap
+            if self._record_cycle > 0:
+                p = Path(path)
+                path = str(p.with_name(
+                    f"{p.stem}-{self._record_cycle}{p.suffix}"))
+            try:
+                client_ip = local_ip_towards(self._dest_host)
+                self._recorder = PcapRecorder(path, client_ip, self._dest_host)
+            except Exception as e:
+                log.warning("pcap recording disabled (setup failed: %s)", e)
+                self._recorder = None
+            self._record_cycle += 1
+
         # 1) Bind UDP sockets BEFORE the handshake — the session-start
         # burst lands within ~100 ms of the 0x1c answer, and the kernel
         # would drop early packets if the sockets aren't ready. Apple
@@ -627,8 +913,21 @@ class Session:
         # loop demuxes audio RTP from RTCP by RTP payload-type byte.
         ctrl_port = cfg.udp_ctrl_port or cfg.port
         video_port = cfg.udp_video_port or (cfg.port + 1)
-        self._sock_ctrl = self._bind_udp(cfg.udp_bind_host, ctrl_port)
-        self._sock_video = self._bind_udp(cfg.udp_bind_host, video_port)
+        # Bind host defaults to INADDR_ANY but can be pinned to one interface
+        # (config field or ISS_UDP_BIND_HOST env) so a client can run on a host
+        # already serving screen-share on 5900-5902 on a DIFFERENT interface IP
+        # without a clash — the ports stay default (they're symmetric with the
+        # server's), only the local interface narrows.
+        bind_host = cfg.udp_bind_host or os.environ.get("ISS_UDP_BIND_HOST", "")
+        self._sock_ctrl = self._bind_udp(bind_host, ctrl_port)
+        self._sock_video = self._bind_udp(bind_host, video_port)
+        # Tap the media sockets so SRTP RTP/RTCP (and our heartbeats /
+        # firewall punches) land in the capture alongside the TCP control
+        # stream. The tap is a transparent proxy — every other socket call
+        # delegates to the real socket.
+        if self._recorder is not None:
+            self._sock_ctrl = self._recorder.wrap_udp(self._sock_ctrl)
+            self._sock_video = self._recorder.wrap_udp(self._sock_video)
         # NAT diagnostic: log the bound local address pair so a user behind
         # NAT can confirm iss is listening where they expect, and we can
         # compare with the src-address-of-first-packet log later.
@@ -736,7 +1035,8 @@ class Session:
             )
 
         # 7) Decoder init.
-        num_tiles = self._negotiation.canvas_tiles or 4
+        from .protocol.offers import tiles_per_frame
+        num_tiles = self._negotiation.canvas_tiles or tiles_per_frame()
         # Size per-tile loss counters now that num_tiles is known.
         self._lost_pkts_per_tile = [0] * num_tiles
         self._last_profile_lost_per_tile = [0] * num_tiles
@@ -752,13 +1052,64 @@ class Session:
         # videotoolbox quirks) and for verifying the SW fallback path
         # actually works on each platform.
         import os as _os
+        import sys as _sys
+        from .media import registry
         prefer_hwaccel = _os.environ.get("ISS_FORCE_SW_HEVC", "0") == "0"
-        self._decoder = HevcDecoder(
-            num_tiles=num_tiles,
-            enable_quality_gate=True,
-            on_frame_published=self._on_frame_published,
-            prefer_hwaccel=prefer_hwaccel,
+        # Decoder selection. On macOS the native VideoToolbox path
+        # (VTDecompressionSession, vtdecode.py) decodes Apple's stream the way
+        # its own viewer does — VideoToolbox manages the DPB and conceals the
+        # odd missing-ref frame instead of BLOCKING, which is what libav's
+        # hwaccel glue does (errno=35 → our drain/drop recovery → cascade
+        # freeze). It's the default on macOS; `ISS_DECODER=libav` forces the
+        # cross-platform libav path, and `ISS_FORCE_SW_HEVC=1` forces libav
+        # software (and therefore libav).
+        _decoder_choice = _os.environ.get("ISS_DECODER", "auto").lower()
+        # Per-codec hardware-accel preference, then registry-driven selection
+        # (media/registry.py owns the capability matrix + override handling).
+        if self._resolved_codec == "avc":
+            # AVC path: the host streams H.264 4:2:0. d3d11va's H.264 decoder
+            # corrupts Apple's stream at the frame_num/POC wrap (~34 s in): the
+            # 4 tiles are one interleaved low-delay stream anchored on per-tile
+            # long-term references, and the D3D11 decoder's reference resolution
+            # collapses when poc_lsb wraps (log2_max_poc_lsb=13 → every ~34 s) —
+            # all four tiles start decoding off the same picture, so the canvas
+            # dissolves into four identical bands. Software libav decodes the
+            # identical bitstream correctly indefinitely (verified clean past
+            # the wrap), so force software for AVC on Windows. Override with
+            # ISS_AVC_HWACCEL=1, or ISS_AVC_HW_REANCHOR for HW + periodic IDR.
+            avc_prefer_hwaccel = prefer_hwaccel
+            if self._avc_reanchor_enabled:
+                # Keep hardware decode; avoid the d3d11va POC-wrap bug by
+                # periodically re-anchoring with a fresh IDR (see _maybe_
+                # reanchor, driven from _tx_loop). Lower latency/CPU than the
+                # software fallback at the cost of a keyframe burst every N s.
+                log.info("AVC: hardware decode + automatic IDR re-anchor "
+                         "(every ~%d frames since IDR, d3d11va POC-wrap "
+                         "workaround)", self._AVC_REANCHOR_FRAMES)
+            elif (_sys.platform == "win32"
+                    and _os.environ.get("ISS_AVC_HWACCEL", "0") == "0"):
+                avc_prefer_hwaccel = False
+                log.info("AVC: forcing software decode "
+                         "(d3d11va H.264 POC-wrap corruption workaround)")
+            _pf = avc_prefer_hwaccel
+            _override = registry.normalize_override(_decoder_choice, "avc")
+        else:
+            # HEVC 4:4:4: the registry prefers native VideoToolbox on macOS and
+            # the generic libav d3d11va-RExt / Intel QSV paths on Windows/Linux.
+            # ISS_FORCE_SW_HEVC=1 pins the libav software path.
+            _pf = prefer_hwaccel
+            _override = ("libav-hevc444-sw" if not prefer_hwaccel
+                         else registry.normalize_override(_decoder_choice, "hevc"))
+
+        _spec, self._decoder = registry.build_best(
+            self._resolved_codec, override=_override, num_tiles=num_tiles,
+            enable_quality_gate=True, on_frame_published=self._on_frame_published,
+            prefer_hwaccel=_pf,
         )
+        if self._decoder is None:
+            raise RuntimeError(
+                f"no usable decoder for codec {self._resolved_codec!r} "
+                f"(override={_override!r})")
         if not prefer_hwaccel:
             log.info("ISS_FORCE_SW_HEVC=1: HW decoders disabled")
         self._decoder.set_params(burst.vps, burst.sps, burst.all_pps)
@@ -923,7 +1274,14 @@ class Session:
         (without it the encoder-canvas reply degenerates and no burst
         arrives), so we always send a valid audio offer; `cfg.audio=False`
         only skips local decode + playback."""
+        # The video offer advertises only the resolved codec's bank; offers.py
+        # keys off ISS_VIDEO_CODEC. Set it here so this offer (and the dynamic-
+        # resolution re-offer) matches the depay + decoder we wire up below.
+        os.environ["ISS_VIDEO_CODEC"] = self._resolved_codec
         video_offer, audio_offer = create_offers()
+        # Stash for mid-session 0x1c re-offers (dynamic resolution).
+        self._video_offer = video_offer
+        self._audio_offer = audio_offer
         self._our_video_ssrc = extract_offer_ssrc(video_offer, is_video=True)
         self._our_audio_ssrc = extract_offer_ssrc(audio_offer, is_video=False)
         log.info(
@@ -942,7 +1300,13 @@ class Session:
             video_offer=video_offer,
             share_console=cfg.share_console,
             alt_session=cfg.alt_session,
+            recorder=self._recorder,
         )
+
+        # Persist the post-auth transport key next to the pcap (sibling
+        # `.key` file) so the recorded session decodes without a wrapper.
+        if self._recorder is not None:
+            self._recorder.write_key(self._negotiation.ecb_key.hex())
 
         keys = self._negotiation.keys
         self._video_decryptor = self._negotiation.video_decryptor
@@ -961,9 +1325,17 @@ class Session:
         # different starvation. Let BurstStarved propagate so the caller does
         # a clean full reconnect, which is what actually restarts the stream.
         burst_buf: list[bytes] = []
-        self._drain_socket_into(self._sock_video, burst_buf, max_seconds=2.0)
+        # H.264 needs a longer drain + higher packet floor than HEVC: its tiles
+        # are independent slice chains and the burst must gather enough to seed
+        # the shared decoder context before the streaming loop starts.
+        _is_avc = self._video_codec == "avc"
+        self._drain_socket_into(
+            self._sock_video, burst_buf, max_seconds=4.0 if _is_avc else 2.0)
         return gather_initial_burst(
             burst_buf, self._video_decryptor, quality_tier=cfg.quality_tier,
+            codec=self._resolved_codec,
+min_packets=400 if _is_avc else 100,
+
         )
 
     def _teardown_negotiation_tcp(self) -> None:
@@ -994,7 +1366,7 @@ class Session:
         action = cmd.get("action")
         if action == "fir":
             # Force an IDR refresh on every tile. Same effect as the
-            # F12 fallback in the desktop frontend.
+            # TUI's force-IDR ('f') action.
             try:
                 self.request_fir(None)
             except Exception:
@@ -1140,6 +1512,21 @@ class Session:
                 pass
             self._negotiation = None
 
+        # Finalise the packet capture (flush + close the file) and print a
+        # ready-to-run dissector command. Done after the sockets are shut so
+        # any last bytes (RST teardown excluded — that's below the socket
+        # API) are already recorded.
+        if self._recorder is not None:
+            path = self._recorder.path
+            hint = self._recorder.dissector_hint()
+            pkts, nbytes = self._recorder.close()  # drains queue, returns counts
+            if path:
+                log.info(
+                    "pcap saved: %s (%d packets, %d bytes)\ndecode with:\n%s",
+                    path, pkts, nbytes, hint,
+                )
+            self._recorder = None
+
         self._video_decryptor = None
         self._audio_decryptor = None
         self._audio_encryptor = None
@@ -1153,6 +1540,15 @@ class Session:
         self._roc = {}
         self._nack_pending = defaultdict(set)
         self._server_sr = {}
+        self._runtime_canvas_w = 0
+        self._runtime_canvas_h = 0
+        self._runtime_scaled_w = 0
+        self._runtime_scaled_h = 0
+        self._needs_post_layout_fir = False
+        self._needs_param_harvest = False
+        self._harvest_vps = None
+        self._harvest_sps = None
+        self._harvest_pps = {}
 
     # ── thread spawning ──────────────────────────────────────────────
 
@@ -1183,21 +1579,37 @@ class Session:
         self._send_ltr_ack(tile_idx)
 
     def _send_ltr_ack(self, tile_idx: int) -> None:
-        if not self._ltr_enabled:
+        """Acknowledge the last cleanly-decoded base-tile frame so Apple's
+        encoder can use it as a long-term reference (single-RTT recovery
+        instead of a full IDR on loss).
+
+        The ack must carry the frame's **DONL** (HEVC Decoding Order Number).
+        The host reads a big-endian u32 at the APP packet's offset 12 and
+        scans a fixed-size ring for an *exact* match, mapping it to an encoder
+        reference token. That ring is keyed on the per-frame DONL the encoder
+        stamps — which is exactly the DONL carried in every payload header
+        (same value space, +1 per frame). A value from any other counter
+        (e.g. the HEVC POC) misses the ring entirely and is a silent no-op,
+        leaving the encoder to fall back to full-IDR recovery (the persistent
+        gray). See nalu.first_donl.
+
+        We ack tile 0 only: it's the anchor SSRC that carries IDRs, and one
+        stream's ack rate matches the host's own observed rate.
+        """
+        if not self._ltr_enabled or tile_idx != 0:
             return
-        counts = self._ltr_tile_counts
-        counts[tile_idx] = counts.get(tile_idx, 0) + 1
-        # Don't ack until every tile we expect has published at least once;
-        # otherwise the min() includes a 0 and we never make forward progress
-        # for the tiles that have published, OR we'd ack low IDs while some
-        # tiles silently haven't started yet.
-        n_tiles = self.num_tiles
-        if len(counts) < n_tiles:
+        dec = self._decoder
+        if dec is None:
             return
-        ltr_id = min(counts.values())
-        if ltr_id <= self._ltr_last_acked:
+        donl = dec.last_clean_donl[0] if dec.last_clean_donl else None
+        if donl is None:
             return
-        self._ltr_last_acked = ltr_id
+        # DONL is monotonic per tile but 16-bit (wraps ~every 18 min at
+        # 60 fps); ack on any change rather than strict ">" so acks resume
+        # after a wrap instead of stalling until the counter climbs back.
+        if donl == self._ltr_last_acked:
+            return
+        self._ltr_last_acked = donl
         enc = self._srtcp_enc
         ssrc = self._our_video_ssrc
         # PT=204 LTR-acks go on the video RTCP-mux port, not the ctrl port.
@@ -1205,10 +1617,57 @@ class Session:
         if enc is None or ssrc is None or sock is None:
             return
         try:
-            pkt = build_rtcp_app_ltrp(ssrc, ltr_id)
+            pkt = build_rtcp_app_ltrp(ssrc, donl)
             sock.sendto(enc.protect(pkt), (self._dest_host, self._video_dest_port))
+            self._ltr_acks_sent += 1
+            if self._log_ltr_acks:
+                log.debug("LTR ack sent: DONL=%d (tile 0)", donl)
         except OSError as e:
             log.debug("LTR ack send failed: %s", e)
+
+    def _dpb_trace(self, msg: str) -> None:
+        """ISS_DPB_TRACE=1 diagnostic. Classify a libav 'Could not find
+        ref with POC N' as EVICTED (we fed POC N but libav dropped it
+        from its DPB → the decoder retains too few frames) vs GAP (we
+        never fed N → transport loss / pre-IDR drop / reorder). The RPS
+        tracker's `_seen_pocs` never evicts, so membership == 'we fed
+        this exact POC at least once'. `lsb_hit` guards against an
+        MSB-derivation mismatch between libav and our tracker: a POC we
+        fed under a different MSB still shows the same poc_lsb."""
+        dec = self._decoder
+        if dec is None:
+            return
+        low = msg.lower()
+        i = low.rfind("poc")
+        if i < 0:
+            return
+        digits = ""
+        for ch in msg[i + 3:]:
+            if ch.isdigit() or (ch == "-" and not digits):
+                digits += ch
+            elif digits:
+                break
+        try:
+            poc = int(digits)
+        except ValueError:
+            return
+        try:
+            seen = frozenset(dec._rps_tracker._seen_pocs)
+        except Exception:
+            return
+        in_seen = poc in seen
+        lsb = poc % 2048
+        lsb_hit = in_seen or any((p % 2048) == lsb for p in seen)
+        mx = max(seen) if seen else -1
+        mn = min(seen) if seen else -1
+        log.warning(
+            "DPBTRACE poc=%d %s dist_from_max=%d lsb_hit=%s "
+            "seen_count=%d seen_range=[%d..%d]",
+            poc,
+            "EVICTED(fed-then-dropped)" if in_seen else "GAP(never-fed)",
+            (mx - poc) if mx >= 0 else -1,
+            lsb_hit, len(seen), mn, mx,
+        )
 
     # ── libav log → decoder-concealment hook ──────────────────────────
     # PyAV forwards libav log messages into the Python `logging`
@@ -1242,6 +1701,14 @@ class Session:
             return
         # Raise PyAV's libav verbosity so concealment WARNINGs reach
         # the Python logger.
+        # Surface EVERY libav message reaching the handler (before the
+        # keyword whitelist below drops it), so a HW decoder's own error
+        # reports aren't silently discarded — this is how we find out what
+        # d3d11va actually emits when it goes gray. Default ON for now (set
+        # ISS_LOG_LIBAV=0 to silence). Kept at WARNING level: the messages
+        # that matter (decode / hwaccel errors) are ERROR-class, so it stays
+        # quiet during normal playback and only fires on real trouble.
+        _log_all_libav = os.environ.get("ISS_LOG_LIBAV", "1") != "0"
         try:
             _avlog.set_libav_level(_avlog.WARNING)
             _avlog.set_level(_avlog.WARNING)
@@ -1261,9 +1728,13 @@ class Session:
         class _LibavConcealmentHandler(logging.Handler):
             def emit(self_h, record):  # noqa: N805
                 try:
-                    msg = record.getMessage().lower()
+                    raw = record.getMessage().strip()
                 except Exception:
                     return
+                msg = raw.lower()
+                if _log_all_libav:
+                    # Diagnostic: log it ALL, before the whitelist drops it.
+                    log.info("LIBAV_RAW[%s] %s", record.levelname, raw)
                 if not any(kw in msg for kw in concealment_keywords):
                     return
                 for sess in tuple(getattr(Session, "_active_sessions", ())):
@@ -1311,8 +1782,8 @@ class Session:
     # ~7 short-term refs per P-slice so a single bad slice produces ~7
     # events; the older threshold of 12 required >=2 bad slices in the
     # same second and skipped recovery for single-slice corruption,
-    # leaving the user with persistent gray artifacts that only F12
-    # cleared. The post-restart grace below + the fast cooldown +
+    # leaving the user with persistent gray artifacts that only a manual
+    # force-IDR cleared. The post-restart grace below + the fast cooldown +
     # mark_decode_error's own per-tile cooldown all cap the FIR rate,
     # so a single bad slice no longer produces a FIR storm.
     _DPB_ERR_WINDOW_S: float = 1.0
@@ -1348,6 +1819,40 @@ class Session:
     # back-to-back retries still wait long enough to see whether the
     # first FIR worked.
     _FIR_MIN_INTERVAL_S: float = 0.25
+    # How long the link must be loss-FREE before a decoder wedge is treated
+    # as a genuine (lossless) VideoToolbox saturation wedge eligible for a
+    # codec restart. A loss event takes up to ~4 s to surface as a
+    # `gap > threshold` wedge (loss → broken ref → stuck → staleness), so a
+    # short window misclassifies loss-rooted broken-ref wedges as "lossless"
+    # and restarts them — which wipes the shared DPB, orphans the cross-tile
+    # IDR refs, and turns one wedge into a multi-second restart cascade
+    # (observed on lossy 58 Mbps streams). 8 s keeps loss-rooted wedges on
+    # the no-flush FIR path (native-aligned); on a truly lossless link the
+    # loss counter never grows, so genuine VT-saturation wedges still
+    # restart. The 15 s last-resort restart below remains the dead-decoder
+    # backstop either way.
+    _SATURATION_LOSS_FREE_WINDOW_S: float = 8.0
+    # Minimum publish-gap before a lossless wedge earns a codec restart. The
+    # no-flush + FIR path (hevc._try_recovery + the gap>3 FIR storm below)
+    # recovers the common periodic no-loss wedge (an LTR/ref aged out of
+    # libav's DPB; see the ltrp notes) in ~3-6 s via Apple's FIR->IDR. A 2.5 s
+    # restart fired *during* that natural recovery — wiping the shared DPB and
+    # orphaning tiles 1-3 (IDRs are tile-0-only) — turned a ~3 s blip into a
+    # ~9 s restart cascade (observed in two 50-58 Mbps GUI captures, loss=0).
+    # 8 s lets the native-aligned FIR path finish first; restart then only
+    # fires for a decoder that is GENUINELY stuck (no recovery in 8 s).
+    _SATURATION_RESTART_GAP_S: float = 8.0
+    # Persistent-DPB-break escalation. When a "Could not find ref" storm
+    # survives this many targeted fast-path FIRs (each ~1 s apart), escalate
+    # to force-IDR ALL tiles (request_fir(None) = the TUI 'f' action), which
+    # users confirm reliably clears the persistent gray. ~3 s of continuous
+    # FIR-resistant corruption before escalating — fast enough to beat a
+    # manual click, slow enough not to blanket-FIR on transient single-frame
+    # loss (which the targeted FIR + natural IDR already handles).
+    _DPB_FORCEALL_AFTER_FIRS: int = 3
+    # A gap this long with no "Could not find ref" means the previous storm
+    # cleared (real recovery); reset the escalation counter.
+    _DPB_STORM_RESET_S: float = 3.0
 
     def _on_libav_concealment(self, msg: str) -> None:
         """Two response modes for libav's "Could not find ref" log:
@@ -1376,6 +1881,14 @@ class Session:
         # means real corruption that won't self-heal before the next
         # natural IDR cycle.
         if "could not find ref" in msg.lower():
+            if os.environ.get("ISS_DPB_TRACE") == "1":
+                self._dpb_trace(msg)
+            self._last_concealment_msg = msg
+            # Storm tracking for reconnect escalation: a long gap since the
+            # last ref-miss means the prior storm cleared → reset the count.
+            if now - self._last_dpb_error_t > self._DPB_STORM_RESET_S:
+                self._dpb_fir_count = 0
+            self._last_dpb_error_t = now
             events = self._dpb_error_window
             events.append(now)
             cutoff = now - self._DPB_ERR_WINDOW_S
@@ -1392,11 +1905,29 @@ class Session:
                     and now - last_fast >= self._DPB_FAST_COOLDOWN_S):
                 self._last_dpb_fast_recovery_t = now
                 events.clear()
-                log.warning(
-                    "DPB break: %d 'Could not find ref' events in %.1fs "
-                    "— FIR for fresh IDR",
-                    self._DPB_ERR_THRESHOLD, self._DPB_ERR_WINDOW_S,
-                )
+                self._dpb_fir_count += 1
+                if self._dpb_fir_count >= self._DPB_FORCEALL_AFTER_FIRS:
+                    # The per-tile FIR above isn't clearing the storm. Escalate
+                    # to the SAME action the TUI 'f' key does — request_fir(None)
+                    # → gate.force_keyframe_all() + FIR every tile. Users report
+                    # this manual Force-IDR ALWAYS clears the persistent gray,
+                    # where the targeted auto-FIR (tile 0 / bad tiles only)
+                    # doesn't. We hold it back to the persistent case so we
+                    # don't blanket-FIR all tiles on every transient loss.
+                    log.warning(
+                        "DPB break persisted through %d FIRs — escalating to "
+                        "force-IDR ALL tiles (= TUI 'f' action)",
+                        self._dpb_fir_count,
+                    )
+                    self._dpb_fir_count = 0
+                    self.request_fir(None)
+                else:
+                    log.warning(
+                        "DPB break: %d 'Could not find ref' events in %.1fs "
+                        "— FIR for fresh IDR (attempt %d/%d before force-all)",
+                        self._DPB_ERR_THRESHOLD, self._DPB_ERR_WINDOW_S,
+                        self._dpb_fir_count, self._DPB_FORCEALL_AFTER_FIRS,
+                    )
                 # Don't blanket-FIR all tiles. The libav log line
                 # doesn't tell us which tile produced the ref-miss,
                 # but the per-tile post-decode `had_decode_error`
@@ -1448,6 +1979,14 @@ class Session:
         testing of the recovery paths; defaults to 0 (no synthetic drop)."""
         import random
         drop_pct = float(os.environ.get("ISS_DROP_PCT", "0"))
+        # Burst-loss injector (0 = off): drop one frame's worth of packets
+        # every N seconds — see the burst block below.
+        self._burst_every_s = float(os.environ.get("ISS_DROP_BURST_EVERY_S", "0"))
+        # Hold off synthetic loss until the stream has established, so the
+        # initial burst + first IDR aren't dropped (which just stalls
+        # startup and tells us nothing about steady-state recovery).
+        drop_after_s = float(os.environ.get("ISS_DROP_AFTER_S", "8"))
+        loop_start = time.monotonic()
         sock = self._sock_video
         if sock is None:
             return
@@ -1473,11 +2012,27 @@ class Session:
             src_seen[_addr] = prev + 1
             if prev == 0:
                 log.info("video UDP: first packet from src=%s:%d", _addr[0], _addr[1])
-            if drop_pct > 0 and random.random() * 100 < drop_pct:
+            if (drop_pct > 0
+                    and time.monotonic() - loop_start > drop_after_s
+                    and random.random() * 100 < drop_pct):
                 loss_count += 1
                 if loss_count % 100 == 1:
                     log.info("ISS_DROP_PCT=%.1f%% — synthetic loss count=%d", drop_pct, loss_count)
                 continue
+            # Burst-loss model: every `_burst_every_s` seconds, drop ALL video
+            # packets for a short window (~one frame). This is the loss
+            # pattern LTR-anchored recovery is meant to fix — a clean single
+            # missing frame — unlike continuous random loss which shreds the
+            # whole reference chain. Recovery quality = does the stream resume
+            # without a fresh IDR (LTR-P) or stall until FIR→IDR?
+            if self._burst_every_s > 0:
+                now_b = time.monotonic()
+                since = now_b - loop_start
+                if since > drop_after_s:
+                    phase = since % self._burst_every_s
+                    if phase < 0.020:  # ~20 ms ≈ one frame at 60 fps
+                        loss_count += 1
+                        continue
             try:
                 q.put_nowait(pkt)
             except queue.Full:
@@ -1541,8 +2096,141 @@ class Session:
         else:
             packets = sorted(grp, key=lambda x: x[0])
 
-        for nalu in reassemble_group([p for _, _, p in packets]):
+        # Frame-completeness check (native jitter-buffer behaviour). An
+        # access unit is fragmented across consecutive RTP sequence
+        # numbers; a gap between this group's sorted packets means at
+        # least one slice / FU fragment never arrived, so the reassembled
+        # NALUs are truncated. Apple's own viewer (AVConference's
+        # VideoPacketBuffer) does NOT feed an incomplete frame to the
+        # decoder — it skips it and requests recovery — because feeding a
+        # partial access unit produces malformed-bitstream errors that
+        # can wedge VideoToolbox. We mirror that below: harvest param
+        # sets first (those NALUs may be intact and small), then drop the
+        # frame if it's incomplete. `&0xFFFF` makes the 65535->0 wrap a
+        # diff of 1 and a duplicate seq a diff of 0; only diff>1 is a gap.
+        oseq = [p[0] for p in packets]
+        incomplete = any(
+            ((oseq[i + 1] - oseq[i]) & 0xFFFF) > 1
+            for i in range(len(oseq) - 1)
+        )
+
+        if self._resolved_codec == "avc":
+            raw_payloads = [p for _, _, p in packets]
+            if self._needs_param_harvest:
+                # AVC param sets live in an avcC config packet, not inline NALs.
+                # Scan the raw payloads and harvest on first hit.
+                for raw in raw_payloads:
+                    if is_avc_config(raw):
+                        self._harvest_avc_param_sets(raw)
+                        break
+                if self._needs_param_harvest:
+                    # Config packet not seen yet — drop until it arrives.
+                    return
+                # Harvest just completed: decoder rebuilt with new SPS/PPS;
+                # fall through and feed the IDR NALUs from this same group.
+            nalus = list(reassemble_group_h264(raw_payloads))
+        else:
+            nalus = list(reassemble_group([p for _, _, p in packets]))
+
+        # If a dynamic resolution change is in progress (HEVC path), harvest
+        # fresh VPS/SPS/PPS from the new encoder's burst so the restarted
+        # decoder has the correct dimensions.
+        if self._needs_param_harvest and nalus:
+            self._harvest_param_sets(nalus)
+            if self._needs_param_harvest:
+                # Harvest still incomplete: the shared decoder context is
+                # still sized for the OLD canvas. Feeding these new-canvas
+                # NALUs into it breaks the DPB on every resize and can
+                # wedge VideoToolbox (errno=35). Drop the group — the
+                # encoder re-sends the IDR burst (we FIR on harvest
+                # completion below, and `_check_stall` FIR-storms if the
+                # param sets are ever lost), so we resume cleanly once the
+                # new SPS/PPS land and the decoder is rebuilt.
+                return
+            # Harvest just completed inside the call above: `set_params` +
+            # `restart` rebuilt the context at the new dimensions, so the
+            # remaining NALUs in THIS group (the new-canvas IDR slice) are
+            # safe to feed below.
+
+        if incomplete:
+            # Don't feed a partial access unit. The broken reference chain
+            # is re-rooted by the FIR the decoder's missing-ref / wedge
+            # path requests once a later complete frame references this
+            # dropped one.
+            return
+
+        for nalu in nalus:
             self._decoder.feed_nalu(nalu, ti)
+
+    def _harvest_param_sets(self, nalus: list[bytes]) -> None:
+        """Accumulate fresh VPS/SPS/PPS from the new encoder's burst, then
+        install them and restart the decoder once all three are seen.
+
+        Apple's HEVC encoder emits parameter sets only with an IDR burst,
+        and they can be split across multiple RTP timestamp groups (VPS in
+        one Aggregation Packet, SPS/PPS in another, or a lost one re-sent
+        on its own). So we accumulate into `self._harvest_*` across calls
+        rather than requiring all three in a single flushed group — matching
+        how `gather_initial_burst` harvests them. PPS is keyed by its
+        ue(v)-decoded pic_parameter_set_id (same as burst.py), not the raw
+        byte. No nal-ref-idc filter: that is an H.264 concept; in HEVC
+        those bits are part of nal_unit_type."""
+        from .media.nalu import NAL_VPS, NAL_SPS, NAL_PPS
+        from .media.bitstream import BitReader, remove_emulation_prevention
+
+        for nalu in nalus:
+            if len(nalu) < 2:
+                continue
+            nt = (nalu[0] >> 1) & 0x3F
+            if nt == NAL_VPS:
+                self._harvest_vps = nalu
+            elif nt == NAL_SPS:
+                self._harvest_sps = nalu
+            elif nt == NAL_PPS and len(nalu) > 2:
+                try:
+                    pps_id = BitReader(
+                        remove_emulation_prevention(nalu[2:])
+                    ).read_ue()
+                except Exception:
+                    continue
+                self._harvest_pps[pps_id] = nalu
+
+        if self._harvest_vps and self._harvest_sps and self._harvest_pps:
+            log.info(
+                "harvested param sets from new stream: VPS=%dB SPS=%dB PPS=%d",
+                len(self._harvest_vps), len(self._harvest_sps),
+                len(self._harvest_pps),
+            )
+            self._decoder.set_params(
+                self._harvest_vps, self._harvest_sps, dict(self._harvest_pps),
+            )
+            self._decoder.restart()
+            self._needs_param_harvest = False
+            self.request_fir()
+
+    def _harvest_avc_param_sets(self, avc_config_payload: bytes) -> None:
+        """Extract SPS/PPS from an avcC config packet and restart the AVC decoder.
+
+        Called from _flush_group when _needs_param_harvest is set and an avcC
+        config packet is seen on the new SSRC group's first burst. The avcC
+        packet carries updated SPS/PPS (potentially different num_ref_frames,
+        level, etc.) — feeding the decoder fresh extradata before the first IDR
+        prevents the "reference frames exceeds max" and IDR-parse errors that
+        occur when restart() was fired with the original burst's stale params."""
+        from .media.nalu import parse_avc_config
+        sps, ppss = parse_avc_config(avc_config_payload)
+        if not sps or not ppss:
+            log.warning("harvest_avc: avcC parse failed (%dB) — will retry", len(avc_config_payload))
+            return
+        pps_map = {i: p for i, p in enumerate(ppss)}
+        log.info("harvest_avc: SPS=%dB PPS=%d — restarting decoder with new params",
+                 len(sps), len(pps_map))
+        self._decoder.set_params(b"", sps, pps_map)
+        self._last_decoder_restart_t = time.monotonic()
+        self._dpb_error_window.clear()
+        self._decoder.restart()
+        self._needs_param_harvest = False
+        self.request_fir()
 
     def _evict_stale_groups(self) -> None:
         """Drop incomplete groups whose marker never arrived, and expire
@@ -1640,26 +2328,32 @@ class Session:
             and s not in self._ssrc_blacklist
             and counts[s] >= _DYNAMIC_SSRC_PACKET_THRESHOLD
         )
-        if len(candidates) < 4:
+        from .protocol.offers import tiles_per_frame
+        want = tiles_per_frame()  # SSRCs per group = tilesPerFrame we offered
+        if len(candidates) < want:
             return
-        # Apple emits 4 CONSECUTIVE SSRCs per tile group (one SSRC per
-        # tile). Picking the first 4 sorted candidates can grab SSRCs
+        # Apple emits `want` CONSECUTIVE SSRCs per tile group (one SSRC per
+        # tile). Picking the first `want` sorted candidates can grab SSRCs
         # from TWO different broadcast groups when Apple is double-
-        # publishing — the resulting Frankenstein map decodes 2 of 4
-        # tiles correctly and silently drops the others. Build runs of
-        # consecutive SSRCs and adopt the first complete-4 run.
+        # publishing — the resulting Frankenstein map decodes some tiles
+        # correctly and silently drops the others. Build runs of
+        # consecutive SSRCs and adopt the first complete run. (want=1 → a
+        # single-SSRC single-picture stream; want=4 → the tiled stream.)
         new_group: list[int] | None = None
         run = [candidates[0]]
-        for s in candidates[1:]:
-            if s - run[-1] <= 1 and len(run) < 4:
-                run.append(s)
-                if len(run) == 4:
-                    new_group = run
-                    break
-            else:
-                run = [s]
+        if want == 1:
+            new_group = run
+        else:
+            for s in candidates[1:]:
+                if s - run[-1] <= 1 and len(run) < want:
+                    run.append(s)
+                    if len(run) == want:
+                        new_group = run
+                        break
+                else:
+                    run = [s]
         if new_group is None:
-            return  # no consecutive 4-run yet — wait for more data
+            return  # no consecutive run of `want` yet — wait for more data
         new_map = {s: i for i, s in enumerate(new_group)}
         if new_map == self._ssrc_to_tile:
             return
@@ -1670,21 +2364,70 @@ class Session:
         # Blacklist the previously-adopted group so we never go back.
         self._ssrc_blacklist.update(self._ssrc_to_tile.keys())
         self._ssrc_to_tile = new_map
+        # A fresh SSRC group is a fresh encoder instance: its LTR frame
+        # ordinals (the "monotonic per decoded frame" id in RTCP_APP_LTRP)
+        # restart from zero. Our ack counter must restart too — otherwise we
+        # keep acking the OLD encoder's high ids, which the new encoder never
+        # issued, so it can't pin a long-term reference and its P-frames drift
+        # against a reference our DPB doesn't share → cross-tile corruption and
+        # flicker. Reset so the new stream is acked from its own frame 0.
+        self._ltr_tile_counts = {}
+        self._ltr_last_acked = 0
+        # Keep the authoritative tile count in step with the adopted
+        # group so num_tiles (and the frontend's per-tile loops) track a
+        # mid-session tile-count change rather than the connect-time value.
+        self._observed_tile_count = len(new_map)
         self._last_ssrc_adopt_ts = now
         # Grace window: pretend frames just flowed so the frame-flow gate
         # gives the new mapping ~0.5 s to start producing before we
         # consider another adoption.
         self._last_publish_t = now
         if self._decoder is not None:
-            # Restart the decoder + FIR for the new tiles. We tried
-            # skipping the restart to avoid a 1.5–6 s outage, but
-            # without it the SW fallback path can't re-feed burst
-            # NALUs and the new context starves until an unprompted
-            # IDR shows up (often never).
-            self._last_decoder_restart_t = now
-            self._dpb_error_window.clear()
-            self._decoder.restart()
-            self.request_fir()
+            # If a dynamic resolution change is in flight, defer the
+            # decoder restart until the video process loop harvests
+            # fresh VPS/SPS/PPS from the new encoder's burst. The old
+            # param sets are stale (old resolution) and would make
+            # the restarted decoder reject all frames.
+            if self._needs_param_harvest:
+                log.info("SSRC adoption deferred — waiting for param harvest")
+                self._dpb_error_window.clear()
+                self.request_fir()
+            else:
+                self._dpb_error_window.clear()
+                if self._resolved_codec == "avc":
+                    # AVC plain SSRC adoption: soft-reset (reset DPB tracking
+                    # state WITHOUT flushing the libav codec context or DPB).
+                    #
+                    # Apple's FIR responses after an SSRC group switch are
+                    # 'P-IDR' NALUs — nal_unit_type=5 header but a non-intra
+                    # slice that references DPB frames from the PRIOR encoder
+                    # context. A full restart() wipes the DPB, so every P-IDR
+                    # fails ("A non-intra slice in an IDR NAL unit" / "no frame!"),
+                    # the concealment handler fires another FIR, the encoder
+                    # restarts again, and the cycle repeats ~every 2 s — an
+                    # indefinite FIR storm with persistent image corruption.
+                    #
+                    # With an intact DPB the P-IDRs decode immediately, frames
+                    # flow normally, and the encoder's next natural I-IDR
+                    # re-anchors the DPB cleanly. The resolution is the same
+                    # (same SPS) so we do NOT set _needs_param_harvest here;
+                    # that flag is reserved for genuine 0x451 canvas resizes.
+                    self._last_decoder_restart_t = now
+                    self._decoder.soft_reset()
+                    self.request_fir()
+                else:
+                    # HEVC: SPS/PPS are inline NALs in the new IDR burst;
+                    # restart so the decoder absorbs them on arrival.
+                    # Guard against rapid back-to-back SSRC rotations (e.g.
+                    # Apple emitting two new groups within 2 s at curtain
+                    # start): the second full restart discards IDR frames
+                    # in-flight for the first group's FIR, making recovery
+                    # nearly impossible.  If we just restarted within 3 s
+                    # the decoder is already fresh — skip the redundant
+                    # teardown and let the FIR re-anchor the new group.
+                    if self._claim_restart(now, 3.0):
+                        self._decoder.restart()
+                    self.request_fir()
 
     # ── RTCP RX loop (server SR for jitter / dlsr) ──────────────────
 
@@ -1849,7 +2592,11 @@ class Session:
         #   11 = UserSessionChanged
         if msg_type == 0x14:
             cmd = struct.unpack(">H", msg[6:8])[0] if len(msg) >= 8 else None
-            log.debug("server sent 0x14 misc-status (cmd=%s): %s", cmd, msg.hex())
+            # Only log on change — the host re-pushes the same status
+            # (typically cmd=4) every couple seconds, which is pure noise.
+            if cmd != self._last_misc_status_cmd:
+                log.debug("server sent 0x14 misc-status (cmd=%s): %s", cmd, msg.hex())
+                self._last_misc_status_cmd = cmd
             if cmd == 2:
                 log.info("remote clipboard changed; sending fetch (0x0b)")
                 try:
@@ -1865,6 +2612,15 @@ class Session:
             if full is not None:
                 self._handle_clipboard_send(full)
             return
+
+        # NOTE: the mid-session 0x1c re-offer's answer is delivered framed
+        # as a 0x00 FBU (an embedded bplist), NOT as a top-level 0x1c — so
+        # there is no `msg_type == 0x1c` branch here. The authoritative new
+        # geometry comes from the 0x451 AppleDisplayLayout rect handled in
+        # _handle_fbu, and the decoder picks up the new dimensions from the
+        # harvested SPS. (An earlier 0x1c branch that called
+        # extract_canvas_dims was a dead no-op — that helper rejects any
+        # message whose first byte isn't 0x00.)
 
         # 0x00: FrameBufferUpdate. On the TCP control channel this only
         # ever carries pseudo-encoding rects (cursor enc 1104, etc.) —
@@ -1892,43 +2648,239 @@ class Session:
         #   then n_rects × { rect_header (12B) + encoding_payload }
         n_rects = struct.unpack(">H", msg[2:4])[0]
         offset = 4
+        _dbg_cursor = os.environ.get("ISS_CURSOR_DEBUG") == "1"
+        _dbg_encs: list[str] = []
+        saw_cursor = False
         for _ in range(n_rects):
             if offset + 12 > len(msg):
                 log.debug("FBU truncated at rect header (offset=%d)", offset)
+                if _dbg_cursor:
+                    log.info("FBU n_rects=%d encs=[%s] TRUNCATED len=%d",
+                             n_rects, ",".join(_dbg_encs), len(msg))
                 return
             f0, f1, f2, f3, encoding = struct.unpack(
                 ">HHHHi", msg[offset:offset + 12],
             )
             offset += 12
+            if _dbg_cursor:
+                _dbg_encs.append("0x%x@(%d,%d,%d,%d)" % (
+                    encoding & 0xffffffff, f0, f1, f2, f3))
             if encoding == 1104:
+                saw_cursor = True
                 consumed = self._handle_cursor_rect(msg, offset, f0, f1, f2, f3)
                 if consumed < 0:
                     return
                 offset += consumed
-            elif encoding in (1010, 1011):
-                # Apple-private config blobs: u16 BE size + payload.
-                # We don't decode them but need to skip past so any
-                # cursor rect that follows in the same FBU is reached.
+            elif encoding in (1010, 1011, 1105, 1107, 1109, 1110):
+                # Apple-private config blobs: u16 BE size + payload. We don't
+                # decode them but need to skip past so any 1104 cursor rect
+                # that follows in the same FBU is still reached.
+                # Known content (from prior RE, none of it required to render):
+                #   1010 — bplist (media-stream negotiation blob)
+                #   1011 — sibling of 1010 in some sessions
+                #   1105 — display info struct (dims, "main" sentinel, scale)
+                #   1107 — VendorKeysyms
+                #   1109 — keyboard input source string (e.g. com.apple.keylayout.US)
+                #   1110 — device info (host model identifier string)
                 if offset + 2 > len(msg):
                     return
                 sz = struct.unpack(">H", msg[offset:offset + 2])[0]
                 if offset + 2 + sz > len(msg):
                     return
                 offset += 2 + sz
+            elif encoding == 0x451:
+                # AppleDisplayLayout: server confirms/announces display
+                # geometry. Payload is a u16 prefix_length followed by
+                # that many bytes of layout data (scaled_w/h, backing
+                # w/h at +4..+11). The remainder is opaque trailing
+                # fields (revision gap). Consume the rect and update
+                # the runtime canvas dimensions so the frontend can
+                # resize its framebuffer.
+                #
+                # A layout event marks a display/session transition — the
+                # point at which the daemon's cursor sender otherwise goes
+                # silent (the post-login/lock freeze). We re-arm the
+                # free-running TCP update sender (AutoFrameBufferUpdate 0x09 +
+                # non-incremental FBU request, like applehpdebug.c::
+                # apple_hp_request_full_refresh_now) at the END of this branch,
+                # AFTER the new backing dims are parsed below, so the 0x09
+                # region matches the geometry this layout announces rather than
+                # the previous (stale) one. Done on EVERY 0x451 so cursor
+                # (enc 1104) SELECTs keep flowing across a login/lock switch.
+                if offset + 2 > len(msg):
+                    return
+                prefix_len = struct.unpack(">H", msg[offset:offset + 2])[0]
+                # Validate the declared payload fits before reading it, so
+                # a truncated/short rect can't raise struct.error and kill
+                # the RX thread (mirrors the 1010/1011 branch).
+                if offset + 2 + prefix_len > len(msg):
+                    return
+                needs_post_layout_arm = False
+                if prefix_len >= 10:
+                    sw = struct.unpack(">H", msg[offset + 4:offset + 6])[0]
+                    sh = struct.unpack(">H", msg[offset + 6:offset + 8])[0]
+                    bw = struct.unpack(">H", msg[offset + 8:offset + 10])[0]
+                    bh = struct.unpack(">H", msg[offset + 10:offset + 12])[0]
+                    # Backing (pixel) dims drive GPU texture sizing; only
+                    # trust them when present. Never substitute the scaled
+                    # (logical) size for backing — on HiDPI that would
+                    # under-size the textures and overrun on upload.
+                    new_bw = bw if (bw and bh) else self._runtime_canvas_w
+                    new_bh = bh if (bw and bh) else self._runtime_canvas_h
+                    if sw and sh:
+                        # Only consider it a runtime change if we already
+                        # had a canvas — the first 0x451 is the initial
+                        # layout confirmation, not a resize.
+                        had_canvas = (
+                            self._runtime_canvas_w > 0
+                            and self._runtime_canvas_h > 0
+                        )
+                        changed = had_canvas and (
+                            new_bw != self._runtime_canvas_w
+                            or new_bh != self._runtime_canvas_h
+                        )
+                        if new_bw and new_bh:
+                            self._runtime_canvas_w = new_bw
+                            self._runtime_canvas_h = new_bh
+                            # Keep the pointer clamp in step with the canvas
+                            # the frontend maps clicks into (canvas_dims);
+                            # otherwise the host mis-places the cursor after
+                            # a mid-session resize.
+                            if self._input is not None:
+                                self._input.set_server_dims(new_bw, new_bh)
+                        self._runtime_scaled_w = sw
+                        self._runtime_scaled_h = sh
+                        log.info(
+                            "AppleDisplayLayout: scaled=%dx%d backing=%dx%d"
+                            " changed=%s",
+                            sw, sh, bw, bh, changed,
+                        )
+                        if changed:
+                            self._needs_param_harvest = True
+                            # Start a clean harvest — discard any stale
+                            # accumulators from a prior (old-resolution)
+                            # harvest so they can't complete this one early.
+                            self._harvest_vps = None
+                            self._harvest_sps = None
+                            self._harvest_pps = {}
+                            log.info("AppleDisplayLayout: flagged param harvest for new canvas")
+                            # The server is waiting for a full-refresh request
+                            # at the new geometry before it resumes the HEVC
+                            # encoder; do the media re-offer below, after the
+                            # cursor re-arm has sent the non-incremental FBUR.
+                            needs_post_layout_arm = True
+                # Re-arm the free-running TCP sender now that _runtime_canvas_w/h
+                # reflect THIS layout (0x09 + non-incremental FBUR). Always, so
+                # the cursor keeps flowing even on no-geometry-change layouts.
+                self._send_cursor_rearm()
+                if needs_post_layout_arm:
+                    # Geometry actually changed — additionally re-offer the
+                    # media session (0x1c) so the encoder restarts at the new
+                    # canvas. The FBUR it needs was just sent by the re-arm.
+                    self._schedule_post_layout_arm()
+                offset += 2 + prefix_len
             else:
                 # Unknown pseudo-encoding on the control channel — we
                 # can't tell its payload size, so we have to give up
-                # parsing the rest of this FBU. The next msg starts
-                # with a fresh type byte so this isn't fatal.
-                log.debug("FBU rect with unknown encoding=%d; aborting walk",
-                          encoding)
+                # parsing the rest of this FBU (dropping any cursor rect
+                # that follows). The next msg starts with a fresh type
+                # byte so this isn't fatal. Surface it under the cursor
+                # debug flag so a still-dropped cursor command is visible.
+                if _dbg_cursor:
+                    log.info("FBU walk ABORT at unknown encoding=0x%x (%d); "
+                             "encs so far=[%s] — rects after this are dropped",
+                             encoding & 0xffffffff, encoding,
+                             ",".join(_dbg_encs))
+                else:
+                    log.debug("FBU rect with unknown encoding=%d; aborting walk",
+                              encoding)
                 return
-        # Note: no re-arm. The daemon's cursor sender is a free-running
-        # pthread (SendFrameBuffer) that calls EncodeCursorImageWithAlpha
-        # whenever the host's cursor changes, gated by a single flag
-        # that's set once when SetEncodings advertises encoding 1104.
-        # msg 0x03 (FBU req) does NOT touch any cursor state and
-        # cannot trigger or accelerate cursor sends.
+        if _dbg_cursor and (n_rects != 1 or any("0x450" in e for e in _dbg_encs)):
+            # Log multi-rect FBUs and any FBU carrying a cursor (0x450/1104)
+            # rect, so we can see whether a cursor command is present but
+            # mis-framed vs genuinely absent during a post-login freeze.
+            log.info("FBU n_rects=%d encs=[%s]", n_rects, ",".join(_dbg_encs))
+        # No per-FBU re-arm. The daemon's TCP update sender free-runs once
+        # armed by AutoFrameBufferUpdate (0x09) — it does NOT need a fresh
+        # FramebufferUpdateRequest per rect. The native client confirms this:
+        # in the captured session it sends only a handful of non-incremental
+        # FBU requests total (at startup and at each AppleDisplayLayout), each
+        # paired with a 0x09, and never one-per-update. The re-arm that keeps
+        # the cursor flowing across a login/lock/agent switch is sent from the
+        # 0x451 handler below (AutoFrameBufferUpdate + non-incremental FBUR),
+        # mirroring applehpdebug.c::apple_hp_request_full_refresh_now.
+
+    def _schedule_post_layout_arm(self) -> None:
+        """Called from the 0x451 handler on a geometry CHANGE. Re-offers the
+        media session (0x1c) with the same SRTP keys so the server restarts
+        the HEVC encoder at the new canvas dimensions. Without the 0x1c
+        re-offer the server stops encoding — it won't resize the media canvas
+        without a fresh media-stream configuration.
+
+        The non-incremental FBU request the encoder restart needs is already
+        sent by `_send_cursor_rearm()` immediately before this call (see the
+        0x451 handler), so this method no longer sends its own FBUR — that
+        avoided a duplicate full-refresh request per resize.
+        """
+        neg = self._negotiation
+        if neg is None:
+            return
+        from .protocol.negotiation import build_0x1c
+
+        # Re-offer the media session. We reuse the same SRTP keys —
+        #    the server accepts this and restarts the encoder at the new
+        #    canvas size. (The native app generates new keys for each
+        #    round; we may revisit this once the full round-trip key
+        #    lifecycle is understood.)
+        try:
+            vo = getattr(self, '_video_offer', None)
+            ao = getattr(self, '_audio_offer', None)
+            if vo is None or ao is None:
+                vo, ao = create_offers()
+            msg_1c = build_0x1c(
+                ao, vo, neg.keys,
+                alt_session=self._config.alt_session,
+            )
+            neg.cipher.encrypt_and_send(neg.sock, msg_1c)
+            log.info("post-layout: sent 0x1c re-offer (%dB)", len(msg_1c))
+        except OSError as e:
+            log.warning("post-layout 0x1c send failed: %s", e)
+
+        # 3) Defer FIR to the TX thread.
+        self._needs_post_layout_fir = True
+
+    def _send_cursor_rearm(self) -> None:
+        """Re-arm the daemon's free-running TCP update sender so the cursor
+        pseudo-encoding (enc 1104) keeps flowing across a display/session
+        transition.
+
+        Mirrors applehpdebug.c::apple_hp_request_full_refresh_now: send
+        AutoFrameBufferUpdate (0x09) followed by a non-incremental
+        FramebufferUpdateRequest, using the backing (pixel) canvas dims for
+        the 0x09 region (the native uses apple_hp_backing_width/height). This
+        is lightweight — unlike _schedule_post_layout_arm it does NOT re-offer
+        the media session — so it's safe to call at every 0x451, including the
+        no-geometry-change layout events emitted at a login/lock/agent switch
+        (the case that froze the cursor before).
+        """
+        neg = self._negotiation
+        if neg is None:
+            return
+        from .protocol.negotiation import (
+            build_auto_framebuffer_update,
+            build_fbu_request,
+        )
+        # Backing/pixel dims for the AutoFrameBufferUpdate region. Fall back
+        # to full (0xFFFF) only if we don't yet have a runtime canvas.
+        rw = self._runtime_canvas_w or 0xFFFF
+        rh = self._runtime_canvas_h or 0xFFFF
+        try:
+            neg.cipher.encrypt_and_send(
+                neg.sock, build_auto_framebuffer_update(rw, rh))
+            neg.cipher.encrypt_and_send(
+                neg.sock, build_fbu_request(incremental=False))
+        except OSError as e:
+            log.debug("cursor re-arm (0x09 + FBUR) failed: %s", e)
 
     def _handle_cursor_rect(
         self, msg: bytes, offset: int,
@@ -1952,6 +2904,9 @@ class Session:
         payload_off = offset + 8
         if payload_off + comp_size > len(msg):
             return -1
+        if os.environ.get("ISS_CURSOR_DEBUG") == "1":
+            log.info("cursor-rect: dims=%dx%d hot=(%d,%d) cache_id=%d comp_size=%d",
+                     cursor_w, cursor_h, hotspot_x, hotspot_y, cache_id, comp_size)
         if comp_size == 0:
             # Cache hit: server sent just the cache_id. Pull our cached
             # cursor for this id and re-apply. Cache IDs are arbitrary
@@ -2032,6 +2987,12 @@ class Session:
     def _notify_cursor(self, img: Optional[_CursorImage]) -> None:
         self._cursor_msgs_processed += 1
         self._cursor_last_t = time.monotonic()
+        if os.environ.get("ISS_CURSOR_DEBUG") == "1":
+            if img is None:
+                log.info("cursor-notify: None (cache-miss / revert-to-default)")
+            else:
+                log.info("cursor-notify: %dx%d hotspot=(%d,%d)",
+                         img.width, img.height, img.hotspot_x, img.hotspot_y)
         cb = self._cursor_callback
         if cb is None:
             return
@@ -2087,15 +3048,36 @@ class Session:
 
     # ── TX loop (heartbeat + RTCP + on-demand FIR/PLI/NACK + watchdog) ─
 
+    def _maybe_poll_cursor(self) -> None:
+        """Periodic minimal (1x1) FramebufferUpdateRequest, every tx tick
+        (~2/s), to keep the daemon's cursor (enc 1104) sender armed so cursor-
+        shape changes keep flowing after the screen goes idle. The daemon
+        re-arms its sender after each rect and goes quiet without ongoing
+        requests (the 'cursor freezes after idle' bug — RE'd: the daemon's
+        threads are all alive, it's request-starvation, not a dead pthread).
+        The 1x1 region keeps it from pulling video (see
+        InputController.request_framebuffer_update)."""
+        if self._input is None:
+            return
+        try:
+            self._input.request_framebuffer_update()
+        except Exception:
+            pass
+
     def _tx_loop(self) -> None:
         while not self._stop_evt.is_set():
             self._tx_tick += 1
             try:
                 self._send_heartbeat()
                 self._send_rr_and_maybe_sr()
+                if self._needs_post_layout_fir:
+                    self._needs_post_layout_fir = False
+                    self.request_fir()
                 self._drain_pending_fir()
                 self._drain_pending_nack()
+                self._maybe_reanchor()
                 self._check_stall()
+                self._maybe_poll_cursor()
                 if self._tx_tick % _TX_PROFILE_EVERY_N_TICKS == 0:
                     self._log_profile_snapshot()
             except Exception as e:
@@ -2130,6 +3112,26 @@ class Session:
         self._last_profile_lost_per_tile = list(lost)
         elapsed = _TX_INTERVAL_S * _TX_PROFILE_EVERY_N_TICKS
         rates = [round(d / elapsed, 1) for d in delta]
+        # Clean (non-concealed) per-tile rate — the honest "real video"
+        # signal. A tile with a high `rates` but ~0 `clean_rates` is GRAY:
+        # it's churning concealed frames at full throughput. (good_count
+        # counts concealed frames; clean_count does not.)
+        clean = self._decoder.clean_counts
+        cbase = (self._last_profile_clean
+                 if len(self._last_profile_clean) == len(clean)
+                 else [0] * len(clean))
+        cdelta = [clean[i] - cbase[i] for i in range(len(clean))]
+        if any(d < 0 for d in cdelta):
+            cdelta = list(clean)
+        self._last_profile_clean = list(clean)
+        clean_rates = [round(d / elapsed, 1) for d in cdelta]
+        # Per-tile KB/s — which screen band is eating the bandwidth.
+        n_t = len(clean)
+        tile_kbs = []
+        for ti in range(n_t):
+            db = self._tile_bytes.get(ti, 0) - self._last_tile_bytes.get(ti, 0)
+            tile_kbs.append(round(max(0, db) / elapsed / 1024, 1))
+        self._last_tile_bytes = dict(self._tile_bytes)
         # RX/TX rate deltas over the same interval.
         rx_v = self._rx_pkts_video; rx_c = self._rx_pkts_ctrl; rx_t = self._rx_pkts_tcp
         bv = self._rx_bytes_video; bc = self._rx_bytes_ctrl
@@ -2183,6 +3185,7 @@ class Session:
         types_str = " ".join(
             f"{t:02x}:{n}" for t, n in sorted(self._rx_msg_type_counts.items())
         )
+        rss_mb = _proc_rss_mb() if log.isEnabledFor(logging.DEBUG) else 0.0
         decoder_name = self._decoder._hw_name or "software"
         ssrc_groups = (
             len(self._video_decryptor.ssrc_counts) // 4
@@ -2196,16 +3199,28 @@ class Session:
         # Periodic profile log is debug-level: the same data flows out the
         # control socket as a structured snapshot for the TUI / monitors,
         # so a normal user doesn't need it spamming the log every 2 s.
+        # LTRP recovery telemetry: ack count proves iss is acking; far_ref
+        # (a P-slice referencing a POC >=16 frames back, vs the normal ~7)
+        # is the wire signature that the host honoured an ack and recovered
+        # via a long-term-style reference instead of a full IDR. far>0 with
+        # acks climbing == LTRP working end-to-end. far==0 while gray recurs
+        # == acks still no-op. See hevc_rps far_ref_events / _send_ltr_ack.
+        rps = getattr(self._decoder, "_rps_tracker", None)
+        ltr_far = getattr(rps, "far_ref_events", 0)
+        ltr_dist = getattr(rps, "max_ref_distance", 0)
+        ltr_miss = getattr(rps, "missing_ref_events", 0)
         log.debug(
-            "profile: decoder=%s tiles=%s rates=%s fps loss/tile=%s "
+            "profile: decoder=%s tiles=%s rates=%s clean_rates=%s gray_tiles=%s fps tile_KBs=%s loss/tile=%s "
+            "ltr=ack%d/far%d/dist%d/miss%d "
             "loss_total=%d unmapped=%d "
             "ssrc_groups=%d last_publish=%.1fs ago "
             "udp_q=video[%d/%d drop=%d] ctrl[%d/%d drop=%d] "
             "rx_pps=video[%.1f/%dMbps] ctrl[%.1f/%.1fkbps] tcp[%.2f] "
             "tx_pps=%.2f cursor=%dms_ago/n=%d tcp_types={%s} "
-            "nalu={%s}",
+            "nalu={%s} rss=%.1fMB",
             decoder_name,
-            good, rates, loss_delta,
+            good, rates, clean_rates, sorted(self._decoder.bad_tiles), tile_kbs, loss_delta,
+            self._ltr_acks_sent, ltr_far, ltr_dist, ltr_miss,
             loss_total, loss_unmapped,
             ssrc_groups,
             last_publish_age,
@@ -2219,6 +3234,7 @@ class Session:
             self._cursor_msgs_processed,
             types_str,
             nalu_str,
+            rss_mb,
         )
 
         # Mirror the same data, structured, onto the control socket for
@@ -2261,6 +3277,14 @@ class Session:
                     {str(t): n for t, n in d.items()}
                     for d in nalu_delta
                 ],
+                "decode_latency_ms": round(
+                    getattr(self._decoder, "decode_latency_ms", 0.0), 1
+                ) if self._decoder is not None else None,
+                "decode_q": {
+                    "depth": getattr(self._decoder, "decode_queue_depth", 0),
+                    "cap": getattr(self._decoder, "decode_queue_cap", 512),
+                    "drop": getattr(self._decoder, "decode_queue_drops", 0),
+                } if self._decoder is not None else None,
             })
 
     def _send_heartbeat(self) -> None:
@@ -2320,6 +3344,57 @@ class Session:
                 sent.append(ti)
         if sent:
             log.debug("FIR/PLI sent for tiles %s", sorted(sent))
+        # Flush any pending gray-out aggregation that's older than the
+        # debounce window so a single-tile event still surfaces if no
+        # follow-up FIR fires.
+        if (self._grayout_window_tiles
+                and time.monotonic() - self._grayout_window_t
+                >= self._GRAYOUT_WINDOW_S):
+            self._flush_grayout_event()
+
+    # poc_lsb wraps at 2^13 = 8192 frames on Apple's H.264 stream — the
+    # rollover the d3d11va decoder mishandles into a cross-tile collapse.
+    # Re-anchor (request a fresh IDR) once the decoder has fed this many frames
+    # since its last IDR, leaving ~1200 frames of margin for the FIR round-trip
+    # and IDR delivery so the wrap never actually happens.
+    _AVC_REANCHOR_FRAMES = 7000
+    # After requesting, wait this long for Apple's IDR to arrive (which resets
+    # frames_since_idr) before requesting again — avoids FIR-spamming while the
+    # keyframe is in flight, but still retries if the IDR is lost.
+    _AVC_REANCHOR_COOLDOWN_S = 3.0
+
+    def _maybe_reanchor(self) -> None:
+        """Automatic IDR re-anchor for the AVC hardware path (ISS_AVC_HW_REANCHOR).
+
+        The AMD d3d11va H.264 decoder corrupts when poc_lsb wraps (~8192 frames
+        of unbroken P-frames). Apple never re-anchors on its own, and the
+        corruption is silent (valid-looking but wrong frames, no decode error),
+        so we can't react to it after the fact — we PREEMPT it: watch the
+        decoder's frames-since-last-IDR and request a fresh IDR just before the
+        wrap. Frame-count-driven (not wall-clock), so it self-adapts to the
+        framerate and is naturally reset by any IDR — startup, SSRC adoption, or
+        our own request — meaning a recent re-anchor pushes the next one out.
+
+        Sends a plain per-tile FIR (no gate keyframe-arming), so the decoder
+        keeps publishing P-frames until the IDR lands; the only cost is the
+        keyframe burst's bandwidth, now incurred only when actually near the
+        wrap rather than on a fixed timer."""
+        if not self._avc_reanchor_enabled or not self._connected or self._decoder is None:
+            return
+        fsi = getattr(self._decoder, "frames_since_idr", 0)
+        if fsi < self._AVC_REANCHOR_FRAMES:
+            return
+        now = time.monotonic()
+        if now - self._last_reanchor_t < self._AVC_REANCHOR_COOLDOWN_S:
+            return
+        self._last_reanchor_t = now
+        sent = sum(
+            1 for ti in range(self.num_tiles)
+            if self._send_fir_for_tile(ti, log_per_tile=False)
+        )
+        log.info("AVC re-anchor: %d frames since IDR (≥%d) — requesting fresh "
+                 "IDR (%d/%d tiles) before poc wrap",
+                 fsi, self._AVC_REANCHOR_FRAMES, sent, self.num_tiles)
 
     def _send_fir_for_tile(self, tile_idx: int, log_per_tile: bool = True) -> bool:
         """Returns True if a FIR was actually emitted (False if rate-
@@ -2342,22 +3417,51 @@ class Session:
         enc = self._srtcp_enc
         if sock is None or enc is None:
             return False
-        # Combine PLI (lighter, lower-priority) with FIR via the compound
-        # builder — server processes whichever it honors first.
+        # Combine the AVPF FIR (PT=206) + PLI with the LEGACY FIR (PT=192,
+        # RFC 2032) the native viewer uses — screensharingd often ignores the
+        # AVPF FIR but answers the legacy one with a fresh IDR. The server
+        # processes whichever it honors first; recovery latency is gated on it.
         seq = (self._tx_tick & 0xFF)
         compound = compound_with_rr(
             self._our_video_ssrc,
             build_fir(self._our_video_ssrc, target_ssrc, seq)
-            + build_pli(self._our_video_ssrc, target_ssrc),
+            + build_pli(self._our_video_ssrc, target_ssrc)
+            + build_fir_legacy(target_ssrc),
         )
         try:
             sock.sendto(enc.protect(compound), (self._dest_host, self._ctrl_dest_port))
             if log_per_tile:
                 log.debug("FIR/PLI sent for tile %d (ssrc=0x%08x)", tile_idx, target_ssrc)
+            self._record_grayout_tile(tile_idx, now)
             return True
         except OSError as e:
             log.debug("FIR send failed: %s", e)
             return False
+
+    # Gray-out aggregator -------------------------------------------------
+    # Coalesce per-tile FIR emissions inside a short window into one
+    # session-level INFO line. The libav concealment message captured at
+    # detection time is appended so we can tell LTRP-ack poisoning (same
+    # ref/POC across tiles) from natural encoder DPB blips (different
+    # refs per tile) without enabling -vv.
+    _GRAYOUT_WINDOW_S: float = 0.25
+
+    def _record_grayout_tile(self, tile_idx: int, now: float) -> None:
+        if (not self._grayout_window_tiles
+                or now - self._grayout_window_t >= self._GRAYOUT_WINDOW_S):
+            if self._grayout_window_tiles:
+                self._flush_grayout_event()
+            self._grayout_window_t = now
+        self._grayout_window_tiles.add(tile_idx)
+
+    def _flush_grayout_event(self) -> None:
+        if not self._grayout_window_tiles:
+            return
+        tiles = sorted(self._grayout_window_tiles)
+        msg = self._last_concealment_msg or "no libav concealment captured"
+        log.info("gray-out: tiles %s recovering via FIR (libav: %s)", tiles, msg)
+        self._grayout_window_tiles.clear()
+        self._last_concealment_msg = ""
 
     def _drain_pending_nack(self) -> None:
         sock = self._sock_ctrl
@@ -2378,6 +3482,25 @@ class Session:
             except OSError as e:
                 log.debug("NACK send failed: %s", e)
 
+    def _claim_restart(self, now: float, min_interval: float) -> bool:
+        """Atomically claim the shared decoder-restart debounce.
+
+        Returns True — and records `now` as the last restart time — iff no
+        restart has been claimed within the last `min_interval` seconds.
+        The check-then-set runs under `_restart_guard` so the video-process
+        thread (SSRC adoption / param harvest) and the tx thread (stall /
+        saturation / FIR-exhaust watchdogs) can't both pass a stale interval
+        check and issue overlapping `decoder.restart()` calls — the
+        cross-thread race that double-tore-down the native QSV/MFX session
+        (STATUS_ACCESS_VIOLATION). The decoder's own `_lifecycle_lock` makes
+        a slipped-through overlap *safe*; this keeps it from happening at all.
+        """
+        with self._restart_guard:
+            if now - self._last_decoder_restart_t < min_interval:
+                return False
+            self._last_decoder_restart_t = now
+            return True
+
     def _check_stall(self) -> None:
         """Decoder-stall recovery. Two failure modes:
 
@@ -2387,10 +3510,15 @@ class Session:
           B. *One tile* frozen but the others publish (Apple sometimes
              ignores per-tile FIRs after a SkyLight transition). The
              session-wide last_publish_t looks healthy because the
-             other tiles update it. We need a per-tile watchdog: if
-             any tile's quality-gate has been firing bad-state for
-             >3 s, force a decoder restart so all tiles re-bootstrap
-             from a fresh burst.
+             other tiles update it. A per-tile watchdog keeps a backstop
+             FIR storm on tiles whose `bad_streak` is high — but it does
+             NOT restart/flush the shared decoder (that wipes the healthy
+             tiles' DPB → all-tile freeze cascade; see hevc._try_recovery).
+             The stuck tile rides its last frame until its IDR re-roots it.
+
+        Only Path A's 15 s *total* freeze (no tile publishing at all) still
+        falls back to a decoder restart — at that point there are no
+        healthy tiles left to orphan.
 
         Never marks the session dead from this path — consumers
         handle reconnect on stall via the TCP read-loop separately."""
@@ -2398,6 +3526,15 @@ class Session:
             return
         gap = time.monotonic() - self._last_publish_t
         now = time.monotonic()
+
+        # Track whether packet loss is actively growing — the discriminator
+        # for Path B's two stuck-tile failure modes. A broken-ref stall from
+        # real loss must NOT flush (cascade); a *lossless* stall is a genuine
+        # VideoToolbox saturation wedge that only a restart can clear.
+        cur_loss = self._lost_pkts
+        if cur_loss > getattr(self, "_loss_at_prev_stall_check", 0):
+            self._last_loss_growth_t = now
+        self._loss_at_prev_stall_check = cur_loss
 
         # --- A: session-wide stall ---
         # Apple usually responds to a FIR within ~1 RTT, so keep
@@ -2408,26 +3545,58 @@ class Session:
         # path is the same either way. Only restart after a really
         # long unrecovered silence (≥ 15 s) where the decoder may
         # genuinely be stuck on internal state.
-        if gap > 15.0 and self._decoder is not None:
-            last_restart = getattr(self, "_last_decoder_restart_t", 0.0)
-            if now - last_restart >= 8.0:
-                # Same Apple-idle suppression as the 3 s path: if no
-                # packets are arriving, Apple isn't encoding, restart
-                # + FIR can't help. Wait for packets to resume.
-                quiet_for = (now - self._last_video_pkt_t
-                             if self._last_video_pkt_t > 0.0 else 0.0)
-                if quiet_for >= 1.5:
-                    return
-                self._last_decoder_restart_t = now
+        #
+        # Saturation wedge (fast path): video packets ARE flowing but the
+        # decoder has produced nothing for a few seconds AND loss is not
+        # growing → a genuine VideoToolbox internal wedge (errno=35 on every
+        # send, even the recovery IDR — incompressible content above the HW
+        # decoder's real-time throughput). EAGAIN no longer bumps bad_streak
+        # (see hevc._handle_decode_error) so Path B can't catch this, and the
+        # no-flush path can't clear an internal VT wedge — only a codec
+        # rebuild does. Gated on NO recent loss so a broken-ref (loss) stall
+        # never restarts here (it stays no-flush). Catches it at ~4 s instead
+        # of the 15 s last resort.
+        recent_loss = (now - getattr(self, "_last_loss_growth_t", 0.0)
+                       < self._SATURATION_LOSS_FREE_WINDOW_S)
+        pkts_flowing = (self._last_video_pkt_t > 0.0
+                        and now - self._last_video_pkt_t < 0.5)
+        if (gap > self._SATURATION_RESTART_GAP_S and self._decoder is not None
+                and not recent_loss and pkts_flowing):
+            if self._claim_restart(now, 3.0):
                 log.warning(
-                    "decoder stuck %.1fs (long); restart decoder + FIR storm",
-                    gap,
+                    "decoder stuck %.1fs, packets flowing, no loss for %.0fs — "
+                    "no-flush FIR didn't recover; restart decoder + FIR",
+                    gap, self._SATURATION_LOSS_FREE_WINDOW_S,
                 )
                 try:
                     self._decoder.restart()
                 except Exception as e:
-                    log.debug("decoder.restart() failed: %s", e)
+                    log.debug("saturation restart failed: %s", e)
                 self.request_fir()
+                return
+        if gap > 15.0 and self._decoder is not None:
+            # Non-atomic pre-check only decides whether to handle here vs fall
+            # through to the gap>3 / Path-B/C logic when still inside the
+            # debounce window; the real claim is atomic (_claim_restart).
+            if now - self._last_decoder_restart_t >= 8.0:
+                # Same Apple-idle suppression as the 3 s path: if no
+                # packets are arriving, Apple isn't encoding, restart
+                # + FIR can't help. Wait for packets to resume — and do NOT
+                # claim the debounce, so a real wedge isn't delayed.
+                quiet_for = (now - self._last_video_pkt_t
+                             if self._last_video_pkt_t > 0.0 else 0.0)
+                if quiet_for >= 1.5:
+                    return
+                if self._claim_restart(now, 8.0):
+                    log.warning(
+                        "decoder stuck %.1fs (long); restart decoder + FIR storm",
+                        gap,
+                    )
+                    try:
+                        self._decoder.restart()
+                    except Exception as e:
+                        log.debug("decoder.restart() failed: %s", e)
+                    self.request_fir()
                 return
         if gap > 3.0:
             last_fir = getattr(self, "_last_stall_fir_t", 0.0)
@@ -2476,19 +3645,78 @@ class Session:
             return
         worst = max((s.bad_streak for s in states), default=0)
         if worst >= STUCK_TILE_ERRORS:
-            last_restart = getattr(self, "_last_decoder_restart_t", 0.0)
-            if now - last_restart >= 4.0:
-                self._last_decoder_restart_t = now
-                log.warning(
-                    "tile stuck (worst bad_streak=%d errors); "
-                    "restart decoder + FIR storm",
-                    worst,
-                )
-                try:
-                    self._decoder.restart()
-                except Exception as e:
-                    log.debug("per-tile-stall restart failed: %s", e)
-                self.request_fir()
+            recent_loss = (now - getattr(self, "_last_loss_growth_t", 0.0)
+                           < self._SATURATION_LOSS_FREE_WINDOW_S)
+            stuck = [i for i in range(self.num_tiles)
+                     if states[i].bad_streak >= STUCK_TILE_ERRORS]
+            if recent_loss:
+                # Broken reference chain from real packet loss. A stuck TILE
+                # must NOT restart/flush the SHARED decoder: `restart()`
+                # wipes all four tiles' DPB, orphaning the 3 healthy tiles
+                # (no per-tile IDR re-roots them) → an all-tile freeze +
+                # errno=35 restart-loop (the exact cascade hevc._try_recovery
+                # avoids). Keep a backstop FIR storm; the healthy tiles run on
+                # and hevc.py drops the stuck tile's P-frames until its IDR.
+                last_fir = getattr(self, "_last_stuck_tile_fir_t", 0.0)
+                if now - last_fir >= 2.0:
+                    self._last_stuck_tile_fir_t = now
+                    log.warning(
+                        "tile stuck (worst bad_streak=%d, tiles=%s, loss "
+                        "active); FIR storm, no flush (native-aligned)",
+                        worst, stuck,
+                    )
+                    self.request_fir()
+            else:
+                # Lossless stall = genuine VideoToolbox saturation wedge
+                # (errno=35 on every send, even the recovery IDR — content
+                # above the HW decoder's real-time throughput). The no-flush
+                # path can't clear an internal VT wedge; only a codec rebuild
+                # does. Safe to restart here: with no loss there are no
+                # missing refs to orphan, so no cascade. Throttled so the
+                # decoder can re-bootstrap before another restart.
+                if self._claim_restart(now, 4.0):
+                    log.warning(
+                        "tile stuck (worst bad_streak=%d, tiles=%s, no loss) "
+                        "— VT saturation wedge; restart decoder + FIR",
+                        worst, stuck,
+                    )
+                    try:
+                        self._decoder.restart()
+                    except Exception as e:
+                        log.debug("saturation-wedge restart failed: %s", e)
+                    self.request_fir()
+
+        # --- C: FIR-exhaustion escalation ---
+        # When the quality gate exhausts its FIR cap, it stops emitting
+        # FIRs but now keeps keyframe_required set so we can detect the
+        # stuck state here.  After a 30 s cooldown (long enough that a
+        # slow Apple response would have landed, short enough not to leave
+        # the user watching a frozen tile), restart the decoder to give
+        # it a fresh codec context and re-anchor via a new FIR.
+        # _fir_last_t[0] is updated only on FIR emission, so after the
+        # cap it freezes at the cap-triggering attempt's timestamp —
+        # making (now - _fir_last_t[0]) a reliable "time since cap" proxy.
+        if self._decoder is not None:
+            gate = self._decoder._gate
+            if (gate._cap_warned[0]
+                    and gate._keyframe_required
+                    and gate._fir_last_t[0] > 0.0):
+                last_restart = self._last_decoder_restart_t
+                secs_since_cap = now - gate._fir_last_t[0]
+                if (gate._fir_last_t[0] > last_restart
+                        and secs_since_cap >= 30.0
+                        and self._claim_restart(now, 30.0)):
+                    stuck_n = len(gate._keyframe_required)
+                    log.warning(
+                        "FIR cap exhausted %.0fs ago, %d tile(s) still "
+                        "stuck — restart decoder + FIR to re-anchor",
+                        secs_since_cap, stuck_n,
+                    )
+                    try:
+                        self._decoder.restart()
+                    except Exception as e:
+                        log.debug("fir-exhaust restart failed: %s", e)
+                    self.request_fir()
 
     # ── tx-side port helpers ─────────────────────────────────────────
 
