@@ -90,6 +90,10 @@ class VTHevcDecoder:
         self.num_tiles = num_tiles
         self._on_frame_published = on_frame_published
         self._tiles = [_VTSlot() for _ in range(num_tiles)]
+        # API parity with HevcDecoder: session.py reads last_clean_donl[0] for
+        # the LTRP DON-ack. VideoToolbox steers its own references and never
+        # uses iss-side LTRP, so this stays all-None → session.py acks no DON.
+        self.last_clean_donl: list = [None] * num_tiles
         # Per-tile NAL-unit-type histogram (diagnostic; read by the snapshot).
         self.nalu_counts_per_tile: list = [{} for _ in range(num_tiles)]
         # session.py reads `_decoder._gate._states[ti].bad_streak` (stall
@@ -177,11 +181,17 @@ class VTHevcDecoder:
                 if idx < len(nalus):
                     self.feed_nalu(nalus[idx], ti)
 
-    def feed_nalu(self, nalu: bytes, tile_idx: int) -> None:
+    def feed_nalu(self, nalu: bytes, tile_idx: int,
+                  donl: Optional[int] = None) -> None:
         """Wrap one NAL unit in a length-prefixed CMSampleBuffer and submit it
         for async decode. The output is dispatched to `tile_idx` by the closure
         below. No RPS pre-check / no drop: VT manages its own DPB and conceals
-        missing refs instead of blocking."""
+        missing refs instead of blocking.
+
+        `donl` (the libav path's HEVC decoding-order number, used there for
+        DON-based LTRP reference tracking) is accepted for API parity with
+        `HevcDecoder.feed_nalu` and intentionally ignored: VideoToolbox owns
+        its own DPB + decode ordering, so iss does not steer its references."""
         session = self._session
         if session is None or not nalu:
             return
@@ -382,6 +392,22 @@ class VTHevcDecoder:
     @property
     def good_counts(self) -> list:
         return [t.good_count for t in self._tiles]
+
+    @property
+    def clean_counts(self) -> list:
+        """Per-tile CLEAN (non-concealed) published-frame totals, the signal
+        session.py uses to flag GRAY tiles (high frame rate, ~0 clean = gray).
+        VideoToolbox conceals missing refs internally at Apple quality and does
+        not publish the libav-style persistent-gray frames this metric exists
+        to catch, so every published (good) frame counts as clean. Aliasing
+        good_counts keeps API parity with HevcDecoder.clean_counts."""
+        return [t.good_count for t in self._tiles]
+
+    @property
+    def bad_tiles(self) -> set:
+        """Tiles the gate considers gray/concealing and awaiting recovery.
+        Delegates to the gate (decoder-agnostic), matching HevcDecoder."""
+        return self._gate.bad_tiles
 
     # -- lifecycle ----------------------------------------------------------
 

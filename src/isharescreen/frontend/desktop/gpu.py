@@ -63,6 +63,55 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 """
 
 
+# Biplanar variant: chroma comes from ONE rg8unorm texture carrying the
+# interleaved UV plane verbatim (Apple nv24 `v is None` passthrough — the
+# native VideoToolbox decoder and libav's nv24 path both emit it). Texel
+# .r = Cb (U), .g = Cr (V). Deinterleaving here — a free GPU texture fetch —
+# instead of on the CPU removes the single biggest cost in the live decode
+# pipeline (~half a core at 4-tile/60fps; see hevc.py _LEGACY_CHROMA). Same
+# BT.709 full-range matrix as the planar shader.
+WGSL_BIPLANAR = """
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> VsOut {
+    let xy = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 3.0, -1.0),
+        vec2<f32>(-1.0,  3.0),
+    );
+    let uv = array<vec2<f32>, 3>(
+        vec2<f32>(0.0, 1.0),
+        vec2<f32>(2.0, 1.0),
+        vec2<f32>(0.0, -1.0),
+    );
+    var o: VsOut;
+    o.pos = vec4<f32>(xy[i], 0.0, 1.0);
+    o.uv = uv[i];
+    return o;
+}
+
+@group(0) @binding(0) var y_tex: texture_2d<f32>;
+@group(0) @binding(1) var uv_tex: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
+
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4<f32> {
+    let y  = textureSample(y_tex, samp, in.uv).r;
+    let c  = textureSample(uv_tex, samp, in.uv);
+    let cb = c.r - 0.5;
+    let cr = c.g - 0.5;
+    let r = y + 1.5748   * cr;
+    let g = y - 0.187324 * cb - 0.468124 * cr;
+    let b = y + 1.8556   * cb;
+    return vec4<f32>(r, g, b, 1.0);
+}
+"""
+
+
 class Renderer:
     """Build once, call `upload_tile` per fresh tile, then `draw`."""
 
@@ -74,6 +123,18 @@ class Renderer:
         self._w = canvas_w
         self._h = canvas_h
 
+        # Two chroma layouts are supported and chosen per session from the
+        # first uploaded tile (see `upload_tile`):
+        #   * planar    — Y + separate U + V, three r8unorm textures (the
+        #                 software / yuv444p fallback path).
+        #   * biplanar  — Y r8unorm + one rg8unorm UV texture carrying the
+        #                 host's interleaved chroma verbatim, deinterleaved in
+        #                 the shader (Apple nv24 passthrough, the hot path —
+        #                 the native VideoToolbox decoder emits it directly).
+        # Both texture sets are built up front (~5 bytes/px canvas, trivial)
+        # so `draw` can render the pre-cleared canvas before any tile lands.
+        self._mode: "str | None" = None
+
         tex_kw = dict(
             format=wgpu.TextureFormat.r8unorm,
             usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
@@ -82,11 +143,17 @@ class Renderer:
         self._y_tex = device.create_texture(**tex_kw)
         self._u_tex = device.create_texture(**tex_kw)
         self._v_tex = device.create_texture(**tex_kw)
+        self._uv_tex = device.create_texture(
+            format=wgpu.TextureFormat.rg8unorm,
+            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
+            size=(canvas_w, canvas_h, 1),
+        )
         # WGPU does not guarantee initialised texture contents. On Mesa
         # i915 we observed unwritten Y/U/V regions sample as bright
         # green. Pre-fill: Y=0 + UV=128 → BT.709 full-range black.
         zeros_y = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
         neutral_uv = np.full((canvas_h, canvas_w), 128, dtype=np.uint8)
+        neutral_uv2 = np.full((canvas_h, canvas_w, 2), 128, dtype=np.uint8)
         device.queue.write_texture(
             {"texture": self._y_tex, "origin": (0, 0, 0)}, zeros_y,
             {"offset": 0, "bytes_per_row": canvas_w},
@@ -98,42 +165,74 @@ class Renderer:
                 {"offset": 0, "bytes_per_row": canvas_w},
                 (canvas_w, canvas_h, 1),
             )
+        device.queue.write_texture(
+            {"texture": self._uv_tex, "origin": (0, 0, 0)}, neutral_uv2,
+            {"offset": 0, "bytes_per_row": canvas_w * 2},
+            (canvas_w, canvas_h, 1),
+        )
         log.info(
-            "renderer: 3x r8unorm %dx%d (%.1f MB total) — pre-cleared to black",
-            canvas_w, canvas_h, 3 * canvas_w * canvas_h / 1e6,
+            "renderer: Y r8 + (U,V r8 | UV rg8) %dx%d (%.1f MB) — pre-cleared to black",
+            canvas_w, canvas_h, 5 * canvas_w * canvas_h / 1e6,
         )
 
         sampler = device.create_sampler(
             mag_filter=wgpu.FilterMode.linear,
             min_filter=wgpu.FilterMode.linear,
         )
-        shader = device.create_shader_module(code=WGSL)
         tex_entry = {
             "visibility": wgpu.ShaderStage.FRAGMENT,
             "texture": {"sample_type": wgpu.TextureSampleType.float, "view_dimension": "2d"},
         }
-        bind_layout = device.create_bind_group_layout(entries=[
+
+        # ── planar pipeline: Y + U + V (3× r8unorm) ─────────────────────
+        planar_shader = device.create_shader_module(code=WGSL)
+        planar_layout = device.create_bind_group_layout(entries=[
             {"binding": 0, **tex_entry},
             {"binding": 1, **tex_entry},
             {"binding": 2, **tex_entry},
             {"binding": 3, "visibility": wgpu.ShaderStage.FRAGMENT, "sampler": {}},
         ])
-        self._pipeline = device.create_render_pipeline(
-            layout=device.create_pipeline_layout(bind_group_layouts=[bind_layout]),
-            vertex={"module": shader, "entry_point": "vs"},
+        self._pipeline_planar = device.create_render_pipeline(
+            layout=device.create_pipeline_layout(bind_group_layouts=[planar_layout]),
+            vertex={"module": planar_shader, "entry_point": "vs"},
             fragment={
-                "module": shader, "entry_point": "fs",
+                "module": planar_shader, "entry_point": "fs",
                 "targets": [{"format": surface_format}],
             },
             primitive={"topology": wgpu.PrimitiveTopology.triangle_list},
         )
-        self._bind_group = device.create_bind_group(
-            layout=bind_layout,
+        self._bind_planar = device.create_bind_group(
+            layout=planar_layout,
             entries=[
                 {"binding": 0, "resource": self._y_tex.create_view()},
                 {"binding": 1, "resource": self._u_tex.create_view()},
                 {"binding": 2, "resource": self._v_tex.create_view()},
                 {"binding": 3, "resource": sampler},
+            ],
+        )
+
+        # ── biplanar pipeline: Y (r8) + interleaved UV (rg8) ────────────
+        biplanar_shader = device.create_shader_module(code=WGSL_BIPLANAR)
+        biplanar_layout = device.create_bind_group_layout(entries=[
+            {"binding": 0, **tex_entry},
+            {"binding": 1, **tex_entry},
+            {"binding": 2, "visibility": wgpu.ShaderStage.FRAGMENT, "sampler": {}},
+        ])
+        self._pipeline_biplanar = device.create_render_pipeline(
+            layout=device.create_pipeline_layout(bind_group_layouts=[biplanar_layout]),
+            vertex={"module": biplanar_shader, "entry_point": "vs"},
+            fragment={
+                "module": biplanar_shader, "entry_point": "fs",
+                "targets": [{"format": surface_format}],
+            },
+            primitive={"topology": wgpu.PrimitiveTopology.triangle_list},
+        )
+        self._bind_biplanar = device.create_bind_group(
+            layout=biplanar_layout,
+            entries=[
+                {"binding": 0, "resource": self._y_tex.create_view()},
+                {"binding": 1, "resource": self._uv_tex.create_view()},
+                {"binding": 2, "resource": sampler},
             ],
         )
 
@@ -155,6 +254,12 @@ class Renderer:
         rows = min(tile.height, slot_height, remaining)
         if rows <= 0:
             return
+        # Lock the chroma layout to the decoder's output on the first tile.
+        # A session's decode path is stable (Apple HW / VideoToolbox → nv24
+        # biplanar; the software fallback → planar yuv444p), so this never
+        # flips mid-stream.
+        if self._mode is None:
+            self._mode = "biplanar" if tile.is_nv12_passthrough else "planar"
         origin = (0, origin_y, 0)
 
         y = np.frombuffer(tile.y, dtype=np.uint8)
@@ -170,14 +275,28 @@ class Renderer:
             (w, rows, 1),
         )
 
-        if tile.v is None:  # NV-style biplanar — not produced by our decoder path
-            return
         cw, ch = tile.chroma_width, tile.chroma_height
         # Same canvas-bound for chroma as for luma so the last tile's
         # padding chroma rows don't get uploaded.
         chroma_rows = min(ch, slot_height, max(0, self._h - origin_y))
         if chroma_rows <= 0:
             return
+
+        if tile.v is None:
+            # Biplanar passthrough (Apple nv24): the interleaved UV plane goes
+            # straight into the rg8unorm texture — no CPU deinterleave. The
+            # source row pitch is `uv_stride` bytes (≥ 2*cw); write_texture
+            # consumes 2*cw bytes/row (rg8) and skips the padding tail.
+            uv = np.frombuffer(tile.u, dtype=np.uint8)
+            uv = uv[: tile.uv_stride * ch].reshape(ch, tile.uv_stride)
+            self._device.queue.write_texture(
+                {"texture": self._uv_tex, "origin": origin},
+                np.ascontiguousarray(uv[:chroma_rows]),
+                {"offset": 0, "bytes_per_row": tile.uv_stride},
+                (cw, chroma_rows, 1),
+            )
+            return
+
         u = np.frombuffer(tile.u, dtype=np.uint8)
         v = np.frombuffer(tile.v, dtype=np.uint8)
         if tile.uv_stride == cw:
@@ -214,8 +333,12 @@ class Renderer:
             "store_op": wgpu.StoreOp.store,
             "clear_value": (0, 0, 0, 1),
         }])
-        rpass.set_pipeline(self._pipeline)
-        rpass.set_bind_group(0, self._bind_group)
+        if self._mode == "biplanar":
+            rpass.set_pipeline(self._pipeline_biplanar)
+            rpass.set_bind_group(0, self._bind_biplanar)
+        else:
+            rpass.set_pipeline(self._pipeline_planar)
+            rpass.set_bind_group(0, self._bind_planar)
         rpass.set_viewport(*viewport, 0.0, 1.0)
         rpass.draw(3)
         rpass.end()

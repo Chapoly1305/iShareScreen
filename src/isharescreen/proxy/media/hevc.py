@@ -974,6 +974,14 @@ class HevcDecoder:
                 with slot.lock:
                     slot.saw_idr_since_reset = False
         self._eagain_streak = 0
+        q = self._queue
+        if q is not None:
+            n = q.qsize()
+            for _ in range(n):
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
 
     def _drain_codec_to_slots(self) -> None:
         """Pull any frames libavcodec has buffered (None packet flush)."""
