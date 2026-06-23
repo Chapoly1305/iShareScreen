@@ -92,6 +92,9 @@ class QsvHevcDecoder:
         self._on_frame_published = on_frame_published
         self._gate = FrameQualityGate(num_tiles, enabled=enable_quality_gate)
         self._tiles: list[_TileSlot] = [_TileSlot() for _ in range(num_tiles)]
+        # Parallel had-error flag per tile, set by _publish_frame and read by
+        # get_frame. Protected by the corresponding slot.lock.
+        self._tile_had_error: list[bool] = [False] * num_tiles
         self.nalu_counts_per_tile: list[dict[int, int]] = [{} for _ in range(num_tiles)]
         self._reformatter: list[Optional[av.video.reformatter.VideoReformatter]] = [None]
         self._seen_fmts: set[str] = set()
@@ -133,6 +136,7 @@ class QsvHevcDecoder:
         self._worker: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._sync_decode_mode = False
+        self._queue_full_drops: int = 0
 
     # -- configuration / lifecycle ------------------------------------
 
@@ -191,6 +195,18 @@ class QsvHevcDecoder:
 
     def _teardown(self) -> None:
         self._stop_worker()
+        # Release all av.VideoFrame references BEFORE dropping the codec.
+        # avcodec_free_context (triggered when self._codec ref-count reaches 0)
+        # may free QSV's internal surface pool. If slot.raw_frame still holds a
+        # live av.VideoFrame at that point, the frame's AVBufferRef points into
+        # freed pool memory; subsequent GC of the frame object triggers a
+        # double-free that corrupts the Windows heap (ntdll crash).
+        for ti, slot in enumerate(self._tiles):
+            with slot.lock:
+                slot.raw_frame = None
+                slot.good_count = 0
+                slot.last_evaluated_count = 0
+                self._tile_had_error[ti] = False
         with self._codec_lock:
             # Do NOT flush (decode(None)) before releasing the codec — hevc_qsv
             # intermittently crashes (STATUS_ACCESS_VIOLATION) in avcodec_send_packet
@@ -202,11 +218,6 @@ class QsvHevcDecoder:
         self._pts_to_tile = {}
         self._next_pts = 0
         self._au_buf = bytearray()
-        for slot in self._tiles:
-            with slot.lock:
-                slot.raw_frame = None
-                slot.good_count = 0
-                slot.last_evaluated_count = 0
         self._gate.reset()
         self._dpb_has_idr = False
 
@@ -282,7 +293,7 @@ class QsvHevcDecoder:
         try:
             q.put_nowait((au, tile_idx))
         except queue.Full:
-            self._queue_full_drops = getattr(self, "_queue_full_drops", 0) + 1
+            self._queue_full_drops += 1
             n = self._queue_full_drops
             if n in (1, 10, 100) or n % 1000 == 0:
                 log.warning("qsv decoder queue FULL — dropped AU for tile %d (n=%d)",
@@ -347,8 +358,14 @@ class QsvHevcDecoder:
                 if self._codec is None:
                     return
                 frames = self._codec.decode(pkt)
-            for frame in frames:
-                self._publish_frame(frame)
+                # Publish inside the lock: _teardown() holds the same lock
+                # when it sets self._codec = None and triggers
+                # avcodec_free_context. Processing frames outside the lock
+                # would let the codec be freed while we still iterate the
+                # returned frame list, causing use-after-free in QSV's
+                # internal surface pool -> ntdll heap corruption.
+                for frame in frames:
+                    self._publish_frame(frame)
         except Exception as e:
             log.debug("qsv decode error (tile %d): %s", tile_idx, e)
 
@@ -358,9 +375,20 @@ class QsvHevcDecoder:
             return
         if not self._dpb_has_idr:
             self._dpb_has_idr = True
+        # Convert av.VideoFrame → TileFrame (pure Python bytes) while still
+        # inside _codec_lock (called from _decode_au which holds the lock).
+        # QSV's surface pool cannot be reclaimed during a concurrent decode()
+        # call while we hold the lock, so reading frame pixel data here is
+        # safe. Storing a TileFrame (not av.VideoFrame) in the slot means the
+        # render thread never touches a QSV surface, eliminating the
+        # STATUS_ACCESS_VIOLATION in _av_frame_to_tile at get_frame() time.
+        tile_frame, had_err = _av_frame_to_tile(frame, self._reformatter, self._seen_fmts)
+        if tile_frame is None:
+            return
         slot = self._tiles[ti]
         with slot.lock:
-            slot.raw_frame = frame
+            slot.raw_frame = tile_frame  # type: ignore[assignment]
+            self._tile_had_error[ti] = had_err
             slot.good_count += 1
         if self._on_frame_published is not None:
             try:
@@ -375,23 +403,22 @@ class QsvHevcDecoder:
             return None
         slot = self._tiles[tile_idx]
         with slot.lock:
-            frame = slot.raw_frame
+            tile_frame = slot.raw_frame  # TileFrame stored by _publish_frame
             count = slot.good_count
             already = count <= slot.last_evaluated_count
-        if frame is None or already:
+            had_err = self._tile_had_error[tile_idx]
+            self._tile_had_error[tile_idx] = False
+        if tile_frame is None or already:
             return None
-        tile_frame, had_err = _av_frame_to_tile(frame, self._reformatter, self._seen_fmts)
         with slot.lock:
             slot.last_evaluated_count = count
-        if tile_frame is None:
-            return None
         if had_err:
             self._gate.mark_decode_error(tile_idx)
         else:
             self._gate.mark_clean(tile_idx)
-        if not self._gate.should_publish(tile_idx, tile_frame):
+        if not self._gate.should_publish(tile_idx, tile_frame):  # type: ignore[arg-type]
             return None
-        return tile_frame
+        return tile_frame  # type: ignore[return-value]
 
     def consume_fir_request(self) -> set[int]:
         return self._gate.consume_fir_request()
