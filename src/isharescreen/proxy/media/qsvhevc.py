@@ -172,9 +172,30 @@ class QsvHevcDecoder:
         except Exception:
             pass
         try:
-            # async_depth=1 minimises QSV's internal pipeline buffering so frames
-            # surface promptly (default depth adds ~17 frames ≈ 70 ms latency).
-            c.options = {"async_depth": "1", "gpu_copy": "on"}
+            # async_depth controls how many Access Units QSV keeps in flight
+            # inside its internal pipeline simultaneously.
+            #
+            # The decode latency formula is:
+            #   latency ≈ (async_depth - 1) × frame_interval
+            # where frame_interval = 1000 ms / (tiles × fps) = 1000/(4×60) ≈ 4 ms.
+            #
+            # async_depth=1 — lowest latency (~0 ms pipeline overhead), but QSV
+            #   must complete each frame before starting the next. At 240 AU/s the
+            #   worker can starve the hardware between frames, causing the Python
+            #   decode queue to fill up under sustained load. Before the QSV surface
+            #   race was fixed (surface pool exhaustion blocked decode(), worsening
+            #   the stall), this caused queue overflow at depth=1 reliably within
+            #   ~30 s. After the fix it is more stable but still the tightest margin.
+            #
+            # async_depth=4 — very stable (4-frame buffer absorbs bursts and render-
+            #   thread scheduling jitter), but pipeline latency ≈ 3×4 ms = 12 ms.
+            #   Was the safe fallback before the surface race fix; latency too high
+            #   for interactive use when compared to the software path (~2 ms).
+            #
+            # async_depth=2 — tested balance: latency ≈ 1×4 ms = 4 ms, throughput
+            #   headroom enough to stay queue-free under 4-tile 60 fps after the
+            #   surface race fix. Current setting.
+            c.options = {"async_depth": "2", "gpu_copy": "on"}
         except Exception:
             pass
         c.open()
