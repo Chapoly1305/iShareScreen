@@ -119,6 +119,7 @@ class VTHevcDecoder:
         self._decode_errors = 0                # benign VT conceals (diagnostic)
         self._lock = threading.Lock()          # guards session create/teardown
         self._seen_fmt = False
+        self._fmt_warned = False                # H1: warn once on non-nv24 output
 
     # -- params / session ---------------------------------------------------
 
@@ -335,6 +336,18 @@ class VTHevcDecoder:
             w = _Q.CVPixelBufferGetWidth(buf)
             h = _Q.CVPixelBufferGetHeight(buf)
             if _Q.CVPixelBufferGetPlaneCount(buf) < 2:
+                return None
+            # H1: only nv24 (444f) is the biplanar 4:4:4 layout the rest of the
+            # pipeline assumes. The fallback decode session (set_params) can
+            # hand us a VT-chosen format (e.g. 4:2:0 biplanar) that would pass
+            # the plane-count guard above and be mislabeled 4:4:4 → garbage
+            # chroma. Reject it rather than render garbage.
+            fmt = _Q.CVPixelBufferGetPixelFormatType(buf)
+            if fmt != _NV24_FMT:
+                if not self._fmt_warned:
+                    self._fmt_warned = True
+                    log.warning("VTHevcDecoder: non-nv24 output format 0x%x — "
+                                "dropping frames (expected 444f)", fmt)
                 return None
             y_rb = _Q.CVPixelBufferGetBytesPerRowOfPlane(buf, 0)
             uv_rb = _Q.CVPixelBufferGetBytesPerRowOfPlane(buf, 1)

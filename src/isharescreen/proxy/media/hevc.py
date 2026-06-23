@@ -70,19 +70,19 @@ _NAL_START_CODE = b"\x00\x00\x00\x01"
 # given GPU; both the decoder and renderer honour it.
 _LEGACY_CHROMA = os.environ.get("ISS_LEGACY_CHROMA") == "1"
 
-# Mid-stream wedge recovery granularity. Default (unset): a wedge drops to
-# the session-wide `_dpb_has_idr = False` gate — ALL four tiles' P-frames
-# are dropped and every tile's `get_frame` returns None until the next IDR.
-# But Apple emits IDRs on tile 0 only (~every 1.7 s), and a tile-0 IDR
-# re-roots tile 0 immediately while tiles 1-3 still reference pre-wedge
-# POCs, so they re-wedge and re-recover for ~4 IDR cycles — an ~8 s
-# all-tile freeze for what is usually a single broken tile. Set
-# ISS_PERTILE_RECOVERY=1 to instead mark ONLY the gate-flagged broken tiles
-# (`bad_streak > 0`) as awaiting re-root: the healthy tiles keep decoding +
-# publishing from their intact history, and only the broken tile(s) wait
-# for the shared tile-0 IDR. Cold start (before the very first IDR) is
-# untouched — `_dpb_has_idr` still gates every tile then.
-_PERTILE_RECOVERY = os.environ.get("ISS_PERTILE_RECOVERY") == "1"
+# Mid-stream wedge recovery granularity. Default (ON): mark ONLY the
+# gate-flagged broken tiles (`bad_streak > 0`) as awaiting re-root — the
+# healthy tiles keep decoding + publishing from their intact history, and
+# only the broken tile(s) wait for the shared tile-0 IDR. This avoids the
+# all-tile freeze the alternative causes: with the session-wide
+# `_dpb_has_idr = False` gate, ALL four tiles' P-frames are dropped and
+# every tile's `get_frame` returns None until the next IDR — and since
+# Apple emits IDRs on tile 0 only (~every 1.7 s), tiles 1-3 re-wedge and
+# re-recover for ~4 IDR cycles (~8 s) for what is usually a single broken
+# tile. Set ISS_PERTILE_RECOVERY=0 to fall back to that session-wide gate.
+# Cold start (before the very first IDR) is untouched — `_dpb_has_idr`
+# still gates every tile then.
+_PERTILE_RECOVERY = os.environ.get("ISS_PERTILE_RECOVERY", "1") != "0"
 
 
 # libavcodec flags. AV_CODEC_FLAG_LOW_DELAY = 0x80000 disables frame
