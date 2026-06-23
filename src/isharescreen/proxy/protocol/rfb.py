@@ -175,55 +175,62 @@ def build_virtual_display(
     width: int,
     height: int,
     hidpi_scale: int = 2,
-    width_mm: float = 300.0,
-    height_mm: float = 200.0,
     hdr: bool = False,
     display_name: str = "iShareScreen Virtual Display",
     mode_count: int = 5,
     alt_user_login: bool = False,
 ) -> bytes:
-    """0x1d HandleSetDisplayConfiguration — engages curtain mode and sets the
-    virtual framebuffer geometry.
+    """0x1d HandleSetDisplayConfiguration — sets the virtual-display
+    geometry. Used both for the initial handshake and for mid-session
+    dynamic-resolution requests (the message is identical; the server
+    treats a steady-state 0x1d as a resize and answers with 0x451).
 
     Wire format reverse-engineered from screensharingd
-    `ViewerMessages.c:HandleSetDisplayConfiguration`. All multi-byte fields
-    are big-endian on the wire; the daemon byte-swaps several fields BE→LE
-    in place after rx, which is why agent-side captures *look* little-endian
-    but the wire format is BE throughout.
+    `ViewerMessages.c:HandleSetDisplayConfiguration`, then byte-aligned to
+    native Screen Sharing.app. All multi-byte fields are big-endian on the
+    wire; the daemon byte-swaps several fields BE→LE in place after rx,
+    which is why agent-side captures *look* little-endian but the wire
+    format is BE throughout.
+
+    The descriptor mirrors what native sends on every 0x1d:
+    `display_flags = 0x01` (DYNAMIC_RESOLUTION), `display_type = 4`
+    (virtual display), `reserved = 7`, physical panel dimensions,
+    `max_width/height = 3840×2160`, and a heterogeneous mode table scaled
+    to the target. A mid-session 0x1d MUST carry these or the server
+    won't treat it as a dynamic-resolution request. (RFC §7.1/§7.3.)
 
     `hidpi_scale` advertises Retina-style geometry: width/height become the
-    logical (point) size while widthPix/heightPix carry the pixel dimensions.
+    logical (point) size while the mode table carries the pixel dimensions.
     `hidpi_scale=1` flat-encodes at the requested resolution.
 
-    `alt_user_login=True` flips a single byte at displayInfo+0x99 to 0x07.
-    That byte is the low byte of the displayInfo `rotations` u32 at +0x96.
+    `alt_user_login=True` marks the cmd=2 alt-user path. The byte at
+    displayInfo+0x99 is the low byte of the `reserved` u32 at +0x96.
 
-    CAUTION: an earlier reading (below) treated this byte as the "magic
-    bit" that makes the daemon target the alt-user vdisplay instead of the
-    *console* screen. Decompiling screensharingd + ScreensharingAgent
-    (a recent macOS build) contradicts that: +0x96 is logged as `rotations` and forwarded
-    verbatim to `SLVirtualDisplaySettings ...rotations:`, and *neither
-    binary branches on +0x96/+0x99*. The console-vs-login-window choice is
-    actually driven by a runtime session probe plus the `BlankScreen`
-    CFPreference, not this descriptor field. A live re-test confirmed this:
-    running the alt-session path with this byte = 0 vs = 0x07 produced
-    byte-identical protocol behavior (same conn1/conn2 auth, ServerInit
-    geometry, enc1103, and cmd=2 dance) — no observable effect, matching
-    the decompilation. (Caveat: on the test host the connecting user was
-    the console user, so alt-session streamed 0 frames either way and the
-    feature itself was not exercised end-to-end.) The write is retained out
-    of caution; drop it once alt-session is validated on a true
-    non-console-user host.
-
-    Earlier (unverified) note: "captured cmd=2 alt-user traffic sets this
-    byte; with it clear the daemon's createLoginWindow=1 branch leaves
-    virtualDisplayCount=0 and targets the console screen." Believed to be a
-    misattribution given the decompilation above.
+    An earlier reading treated this byte as the "magic bit" that makes the
+    daemon target the alt-user vdisplay instead of the *console* screen.
+    Decompilation contradicts that: +0x96 is forwarded verbatim as the
+    `rotations` field and *neither* the daemon nor the agent branches on
+    +0x96/+0x99. The console-vs-login-window choice is actually driven by a
+    runtime session probe plus the `BlankScreen` preference, not this
+    descriptor field. A live re-test confirmed it: this byte = 0 vs = 0x07
+    produced byte-identical protocol behavior (same auth, ServerInit
+    geometry, enc1103, and cmd=2 dance) — no observable effect. (Caveat: on
+    the test host the connecting user was the console user, so alt-session
+    streamed 0 frames either way and the feature was not exercised
+    end-to-end.) Since we always emit `reserved = 7`, displayInfo+0x99 is
+    already `0x07` for every 0x1d, so `alt_user_login` is a no-op at the
+    byte level today — kept for call-site intent and in case the reserved
+    value ever changes.
     """
-    pts_w = width * hidpi_scale
-    pts_h = height * hidpi_scale
-    pix_w = width
-    pix_h = height
+    # `width`/`height` are the LOGICAL (point / scaled) target. `hidpi_scale`
+    # is the backing:point ratio the mode table advertises: 2 => Retina
+    # (backing = 2× points), 1 => flat (backing = points, ~1/4 the pixels =
+    # much less bandwidth; the right choice on non-Retina clients where a 2×
+    # stream renders the UI half-size). The host honors whichever ratio the
+    # mode table carries (verified live: a 1× mode table returns
+    # backing == scaled).
+    pts_w = width
+    pts_h = height
     di_size = 0x9C + 28 * mode_count
 
     di = bytearray(di_size)
@@ -233,20 +240,56 @@ def build_virtual_display(
     # could write through +0x7a for names >119 bytes.)
     name_bytes = display_name.encode("utf-8")[:119]
     di[0x02:0x02 + len(name_bytes)] = name_bytes
-    struct.pack_into(">f", di, 0x82, width_mm)
-    struct.pack_into(">f", di, 0x86, height_mm)
-    struct.pack_into(">I", di, 0x8A, pts_w)
-    struct.pack_into(">I", di, 0x8E, pts_h)
-    struct.pack_into(">H", di, 0x9A, mode_count)
-    if alt_user_login:
-        di[0x99] = 0x07
 
+    # display_flags: always set DYNAMIC_RESOLUTION (0x01) — matches
+    # native Screen Sharing.app which sets this on every 0x1d.
+    struct.pack_into(">I", di, 0x7A, 1)
+
+    # display_type = 4 (virtual display).
+    struct.pack_into(">I", di, 0x7E, 4)
+
+    # Physical dimensions from native macOS capture.
+    struct.pack_into(">f", di, 0x82, 369.4545593261719)
+    struct.pack_into(">f", di, 0x86, 207.81817626953125)
+
+    struct.pack_into(">H", di, 0x92, 0)   # current_mode_index
+    struct.pack_into(">H", di, 0x94, 0)   # preferred_mode_index
+    struct.pack_into(">I", di, 0x96, 7)   # reserved — native sends 7
+    struct.pack_into(">H", di, 0x9A, mode_count)
+
+    # Heterogeneous mode table (like native kModes), scaled to target.
+    _NATIVE_MODES = [
+        (3840, 2160, 1920, 1080),
+        (2880, 1800, 1440,  900),
+        (3840, 2160, 1920, 1080),
+        (2880, 1620, 1440,  810),
+        (2624, 1696, 1312,  848),
+    ]
+    sx = pts_w / 1920.0 if pts_w else 1.0
+    sy = pts_h / 1080.0 if pts_h else 1.0
     mode_flags = 1 if hdr else 0
+
     for i in range(mode_count):
+        base = _NATIVE_MODES[i % len(_NATIVE_MODES)]
+        # point (scaled) dims from the native template, scaled to the target;
+        # pixel (backing) dims = point × hidpi_scale, so the mode table
+        # advertises a 2× (Retina) or 1× (flat) backing per the caller.
+        msw = int(base[2] * sx + 0.5)
+        msh = int(base[3] * sy + 0.5)
+        mw = msw * hidpi_scale
+        mh = msh * hidpi_scale
         m = 0x9C + 28 * i
-        struct.pack_into(">IIII", di, m + 0x00, pts_w, pts_h, pix_w, pix_h)
+        struct.pack_into(">IIII", di, m + 0x00, mw, mh, msw, msh)
         struct.pack_into(">d", di, m + 0x10, 60.0)
         struct.pack_into(">I", di, m + 0x18, mode_flags)
+
+    # max_width/height = 3840×2160, matching native app. The server
+    # caps the virtual display at this backing size regardless of
+    # the mode-table entries. Larger requests get a server-side
+    # fallback (typically to a safe minimum). Keeping the client
+    # request ≤ this bound avoids triggering the fallback path.
+    struct.pack_into(">I", di, 0x8A, 3840)
+    struct.pack_into(">I", di, 0x8E, 2160)
 
     msg_size = 8 + di_size
     header = struct.pack(">BBHHHI", CLI_VIRTUAL_DISPLAY, 0, msg_size, 1, 1, 0)

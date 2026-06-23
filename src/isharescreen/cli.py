@@ -23,6 +23,7 @@ shows up in ``ps`` and shell history.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import os
 import signal
@@ -93,17 +94,38 @@ def _make_parser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("display")
     g.add_argument(
-        "--advertise", metavar="WxH[@HIDPI]", default=None,
+        "--advertise", metavar="WxH[@HIDPI]|auto", default=None,
         help=(
             "virtual display geometry advertised to the host "
-            "(e.g. '2560x1440' or '1920x1200@2'). When omitted, the "
-            "interactive prompt asks for a resolution preset "
-            "(default 1920x1200)."
+            "(e.g. '2560x1440' or '1920x1200@2'). 'auto' (the default "
+            "when omitted) sizes the virtual display to the local viewer "
+            "window/monitor and tracks resizes (see --dynamic)."
+        ),
+    )
+    g.add_argument(
+        "--dynamic", action=argparse.BooleanOptionalAction, default=None,
+        help=(
+            "re-advertise the host's virtual display to match the viewer "
+            "window whenever it's resized, so the remote re-renders sharp "
+            "instead of stretching. Each change is a brief media-session "
+            "restart. Defaults on when --advertise is 'auto'/omitted, off "
+            "for an explicit WxH (use --dynamic to force-enable, "
+            "--no-dynamic to pin a fixed canvas)."
         ),
     )
     g.add_argument(
         "--hdr", action="store_true",
         help="advertise HDR-capable viewer to the host",
+    )
+    g.add_argument(
+        "--hidpi", choices=("auto", "on", "off"), default="auto",
+        help=(
+            "HiDPI (Retina) rendering of the host display. 'on' = Retina 2x, "
+            "full quality (up to ~300 Mbps); 'off' = flat 1x quality (up to "
+            "~60 Mbps); 'auto' (default) = match the local display (2x on a "
+            "Retina client, 1x otherwise; downgrades to 1x when 2x wouldn't fit "
+            "the host backing cap)"
+        ),
     )
     g.add_argument(
         "--curtain", action=argparse.BooleanOptionalAction, default=True,
@@ -184,13 +206,15 @@ def _make_parser() -> argparse.ArgumentParser:
 # ── value parsing ────────────────────────────────────────────────────
 
 def _parse_advertise(spec: Optional[str]) -> Optional[AdvertiseDims]:
-    if not spec:
+    # None / "" / "auto" all mean "no fixed geometry" — the desktop viewer
+    # auto-detects from the local monitor and (by default) tracks resizes.
+    if not spec or spec.strip().lower() == "auto":
         return None
     geom_part, _, hidpi_part = spec.partition("@")
     try:
         w_str, h_str = geom_part.lower().split("x", 1)
         width, height = int(w_str), int(h_str)
-        hidpi = int(hidpi_part) if hidpi_part else 1
+        hidpi = int(hidpi_part) if hidpi_part else 2
     except ValueError as e:
         raise SystemExit(
             f"invalid --advertise value {spec!r}: expected 'WxH' or 'WxH@HIDPI' ({e})"
@@ -239,6 +263,25 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
     use goes through `isharescreen.tui` instead."""
     cli_password = _password_from_args(args)
     cli_advertise = _parse_advertise(args.advertise)
+    # For a fixed --advertise WxH, the --hidpi mode determines the backing
+    # scale (the auto/dynamic path resolves this in the frontend instead).
+    # 'on' → 2×, 'off' → 1×, 'auto' → 2× when the 2× backing fits the host's
+    # 3840×2160 cap (logical ≤ 1920×1080), else 1×.
+    if cli_advertise is not None:
+        w, h = cli_advertise.width, cli_advertise.height
+        if args.hidpi == "off":
+            scale = 1
+        elif args.hidpi == "on":
+            scale = 2
+        else:  # auto
+            scale = 2 if (w * 2 <= 3840 and h * 2 <= 2160) else 1
+        cli_advertise = dataclasses.replace(cli_advertise, hidpi_scale=scale)
+    # Dynamic resolution: explicit --dynamic/--no-dynamic wins; otherwise
+    # default it on exactly when no fixed geometry was given (advertise is
+    # 'auto'/omitted ⇒ cli_advertise is None).
+    dynamic_resolution = (
+        args.dynamic if args.dynamic is not None else cli_advertise is None
+    )
     missing = [
         label for label, value in
         (("--host", args.host), ("-u/--user", args.user),
@@ -255,7 +298,9 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
         username=args.user, password=cli_password or "",
         auth_mode=args.auth,
         advertise=cli_advertise,
+        dynamic_resolution=dynamic_resolution,
         hdr=args.hdr,
+        hidpi=args.hidpi,
         curtain=args.curtain,
         audio=args.audio,
         share_console=args.share_console, alt_session=args.alt_session,

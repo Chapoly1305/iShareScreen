@@ -109,9 +109,17 @@ _BURST_RETRY_SLEEP_S = 0.8
 # packets aren't dropped by the kernel (RcvbufErrors). The process thread
 # does decrypt + dispatch from the queue. If the process thread can't keep
 # up the queue fills and we drop packets at the app layer instead — same
-# end result as a kernel drop, but moved to a place we can measure. 4096
-# packets at ~1500 bytes is ~6 MB worst-case memory.
-_UDP_DRAIN_QUEUE_MAX = 4096
+# end result as a kernel drop, but moved to a place we can measure.
+#
+# 16384 (~24 MB worst-case at ~1500 B) absorbs the bursts a HiDPI/2x stream
+# produces: at ~300 Mbps the packet rate is ~28k pps, and the old 4096 cap
+# was only ~0.15 s of buffer — measured overflowing in bursts (snapshot
+# showed depth≈1 but drop=15197, i.e. the process thread keeps up on average
+# but spikes blew past the shallow queue, breaking the ref chain). The deeper
+# queue is ~0.6 s, enough for the encoder's per-frame/IDR bursts; the process
+# thread drains it back to ~empty between spikes so the added latency only
+# appears during a genuine overload, not steady state.
+_UDP_DRAIN_QUEUE_MAX = 16384
 
 # Stall threshold — if no decoded video frame in this long, mark the
 # session as soft-dead. Consumer reconnects by calling close() + connect().
@@ -188,6 +196,19 @@ class SessionConfig:
     advertise: Optional[AdvertiseDims] = None
     hdr: bool = False
     audio: bool = True
+    # HiDPI mode for the host's virtual display, resolved to a backing:point
+    # ratio by the frontend (which knows the window size):
+    #   "on"   → always 2× (Retina): crisp, but ~4× the pixels = more
+    #            bandwidth, and UI renders half-size on a non-Retina client.
+    #   "off"  → always 1× (flat, backing == logical): far less bandwidth,
+    #            correctly-sized UI on non-Retina (Linux/Windows) clients.
+    #   "auto" → match the LOCAL display: 2× on a Retina client, 1× on a
+    #            non-Retina one (so the stream maps 1:1 to the client's pixels);
+    #            2× is downgraded to 1× when it wouldn't fit the host's
+    #            3840×2160 cap (window logical > 1920×1080).
+    # The frontend passes the resolved scale into send_dynamic_resolution and
+    # the initial AdvertiseDims; the proxy itself only carries the mode.
+    hidpi: str = "auto"
 
     # When auth user differs from the console user, ask the console user
     # to share their existing session (Apple's "Ask to share" choice in
@@ -242,10 +263,21 @@ class SessionConfig:
     # socket and the two UDP media sockets is written — exactly as it goes
     # on the wire (still enc1103/SRTP encrypted) — to a classic `.pcap` at
     # this path, with synthetic Ethernet/IPv4/TCP|UDP framing. The result is
-    # byte-identical to a tcpdump capture and feeds straight into the
-    # workspace Python dissector (which derives the keys from the cleartext
+    # byte-identical to a packet-capture dump and feeds straight into the
+    # bundled Python dissector (which derives the keys from the cleartext
     # handshake it sees) or Wireshark. None ⇒ no capture; zero overhead.
     record_pcap: Optional[str] = None
+
+    # Dynamic resolution: the frontend issues a mid-session resize (via
+    # Session.send_dynamic_resolution) whenever the viewer window changes
+    # size, so the host's virtual display re-renders sharp at the new size
+    # instead of stretching a fixed canvas. This is an IN-BAND change on
+    # the existing connection — 0x1d → server 0x451 → 0x1c re-offer →
+    # encoder restart — no reconnect. Purely a frontend concern; the
+    # protocol layer doesn't read this flag, it rides along with the rest
+    # of the config to the desktop viewer. Off ⇒ classic fixed canvas
+    # (the window just stretches the stream on resize).
+    dynamic_resolution: bool = False
 
 # ── internal RTP packet group ────────────────────────────────────────
 
@@ -271,6 +303,19 @@ class Session:
             "avc" if os.environ.get("ISS_VIDEO_CODEC", "").lower() == "avc"
             else "hevc"
         )
+        # Runtime-updated canvas dimensions from AppleDisplayLayout (0x451).
+        # `_runtime_canvas_*` = backing/pixel size (decoded frame dimensions).
+        # `_runtime_scaled_*` = logical/scaled size (window/client coordinate space).
+        self._runtime_canvas_w: int = 0
+        self._runtime_canvas_h: int = 0
+        self._runtime_scaled_w: int = 0
+        self._runtime_scaled_h: int = 0
+        self._needs_post_layout_fir: bool = False
+        self._needs_param_harvest: bool = False
+        # Cross-RTP-group accumulators for the post-resize param harvest.
+        self._harvest_vps: Optional[bytes] = None
+        self._harvest_sps: Optional[bytes] = None
+        self._harvest_pps: dict[int, bytes] = {}
         self._decoder: Optional[object] = None
         self._aac: Optional[AacEldDecoder] = None
         self._input: Optional[InputController] = None
@@ -623,6 +668,39 @@ class Session:
             gate.mark_decode_error(tile_idx)
             self._send_fir_for_tile(tile_idx)
 
+    def send_dynamic_resolution(
+        self, width: int, height: int, hidpi_scale: int = 2,
+    ) -> None:
+        """Request a mid-session display resize without reconnecting.
+
+        Sends a runtime SetDisplayConfiguration (0x1d) on the existing
+        encrypted TCP channel with display_flags=DYNAMIC_RESOLUTION.
+        The server responds with AppleDisplayLayout (0x451) and
+        restarts the HEVC encoder at the new resolution — new SSRCs,
+        new SPS/PPS, new IDR burst. The 0x451 handler updates canvas
+        dims; the frontend polls `canvas_dims` to detect the change.
+        No reconnect, no re-authentication.
+        """
+        from .protocol.rfb import build_virtual_display
+        from .protocol.negotiation import build_fbu_request
+
+        neg = self._negotiation
+        if neg is None:
+            raise RuntimeError("Not connected")
+        log.info("send_dynamic_resolution: requesting %dx%d", width, height)
+        msg = build_virtual_display(
+            width=width, height=height, hidpi_scale=hidpi_scale, hdr=False,
+        )
+        neg.cipher.encrypt_and_send(neg.sock, msg)
+        # Re-arm TCP and nudge encoder with FIRs for fresh IDRs.
+        try:
+            neg.cipher.encrypt_and_send(
+                neg.sock, build_fbu_request(incremental=False)
+            )
+        except OSError:
+            pass
+        self.request_fir()
+
     # ── public state inspection ──────────────────────────────────────
 
     @property
@@ -636,6 +714,22 @@ class Session:
 
     @property
     def canvas_dims(self) -> tuple[int, int]:
+        """Backing/pixel dimensions of the HEVC decoder output — the size
+        the GPU textures must be allocated at. May be larger than
+        `scaled_dims` on HiDPI virtual displays."""
+        rw, rh = self._runtime_canvas_w, self._runtime_canvas_h
+        if rw and rh:
+            return (rw, rh)
+        n = self._negotiation
+        return (n.canvas_width, n.canvas_height) if n else (0, 0)
+
+    @property
+    def scaled_dims(self) -> tuple[int, int]:
+        """Logical/scaled display dimensions — the coordinate space the
+        client uses for window sizing and input mapping."""
+        sw, sh = self._runtime_scaled_w, self._runtime_scaled_h
+        if sw and sh:
+            return (sw, sh)
         n = self._negotiation
         return (n.canvas_width, n.canvas_height) if n else (0, 0)
 
@@ -1086,6 +1180,9 @@ class Session:
         arrives), so we always send a valid audio offer; `cfg.audio=False`
         only skips local decode + playback."""
         video_offer, audio_offer = create_offers()
+        # Stash for mid-session 0x1c re-offers (dynamic resolution).
+        self._video_offer = video_offer
+        self._audio_offer = audio_offer
         self._our_video_ssrc = extract_offer_ssrc(video_offer, is_video=True)
         self._our_audio_ssrc = extract_offer_ssrc(audio_offer, is_video=False)
         log.info(
@@ -1343,6 +1440,15 @@ class Session:
         self._roc = {}
         self._nack_pending = defaultdict(set)
         self._server_sr = {}
+        self._runtime_canvas_w = 0
+        self._runtime_canvas_h = 0
+        self._runtime_scaled_w = 0
+        self._runtime_scaled_h = 0
+        self._needs_post_layout_fir = False
+        self._needs_param_harvest = False
+        self._harvest_vps = None
+        self._harvest_sps = None
+        self._harvest_pps = {}
 
     # ── thread spawning ──────────────────────────────────────────────
 
@@ -1882,13 +1988,63 @@ class Session:
 
         ordered = [p for _, _, p in packets]
         self._tile_bytes[ti] = self._tile_bytes.get(ti, 0) + sum(len(p) for p in ordered)
+
+        # Frame-completeness check (native jitter-buffer behaviour). An
+        # access unit is fragmented across consecutive RTP sequence
+        # numbers; a gap between this group's sorted packets means at
+        # least one slice / FU fragment never arrived, so the reassembled
+        # NALUs are truncated. Apple's own viewer does NOT feed an
+        # incomplete frame to the decoder — it skips it and requests
+        # recovery — because feeding a partial access unit produces
+        # malformed-bitstream errors that can wedge the decoder. We mirror
+        # that below: harvest param sets first (those NALUs may be intact
+        # and small), then drop the frame if it's incomplete. `&0xFFFF`
+        # makes the 65535->0 wrap a diff of 1 and a duplicate seq a diff of
+        # 0; only diff>1 is a gap.
+        oseq = [p[0] for p in packets]
+        incomplete = any(
+            ((oseq[i + 1] - oseq[i]) & 0xFFFF) > 1
+            for i in range(len(oseq) - 1)
+        )
+
         # The access unit's DONL (decoding-order number) — the LTR ring key
         # the LTRP ack must echo. Same for every NALU in the group.
         donl = first_donl(ordered) if self._ltr_enabled else None
         _reassemble = reassemble_h264 if self._video_codec == "avc" else reassemble_group
         au_cb = self._video_au_callback if self._video_codec == "avc" else None
+
+        nalus = list(_reassemble(ordered))
+
+        # If a dynamic resolution change is in progress, harvest fresh
+        # VPS/SPS/PPS from the new encoder's burst so the restarted
+        # decoder has the correct dimensions. (HEVC only — the AVC path
+        # doesn't drive the virtual-display re-render.)
+        if self._needs_param_harvest and nalus and self._video_codec != "avc":
+            self._harvest_param_sets(nalus)
+            if self._needs_param_harvest:
+                # Harvest still incomplete: the shared decoder context is
+                # still sized for the OLD canvas. Feeding these new-canvas
+                # NALUs into it breaks the DPB on every resize and can
+                # wedge the decoder. Drop the group — the encoder re-sends
+                # the IDR burst (we FIR on harvest completion below, and
+                # `_check_stall` FIR-storms if the param sets are ever
+                # lost), so we resume cleanly once the new SPS/PPS land and
+                # the decoder is rebuilt.
+                return
+            # Harvest just completed inside the call above: `set_params` +
+            # `restart` rebuilt the context at the new dimensions, so the
+            # remaining NALUs in THIS group (the new-canvas IDR slice) are
+            # safe to feed below.
+
+        if incomplete:
+            # Don't feed a partial access unit. The broken reference chain
+            # is re-rooted by the FIR the decoder's missing-ref / wedge
+            # path requests once a later complete frame references this
+            # dropped one.
+            return
+
         au_parts: list[bytes] = []
-        for nalu in _reassemble(ordered):
+        for nalu in nalus:
             self._decoder.feed_nalu(nalu, ti, donl=donl)
             if au_cb is not None:
                 au_parts.append(b"\x00\x00\x00\x01" + bytes(nalu))
@@ -1897,6 +2053,52 @@ class Session:
                 au_cb(ti, key[1], b"".join(au_parts))
             except Exception:
                 log.debug("video_au_callback raised", exc_info=True)
+
+    def _harvest_param_sets(self, nalus: list[bytes]) -> None:
+        """Accumulate fresh VPS/SPS/PPS from the new encoder's burst, then
+        install them and restart the decoder once all three are seen.
+
+        Apple's HEVC encoder emits parameter sets only with an IDR burst,
+        and they can be split across multiple RTP timestamp groups (VPS in
+        one Aggregation Packet, SPS/PPS in another, or a lost one re-sent
+        on its own). So we accumulate into `self._harvest_*` across calls
+        rather than requiring all three in a single flushed group — matching
+        how `gather_initial_burst` harvests them. PPS is keyed by its
+        ue(v)-decoded pic_parameter_set_id (same as burst.py), not the raw
+        byte. No nal-ref-idc filter: that is an H.264 concept; in HEVC
+        those bits are part of nal_unit_type."""
+        from .media.nalu import NAL_VPS, NAL_SPS, NAL_PPS
+        from .media.bitstream import BitReader, remove_emulation_prevention
+
+        for nalu in nalus:
+            if len(nalu) < 2:
+                continue
+            nt = (nalu[0] >> 1) & 0x3F
+            if nt == NAL_VPS:
+                self._harvest_vps = nalu
+            elif nt == NAL_SPS:
+                self._harvest_sps = nalu
+            elif nt == NAL_PPS and len(nalu) > 2:
+                try:
+                    pps_id = BitReader(
+                        remove_emulation_prevention(nalu[2:])
+                    ).read_ue()
+                except Exception:
+                    continue
+                self._harvest_pps[pps_id] = nalu
+
+        if self._harvest_vps and self._harvest_sps and self._harvest_pps:
+            log.info(
+                "harvested param sets from new stream: VPS=%dB SPS=%dB PPS=%d",
+                len(self._harvest_vps), len(self._harvest_sps),
+                len(self._harvest_pps),
+            )
+            self._decoder.set_params(
+                self._harvest_vps, self._harvest_sps, dict(self._harvest_pps),
+            )
+            self._decoder.restart()
+            self._needs_param_harvest = False
+            self.request_fir()
 
     def _evict_stale_groups(self) -> None:
         """Drop incomplete groups whose marker never arrived, and expire
@@ -2030,21 +2232,46 @@ class Session:
         # Blacklist the previously-adopted group so we never go back.
         self._ssrc_blacklist.update(self._ssrc_to_tile.keys())
         self._ssrc_to_tile = new_map
+        # Keep the authoritative tile count in step with the adopted
+        # group so num_tiles (and the frontend's per-tile loops) track a
+        # mid-session tile-count change rather than the connect-time value.
+        self._observed_tile_count = len(new_map)
         self._last_ssrc_adopt_ts = now
         # Grace window: pretend frames just flowed so the frame-flow gate
         # gives the new mapping ~0.5 s to start producing before we
         # consider another adoption.
         self._last_publish_t = now
         if self._decoder is not None:
-            # Restart the decoder + FIR for the new tiles. We tried
-            # skipping the restart to avoid a 1.5–6 s outage, but
-            # without it the SW fallback path can't re-feed burst
-            # NALUs and the new context starves until an unprompted
-            # IDR shows up (often never).
-            self._last_decoder_restart_t = now
-            self._dpb_error_window.clear()
-            self._decoder.restart()
-            self.request_fir()
+            # If a dynamic resolution change is in flight, defer the
+            # decoder restart until the video process loop harvests
+            # fresh VPS/SPS/PPS from the new encoder's burst. The old
+            # param sets are stale (old resolution) and would make
+            # the restarted decoder reject all frames.
+            if self._needs_param_harvest:
+                log.info("SSRC adoption deferred — waiting for param harvest")
+                self._dpb_error_window.clear()
+                self.request_fir()
+            else:
+                # Restart the decoder + FIR for the new tiles. We tried
+                # skipping the restart to avoid a 1.5–6 s outage, but
+                # without it the SW fallback path can't re-feed burst
+                # NALUs and the new context starves until an unprompted
+                # IDR shows up (often never).
+                self._dpb_error_window.clear()
+                # Guard against rapid back-to-back SSRC rotations (e.g.
+                # Apple emitting two new groups within 2 s at curtain
+                # start): the second full restart discards IDR frames
+                # in-flight for the first group's FIR, making recovery
+                # nearly impossible. If we just restarted within 3 s
+                # the decoder is already fresh — skip the redundant
+                # teardown and let the FIR re-anchor the new group.
+                # NOTE: read the prior restart time BEFORE stamping `now`,
+                # otherwise the gap is always 0 and the restart never fires.
+                last_restart = self._last_decoder_restart_t
+                if now - last_restart >= 3.0:
+                    self._last_decoder_restart_t = now
+                    self._decoder.restart()
+                self.request_fir()
 
     # ── RTCP RX loop (server SR for jitter / dlsr) ──────────────────
 
@@ -2230,6 +2457,15 @@ class Session:
                 self._handle_clipboard_send(full)
             return
 
+        # NOTE: the mid-session 0x1c re-offer's answer is delivered framed
+        # as a 0x00 FBU (an embedded bplist), NOT as a top-level 0x1c — so
+        # there is no `msg_type == 0x1c` branch here. The authoritative new
+        # geometry comes from the 0x451 AppleDisplayLayout rect handled in
+        # _handle_fbu, and the decoder picks up the new dimensions from the
+        # harvested SPS. (An earlier 0x1c branch that called
+        # extract_canvas_dims was a dead no-op — that helper rejects any
+        # message whose first byte isn't 0x00.)
+
         # 0x00: FrameBufferUpdate. On the TCP control channel this only
         # ever carries pseudo-encoding rects (cursor enc 1104, etc.) —
         # actual pixel data flows over UDP/SRTP, not here.
@@ -2257,58 +2493,252 @@ class Session:
         n_rects = struct.unpack(">H", msg[2:4])[0]
         offset = 4
         saw_cursor = False
+        _dbg_cursor = os.environ.get("ISS_CURSOR_DEBUG") == "1"
+        _dbg_encs: list[str] = []
         for _ in range(n_rects):
             if offset + 12 > len(msg):
                 log.debug("FBU truncated at rect header (offset=%d)", offset)
+                if _dbg_cursor:
+                    log.info("FBU n_rects=%d encs=[%s] TRUNCATED len=%d",
+                             n_rects, ",".join(_dbg_encs), len(msg))
                 return
             f0, f1, f2, f3, encoding = struct.unpack(
                 ">HHHHi", msg[offset:offset + 12],
             )
             offset += 12
+            if _dbg_cursor:
+                _dbg_encs.append("0x%x@(%d,%d,%d,%d)" % (
+                    encoding & 0xffffffff, f0, f1, f2, f3))
             if encoding == 1104:
                 saw_cursor = True
                 consumed = self._handle_cursor_rect(msg, offset, f0, f1, f2, f3)
                 if consumed < 0:
                     return
                 offset += consumed
-            elif encoding in (1010, 1011, 1105, 1107, 1109, 1110):
-                # Apple-private config blobs: u16 BE size + payload. We don't
-                # decode them but need to skip past so any 1104 cursor rect
-                # that follows in the same FBU is still reached.
-                # Known content (from prior RE, none of it required to render):
-                #   1010 — bplist (media-stream negotiation blob)
-                #   1011 — sibling of 1010 in some sessions
-                #   1105 — display info struct (dims, "main" sentinel, scale)
-                #   1107 — VendorKeysyms
-                #   1109 — keyboard input source string (e.g. com.apple.keylayout.US)
-                #   1110 — device info (host model identifier string)
+            elif encoding in (1010, 1011, 1105, 1107, 1109, 1110,
+                              0x3f2, 0x3f3, 0x3ea, 0x453, 0x455, 0x456):
+                # Apple-private pseudo-encodings that all share one wire
+                # format: u16 BE payload_len + payload. We don't decode
+                # them but MUST skip past them rather than abort the walk —
+                # otherwise a 1104/0x450 cursor rect that follows in the
+                # SAME FBU is lost (which froze the cursor shape right after
+                # login). Two families share this skip path:
+                #   Config blobs (known content, none required to render):
+                #     1010 — media-stream negotiation blob (bplist)
+                #     1011 — sibling of 1010 in some sessions
+                #     1105 — display info struct (dims, "main" sentinel, scale)
+                #     1107 — vendor keysyms
+                #     1109 — keyboard input source string
+                #     1110 — device info (host model identifier string)
+                #   Media-stream reconfig rects (0x453/0x455/0x456 and the
+                #     0x3ea/0x3f2/0x3f3 group) the daemon emits at a
+                #     login/session switch.
                 if offset + 2 > len(msg):
                     return
                 sz = struct.unpack(">H", msg[offset:offset + 2])[0]
                 if offset + 2 + sz > len(msg):
                     return
                 offset += 2 + sz
+            elif encoding == 0x451:
+                # AppleDisplayLayout: server confirms/announces display
+                # geometry. Payload is a u16 prefix_length followed by
+                # that many bytes of layout data (scaled_w/h, backing
+                # w/h at +4..+11). The remainder is opaque trailing
+                # fields (revision gap). Consume the rect and update
+                # the runtime canvas dimensions so the frontend can
+                # resize its framebuffer.
+                #
+                # A layout event marks a display/session transition — the
+                # point at which the daemon's cursor sender otherwise goes
+                # silent (the post-login/lock freeze). We re-arm the
+                # free-running TCP update sender (AutoFrameBufferUpdate 0x09 +
+                # non-incremental FBU request — a full-refresh request) at the
+                # END of this branch,
+                # AFTER the new backing dims are parsed below, so the 0x09
+                # region matches the geometry this layout announces rather than
+                # the previous (stale) one. Done on EVERY 0x451 so cursor
+                # (enc 1104) SELECTs keep flowing across a login/lock switch.
+                if offset + 2 > len(msg):
+                    return
+                prefix_len = struct.unpack(">H", msg[offset:offset + 2])[0]
+                # Validate the declared payload fits before reading it, so
+                # a truncated/short rect can't raise struct.error and kill
+                # the RX thread (mirrors the 1010/1011 branch).
+                if offset + 2 + prefix_len > len(msg):
+                    return
+                needs_post_layout_arm = False
+                if prefix_len >= 12:
+                    sw = struct.unpack(">H", msg[offset + 4:offset + 6])[0]
+                    sh = struct.unpack(">H", msg[offset + 6:offset + 8])[0]
+                    bw = struct.unpack(">H", msg[offset + 8:offset + 10])[0]
+                    bh = struct.unpack(">H", msg[offset + 10:offset + 12])[0]
+                    # Backing (pixel) dims drive GPU texture sizing; only
+                    # trust them when present. Never substitute the scaled
+                    # (logical) size for backing — on HiDPI that would
+                    # under-size the textures and overrun on upload.
+                    new_bw = bw if (bw and bh) else self._runtime_canvas_w
+                    new_bh = bh if (bw and bh) else self._runtime_canvas_h
+                    if sw and sh:
+                        # Only consider it a runtime change if we already
+                        # had a canvas — the first 0x451 is the initial
+                        # layout confirmation, not a resize.
+                        had_canvas = (
+                            self._runtime_canvas_w > 0
+                            and self._runtime_canvas_h > 0
+                        )
+                        changed = had_canvas and (
+                            new_bw != self._runtime_canvas_w
+                            or new_bh != self._runtime_canvas_h
+                        )
+                        if new_bw and new_bh:
+                            self._runtime_canvas_w = new_bw
+                            self._runtime_canvas_h = new_bh
+                            # Keep the pointer clamp in step with the canvas
+                            # the frontend maps clicks into (canvas_dims);
+                            # otherwise the host mis-places the cursor after
+                            # a mid-session resize.
+                            if self._input is not None:
+                                self._input.set_server_dims(new_bw, new_bh)
+                        self._runtime_scaled_w = sw
+                        self._runtime_scaled_h = sh
+                        log.info(
+                            "AppleDisplayLayout: scaled=%dx%d backing=%dx%d"
+                            " changed=%s",
+                            sw, sh, bw, bh, changed,
+                        )
+                        if changed:
+                            self._needs_param_harvest = True
+                            # Start a clean harvest — discard any stale
+                            # accumulators from a prior (old-resolution)
+                            # harvest so they can't complete this one early.
+                            self._harvest_vps = None
+                            self._harvest_sps = None
+                            self._harvest_pps = {}
+                            log.info("AppleDisplayLayout: flagged param harvest for new canvas")
+                            # The server is waiting for a full-refresh request
+                            # at the new geometry before it resumes the HEVC
+                            # encoder; do the media re-offer below, after the
+                            # cursor re-arm has sent the non-incremental FBUR.
+                            needs_post_layout_arm = True
+                # Re-arm the free-running TCP sender now that _runtime_canvas_w/h
+                # reflect THIS layout (0x09 + non-incremental FBUR). Always, so
+                # the cursor keeps flowing even on no-geometry-change layouts.
+                self._send_cursor_rearm()
+                if needs_post_layout_arm:
+                    # Geometry actually changed — additionally re-offer the
+                    # media session (0x1c) so the encoder restarts at the new
+                    # canvas. The FBUR it needs was just sent by the re-arm.
+                    self._schedule_post_layout_arm()
+                offset += 2 + prefix_len
             else:
                 # A non-cursor, non-config rect on the control channel means
-                # the daemon answered with video/raw pixel data over RFB. With
-                # the 1x1 keepalive below this should never happen; count it as
-                # the safety signal that a request pulled video (the failure
-                # mode of the old full-screen request that destabilised RTP).
+                # the daemon answered with video/raw pixel data over RFB, or
+                # an unknown pseudo-encoding whose payload size we can't tell.
+                # Either way we give up parsing the rest of this FBU (dropping
+                # any cursor rect that follows). The next msg starts with a
+                # fresh type byte so this isn't fatal. Count it as the safety
+                # signal that a request pulled video (the failure mode of the
+                # old full-screen request that destabilised RTP).
                 self._fbu_video_rects += 1
-                log.debug("FBU rect with video/unknown encoding=%d; aborting "
-                          "walk (video_rects=%d)", encoding, self._fbu_video_rects)
+                if _dbg_cursor:
+                    log.info("FBU walk ABORT at unknown encoding=0x%x (%d); "
+                             "encs so far=[%s] — rects after this are dropped "
+                             "(video_rects=%d)",
+                             encoding & 0xffffffff, encoding,
+                             ",".join(_dbg_encs), self._fbu_video_rects)
+                else:
+                    log.debug("FBU rect with video/unknown encoding=%d; aborting "
+                              "walk (video_rects=%d)", encoding,
+                              self._fbu_video_rects)
                 return
-        # Re-arm the cursor pipeline. The daemon's threads stay alive (it's
-        # not a dead cursor pthread) — the cursor just
-        # stops because the daemon re-arms its sender after each rect and needs
-        # a fresh request, which iss wasn't sending (SS.app polls continuously,
-        # so it never freezes). Re-request a MINIMAL 1x1 region after each
-        # cursor update so shape changes keep flowing, without pulling video.
+        if _dbg_cursor and (n_rects != 1 or any("0x450" in e for e in _dbg_encs)):
+            # Log multi-rect FBUs and any FBU carrying a cursor (0x450/1104)
+            # rect, so we can see whether a cursor command is present but
+            # mis-framed vs genuinely absent during a post-login freeze.
+            log.info("FBU n_rects=%d encs=[%s]", n_rects, ",".join(_dbg_encs))
+        # Re-arm the cursor pipeline. The daemon re-arms its sender after each
+        # rect and needs a fresh request to keep cursor (enc 1104) shape
+        # updates flowing; re-request a MINIMAL 1x1 region after each cursor
+        # update so shape changes keep flowing, without pulling video. (The
+        # heavier free-running re-arm — 0x09 + non-incremental FBUR — is sent
+        # from the 0x451 handler on a display/session transition.)
         if saw_cursor and self._input is not None:
             try:
                 self._input.request_framebuffer_update()
             except Exception:
                 pass
+
+    def _schedule_post_layout_arm(self) -> None:
+        """Called from the 0x451 handler on a geometry CHANGE. Re-offers the
+        media session (0x1c) with the same SRTP keys so the server restarts
+        the HEVC encoder at the new canvas dimensions. Without the 0x1c
+        re-offer the server stops encoding — it won't resize the media canvas
+        without a fresh media-stream configuration.
+
+        The non-incremental FBU request the encoder restart needs is already
+        sent by `_send_cursor_rearm()` immediately before this call (see the
+        0x451 handler), so this method no longer sends its own FBUR — that
+        avoided a duplicate full-refresh request per resize.
+        """
+        neg = self._negotiation
+        if neg is None:
+            return
+        from .protocol.negotiation import build_0x1c
+
+        # Re-offer the media session. We reuse the same SRTP keys —
+        #    the server accepts this and restarts the encoder at the new
+        #    canvas size. (The native app generates new keys for each
+        #    round; we may revisit this once the full round-trip key
+        #    lifecycle is understood.)
+        try:
+            vo = getattr(self, '_video_offer', None)
+            ao = getattr(self, '_audio_offer', None)
+            if vo is None or ao is None:
+                vo, ao = create_offers()
+            msg_1c = build_0x1c(
+                ao, vo, neg.keys,
+                alt_session=self._config.alt_session,
+            )
+            neg.cipher.encrypt_and_send(neg.sock, msg_1c)
+            log.info("post-layout: sent 0x1c re-offer (%dB)", len(msg_1c))
+        except OSError as e:
+            log.warning("post-layout 0x1c send failed: %s", e)
+
+        # 3) Defer FIR to the TX thread.
+        self._needs_post_layout_fir = True
+
+    def _send_cursor_rearm(self) -> None:
+        """Re-arm the daemon's free-running TCP update sender so the cursor
+        pseudo-encoding (enc 1104) keeps flowing across a display/session
+        transition.
+
+        Sends a full-refresh request: AutoFrameBufferUpdate (0x09) followed
+        by a non-incremental FramebufferUpdateRequest, using the backing
+        (pixel) canvas dims for the 0x09 region (matching what native sends).
+        This
+        is lightweight — unlike _schedule_post_layout_arm it does NOT re-offer
+        the media session — so it's safe to call at every 0x451, including the
+        no-geometry-change layout events emitted at a login/lock/agent switch
+        (the case that froze the cursor before).
+        """
+        neg = self._negotiation
+        if neg is None:
+            return
+        from .protocol.negotiation import (
+            build_auto_framebuffer_update,
+            build_fbu_request,
+        )
+        # Backing/pixel dims for the AutoFrameBufferUpdate region. Fall back
+        # to full (0xFFFF) only if we don't yet have a runtime canvas.
+        rw = self._runtime_canvas_w or 0xFFFF
+        rh = self._runtime_canvas_h or 0xFFFF
+        try:
+            neg.cipher.encrypt_and_send(
+                neg.sock, build_auto_framebuffer_update(rw, rh))
+            neg.cipher.encrypt_and_send(
+                neg.sock, build_fbu_request(incremental=False))
+        except OSError as e:
+            log.debug("cursor re-arm (0x09 + FBUR) failed: %s", e)
 
     def _handle_cursor_rect(
         self, msg: bytes, offset: int,
@@ -2332,6 +2762,9 @@ class Session:
         payload_off = offset + 8
         if payload_off + comp_size > len(msg):
             return -1
+        if os.environ.get("ISS_CURSOR_DEBUG") == "1":
+            log.info("cursor-rect: dims=%dx%d hot=(%d,%d) cache_id=%d comp_size=%d",
+                     cursor_w, cursor_h, hotspot_x, hotspot_y, cache_id, comp_size)
         if comp_size == 0:
             # Cache hit: server sent just the cache_id. Pull our cached
             # cursor for this id and re-apply. Cache IDs are arbitrary
@@ -2412,6 +2845,12 @@ class Session:
     def _notify_cursor(self, img: Optional[_CursorImage]) -> None:
         self._cursor_msgs_processed += 1
         self._cursor_last_t = time.monotonic()
+        if os.environ.get("ISS_CURSOR_DEBUG") == "1":
+            if img is None:
+                log.info("cursor-notify: None (cache-miss / revert-to-default)")
+            else:
+                log.info("cursor-notify: %dx%d hotspot=(%d,%d)",
+                         img.width, img.height, img.hotspot_x, img.hotspot_y)
         cb = self._cursor_callback
         if cb is None:
             return
@@ -2489,6 +2928,9 @@ class Session:
             try:
                 self._send_heartbeat()
                 self._send_rr_and_maybe_sr()
+                if self._needs_post_layout_fir:
+                    self._needs_post_layout_fir = False
+                    self.request_fir()
                 self._drain_pending_fir()
                 self._drain_pending_nack()
                 self._check_stall()

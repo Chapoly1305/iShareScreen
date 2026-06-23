@@ -69,17 +69,36 @@ class StreamCipher:
         self._dec_ctr = 0
         self._lock = threading.Lock()
 
+    def _encrypt_locked(self, plaintext: bytes) -> bytes:
+        """Encrypt one record. Caller MUST hold `self._lock` — the record
+        counter increment and the returned bytes must stay paired."""
+        counter = self._enc_ctr
+        pad = (-(2 + len(plaintext) + _MAC_LEN)) % _BLOCK
+        framed = struct.pack(">H", len(plaintext)) + plaintext + b"\x00" * pad
+        mac = hashlib.sha1(struct.pack(">I", counter) + framed).digest()
+        block = framed + mac
+        ciphertext = self._enc.encrypt(block)
+        self._enc_ctr = counter + 1
+        return struct.pack(">H", len(ciphertext)) + ciphertext
+
     def encrypt_message(self, plaintext: bytes) -> bytes:
         """Wrap a control-channel message (RFB body) for sending."""
         with self._lock:
-            counter = self._enc_ctr
-            pad = (-(2 + len(plaintext) + _MAC_LEN)) % _BLOCK
-            framed = struct.pack(">H", len(plaintext)) + plaintext + b"\x00" * pad
-            mac = hashlib.sha1(struct.pack(">I", counter) + framed).digest()
-            block = framed + mac
-            ciphertext = self._enc.encrypt(block)
-            self._enc_ctr = counter + 1
-        return struct.pack(">H", len(ciphertext)) + ciphertext
+            return self._encrypt_locked(plaintext)
+
+    def encrypt_and_send(self, sock, plaintext: bytes) -> None:
+        """Encrypt and write to `sock` atomically under the cipher lock.
+
+        Multiple threads send on the same control socket (the input
+        forwarder, the render thread's dynamic-resolution requests, and
+        the TCP-rx thread's post-layout re-offer). `encrypt_message`
+        already serialises the record counter, but if the `sendall` is
+        outside the lock two records can interleave their bytes on the
+        wire under backpressure and desync the server's record framing.
+        Holding the lock across both keeps counter order == wire order."""
+        with self._lock:
+            enc = self._encrypt_locked(plaintext)
+            sock.sendall(enc)
 
     def decrypt_message(self, ciphertext: bytes) -> Optional[bytes]:
         """Decrypt one ciphertext block. Returns the inner RFB body, or None
