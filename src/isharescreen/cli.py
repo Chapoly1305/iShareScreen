@@ -24,11 +24,18 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import faulthandler
 import logging
 import signal
 import sys
 import time
 from typing import Optional
+
+# Enable faulthandler early so that native-thread crashes (e.g. QSV worker,
+# GPU renderer) print a Python traceback (or at least register the fault) to
+# stderr before the process dies. Works best for faults on a thread that holds
+# the GIL; for pure-native-thread crashes it at least lets WER catch the dump.
+faulthandler.enable()
 
 from . import __version__
 from .proxy.protocol.negotiation import AdvertiseDims
