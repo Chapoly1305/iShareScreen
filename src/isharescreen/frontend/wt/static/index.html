@@ -645,24 +645,25 @@ async function main() {
     const sFps = ((frames - lastFrames) / dt);
     const mbps = ((bytesReceived - lastBytes) * 8 / 1e6 / dt);
     lastDecoded = decoded; lastFrames = frames; lastBytes = bytesReceived; lastT = now;
-    // Compact debug line. Each field earns its place:
+    // Compact status line — the fields a viewer actually cares about:
     //   fps      — is the decoder keeping up? (essential)
-    //   Mb/s     — is data flowing at the expected rate?
-    //   gray%    — what the canvas-sampler sees right now
-    //   loss%    — server-side cumulative SRTP loss; tells us if a
-    //              gray period correlates with packet loss (legit) or
-    //              not (likely a bug to chase)
-    //   stuck    — seconds since the iss decoder last published a
-    //              fresh tile; goes >0 the moment iss is wedged even
-    //              if the WT pump is still re-encoding stale tiles
+    //   Mb/s     — current bandwidth (what the user watches)
+    //   WxH      — the resolution actually being delivered
+    //   loss%    — server-side cumulative SRTP loss (quality)
+    //   frozen   — shown ONLY when the iss decoder hasn't published a
+    //              fresh tile for >=1.5s (a real freeze); tints the bar red
     //   dec/enc  — hw paths that picked up (vaapi/h264_videotoolbox/…)
-    const grayPct = Math.round((lastSampleStats.gray_frac || 0) * 100);
-    const klass = serverStats.stuck_s >= 1.5 || grayPct >= 50 ? "err" : "ok";
+    // The canvas gray-sampler still runs below and is reported to the iss
+    // server log; gray% just isn't shown here — it isn't actionable for
+    // the person watching.
+    const stuck = serverStats.stuck_s || 0;
+    const loss = serverStats.loss_pct || 0;
+    const klass = stuck >= 1.5 ? "err" : "ok";
     setStatus(
-      `${dFps.toFixed(0)}fps · ${mbps.toFixed(1)} Mb/s · `
-      + `gray ${grayPct}% · loss ${(serverStats.loss_pct || 0).toFixed(2)}% · `
-      + `stuck ${(serverStats.stuck_s || 0).toFixed(1)}s · `
-      + `${serverStats.decoder || "?"}/${(serverStats.encoder || "?")}`,
+      `${dFps.toFixed(0)} fps · ${mbps.toFixed(2)} Mb/s · ${canvas.width}×${canvas.height}`
+      + ` · loss ${loss.toFixed(2)}%`
+      + (stuck >= 1.5 ? ` · ⚠ frozen ${stuck.toFixed(1)}s` : "")
+      + ` · ${serverStats.decoder || "?"}/${serverStats.encoder || "?"}`,
       klass,
     );
     // Sample the canvas to verify real content is being displayed.

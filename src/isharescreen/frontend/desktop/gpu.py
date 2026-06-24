@@ -327,10 +327,11 @@ class Renderer:
         self._cur_w = self._cur_h = 0
         self._cur_hx = self._cur_hy = 0
         self._cursor_pos: "tuple[int, int] | None" = None  # pointer, canvas texels
-        # Render scale for the cursor sprite = the local display's content
-        # scale (Retina factor). A cursor is a UI element drawn at the local
-        # display resolution, so its size must NOT scale with the video
-        # letterbox (which shrinks the remote canvas into the window).
+        # Calibration multiplier for the cursor sprite (default 1.0,
+        # ISS_CURSOR_SCALE). The base on-screen size is computed in draw() by
+        # scaling the sprite with the video's uniform letterbox factor (1
+        # sprite pixel = 1 content texel), so the cursor tracks the zoomed
+        # content rather than staying frozen at native size.
         self._cursor_scale = 1.0
         self._cursor_sampler = device.create_sampler(
             mag_filter=wgpu.FilterMode.nearest,
@@ -529,13 +530,33 @@ class Renderer:
             usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
             size=(w, h, 1),
         )
-        rgba = np.frombuffer(img.rgba, dtype=np.uint8)[: w * h * 4].reshape(h, w, 4)
-        self._device.queue.write_texture(
-            {"texture": tex, "origin": (0, 0, 0)},
-            np.ascontiguousarray(rgba),
-            {"offset": 0, "bytes_per_row": w * 4},
-            (w, h, 1),
-        )
+        rgba = np.frombuffer(img.rgba, dtype=np.uint8)[: w * h * 4].reshape(h, w * 4)
+        # wgpu requires the source `bytes_per_row` to be a multiple of 256
+        # (COPY_BYTES_PER_ROW_ALIGNMENT). A small cursor (e.g. 17px wide → 68
+        # bytes/row) is unaligned, so write_texture throws and leaves the
+        # overlay with no texture — the cursor never appears. Pad each row up
+        # to the 256-byte stride; the copy still reads only the real w*4 bytes.
+        w4 = w * 4
+        bpr = ((w4 + 255) // 256) * 256
+        if bpr == w4:
+            data = np.ascontiguousarray(rgba)
+        else:
+            data = np.zeros((h, bpr), dtype=np.uint8)
+            data[:, :w4] = rgba
+        try:
+            self._device.queue.write_texture(
+                {"texture": tex, "origin": (0, 0, 0)},
+                np.ascontiguousarray(data),
+                {"offset": 0, "bytes_per_row": bpr},
+                (w, h, 1),
+            )
+        except Exception as e:
+            log.warning("cursor write_texture FAILED w=%d h=%d w4=%d bpr=%d "
+                        "data=%r: %s", w, h, w4, bpr,
+                        getattr(data, "shape", None), e)
+            self._cursor_tex = None
+            self._cursor_bind_group = None
+            return
         self._cursor_tex = tex
         self._cur_w, self._cur_h = w, h
         self._cur_hx, self._cur_hy = int(img.hotspot_x), int(img.hotspot_y)
@@ -555,9 +576,10 @@ class Renderer:
         self._cursor_pos = pos
 
     def set_cursor_scale(self, scale: float) -> None:
-        """Local display content scale (Retina factor) — the cursor sprite is
-        drawn at `pixmap_size * scale` surface pixels, matching the size the
-        OS would show it, independent of the video letterbox."""
+        """Calibration multiplier for the cursor overlay (default 1.0). The
+        sprite's base on-screen size is `pixmap_size * letterbox_scale` (set in
+        draw, so 1 sprite pixel = 1 content texel and the cursor tracks the
+        video zoom); this multiplier (ISS_CURSOR_SCALE) tunes it further."""
         self._cursor_scale = max(0.1, float(scale))
 
     def draw(
@@ -588,17 +610,16 @@ class Renderer:
             self._uniform_buf, 0,
             np.array([ux, uy, 0.0, 0.0], dtype=np.float32).tobytes(),
         )
-        # Aspect-preserving fit: one uniform scale (same factor on both
-        # axes) sized to the largest content rect that fits the target,
-        # then centered. Preserves the decoded aspect — never stretched —
-        # and the leftover falls out as symmetric letter/pillarbox bars.
-        if cw > 0 and ch > 0 and target_w > 0 and target_h > 0:
-            scale = min(target_w / cw, target_h / ch)
-            vw, vh = cw * scale, ch * scale
-        else:
-            scale = 1.0
-            vw, vh = float(target_w), float(target_h)
-        viewport = ((target_w - vw) * 0.5, (target_h - vh) * 0.5, vw, vh)
+        # Fill the whole window (the pre-rework baseline behavior). The window
+        # is aspect-locked to the content (see app.py), so a free resize fills
+        # with no distortion; when the window can't hold the aspect (maximize
+        # overrides the lock) the content stretches to fill rather than showing
+        # black bars. `uv_scale` (above) still crops sampling to the decoded
+        # sub-rect, so texture padding is never shown (no green/black bottom).
+        viewport = (0.0, 0.0, float(target_w), float(target_h))
+        # Per-axis content->screen scale, for placing the cursor overlay.
+        sclx = target_w / cw if cw > 0 else 1.0
+        scly = target_h / ch if ch > 0 else 1.0
         encoder = self._device.create_command_encoder()
         rpass = encoder.begin_render_pass(color_attachments=[{
             "view": target_view,
@@ -635,12 +656,13 @@ class Renderer:
                 )
         if _overlay_ok:
             cx, cy = self._cursor_pos
-            vx, vy = viewport[0], viewport[1]
-            d = self._cursor_scale
-            # Pointer maps through the letterbox; the sprite is sized to the
-            # local display (a cursor must not shrink with the video zoom).
-            px = vx + cx * scale
-            py = vy + cy * scale
+            # Content texels map onto the full window per-axis (fill). Place
+            # the cursor by the per-axis scale; size the sprite by the smaller
+            # axis so it stays square (never stretched). `_cursor_scale` is a
+            # calibration / ISS_CURSOR_SCALE multiplier (default 1.0).
+            d = min(sclx, scly) * self._cursor_scale
+            px = cx * sclx
+            py = cy * scly
             sw = self._cur_w * d
             sh = self._cur_h * d
             sx = px - self._cur_hx * d

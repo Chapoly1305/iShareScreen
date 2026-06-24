@@ -264,17 +264,20 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
     cli_password = _password_from_args(args)
     cli_advertise = _parse_advertise(args.advertise)
     # For a fixed --advertise WxH, the --hidpi mode determines the backing
-    # scale (the auto/dynamic path resolves this in the frontend instead).
-    # 'on' → 2×, 'off' → 1×, 'auto' → 2× when the 2× backing fits the host's
-    # 3840×2160 cap (logical ≤ 1920×1080), else 1×.
+    # scale. 'on'/'off' are display-independent so we resolve them here
+    # (2×/1×). 'auto' must match the LOCAL display's backing scale (1× on a
+    # non-Retina Windows/Linux display, 2× on a Retina Mac) — but the CLI has
+    # no window/monitor handle, so we seed a safe 1× default and let the
+    # frontend (which calls _display_scale()) re-resolve 'auto' once GLFW can
+    # see the display. This avoids the old bug where 1366×768 auto blindly
+    # became 2× (2732×1536 backing = 4× the bytes + an oversized window).
     if cli_advertise is not None:
-        w, h = cli_advertise.width, cli_advertise.height
         if args.hidpi == "off":
             scale = 1
         elif args.hidpi == "on":
             scale = 2
-        else:  # auto
-            scale = 2 if (w * 2 <= 3840 and h * 2 <= 2160) else 1
+        else:  # auto — frontend re-resolves to the local display scale
+            scale = 1
         cli_advertise = dataclasses.replace(cli_advertise, hidpi_scale=scale)
     # Dynamic resolution: explicit --dynamic/--no-dynamic wins; otherwise
     # default it on exactly when no fixed geometry was given (advertise is

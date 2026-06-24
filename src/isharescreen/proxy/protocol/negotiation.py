@@ -171,9 +171,11 @@ def build_0x1c(
     # Without bit 2 on the cmd=2 alt-session path, the agent bakes the
     # alt-user's cursor into the framebuffer at top-left and never
     # updates it — visible as a cursor stuck in the corner of every
-    # tile. We set bit 2 only for alt-session because the standard
-    # console-user path's cursor is expected to update via the encoder
-    # (the local mouse drives it).
+    # tile. We set bit 2 unconditionally for alt-session here, AND for the
+    # standard console-user path via the elif below (default on; disabled
+    # only by ISS_LEGACY_CURSOR=1). In both cases the local enc-1104 overlay
+    # renders the cursor, so the agent never bakes it into encoded frames —
+    # which is what keeps cursor motion from generating needless frames.
     config_flags = 3
     if alt_session:
         config_flags = (config_flags & ~2) | 4   # drop bit 1, set bit 2
@@ -535,6 +537,13 @@ APPLE_HP_MSG_AUTO_FRAMEBUFFER_UPDATE = 0x09
 def build_auto_framebuffer_update(width: int, height: int) -> bytes:
     """Apple HP AutoFrameBufferUpdate (msg 0x09) — a 16-byte fixed record.
 
+    NOTE: currently unused. Arming this message makes the daemon's
+    `SendFrameBuffer` loop *free-run* TCP-side updates, which pulls full
+    video frames on a static screen (~800 pps idle). Our RE notes confirm
+    msg 0x09 is NOT a cursor re-arm — the enc-1104 cursor works without it
+    (the periodic 1x1 incremental FBU poll re-arms the cursor sender). Kept
+    here only for protocol reference; do not call it on the idle path.
+
     This is the message that arms the daemon's `SendFrameBuffer` loop to
     *free-run* TCP-side updates (including the cursor pseudo-encoding 1104
     SELECTs) without a fresh FramebufferUpdateRequest per frame. The native
@@ -596,29 +605,8 @@ def _phase_media_offer(
         except OSError as e:
             log.warning("msg 0x03 send failed: %s", e)
 
-    def _arm_auto_fbu(cv: tuple[int, int, int]) -> None:
-        # Arm the daemon's free-running TCP update sender once we know the
-        # canvas. The native client pairs a non-incremental FBU request
-        # (sent above) with AutoFrameBufferUpdate (0x09) so the cursor
-        # pseudo-encoding (enc 1104) SELECTs free-run without a per-frame
-        # request. Use backing/pixel dims for the region, like the native
-        # client (which uses the backing width/height).
-        if os.environ.get("ISS_LEGACY_CURSOR") == "1":
-            return
-        if not (cv[0] and cv[1]):
-            return
-        try:
-            sock.sendall(cipher.encrypt_message(
-                build_auto_framebuffer_update(cv[0], cv[1])
-            ))
-            log.info("msg 0x09 AutoFrameBufferUpdate sent (%dx%d, cursor re-arm)",
-                     cv[0], cv[1])
-        except OSError as e:
-            log.warning("msg 0x09 send failed: %s", e)
-
     canvas = _read_video_answer(sock, cipher, leftover_msgs)
     if canvas[0] and canvas[1]:
-        _arm_auto_fbu(canvas)
         return keys, canvas
 
     for attempt in range(_DEGENERATE_RETRY_LIMIT):
@@ -635,7 +623,6 @@ def _phase_media_offer(
         canvas = _read_video_answer(sock, cipher, leftover_msgs)
         if canvas[0] and canvas[1]:
             break
-    _arm_auto_fbu(canvas)
     return keys, canvas
 
 

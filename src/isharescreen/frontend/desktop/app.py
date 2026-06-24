@@ -193,6 +193,19 @@ def run(
         log.info("auto-detected initial viewer %dx%d → request %dx%d @%dx "
                  "(hidpi=%s dynamic=%s)",
                  aw, ah, rw, rh, scale, config.hidpi, dynamic)
+    else:
+        # A FIXED --advertise WxH renders at EXACTLY that resolution (the CLI
+        # already set hidpi_scale: 1 for 'auto'/'off', 2 for explicit 'on').
+        # We deliberately do NOT promote 'auto' to the local display scale:
+        # the user picked a specific resolution to get that resolution and its
+        # bandwidth, and silently doubling it on a HiDPI display quadruples the
+        # bytes for sharpness they never asked for. The decoded canvas is
+        # letterbox-fit into the window regardless of the display's pixel
+        # density (the surface-vs-logical ratio handles HiDPI in draw()).
+        # '--hidpi on' is the explicit opt-in to a 2× backing.
+        log.info("fixed advertise %dx%d @%dx (rendering the picked resolution)",
+                 config.advertise.width, config.advertise.height,
+                 config.advertise.hidpi_scale)
     session = Session(config)
     session.connect()
 
@@ -279,10 +292,36 @@ def run(
              num_tiles, session.hw_accel)
 
     # ── window + wgpu surface ──────────────────────────────────────────
-    win_w = scaled_w or canvas_w
-    win_h = scaled_h or canvas_h
+    # Open at the LOGICAL advertised size, not the backing size. At connect
+    # `session.scaled_dims` is still 0 (the 0x451 layout handler fills it
+    # async), so it falls back to `canvas_dims` = the backing (e.g. 2732×1536
+    # on a 1366×768 @2× HiDPI display) — which would size the window to the
+    # backing and blow past the screen. The advertised WxH is the logical
+    # point size (independent of hidpi_scale), so use it directly. On an
+    # explicit --hidpi on this opens a logical-sized window into which the 2×
+    # backing renders, letterboxed by gpu.Renderer.draw.
+    adv = config.advertise
+    win_w = (adv.width if adv else 0) or scaled_w or canvas_w
+    win_h = (adv.height if adv else 0) or scaled_h or canvas_h
     window = RenderCanvas(title=title, size=(win_w, win_h), max_fps=120)
     glfw_window = window._window  # for raw glfw input callbacks only
+    # Lock the window to the content's aspect ratio so the stream always fills
+    # it edge-to-edge with no letterbox side-bars (restores pre-merge behavior;
+    # the render rework dropped the lock, so on a monitor whose work-area aspect
+    # differs from the advertised aspect the window opens off-aspect and
+    # gpu.Renderer.draw pillarboxes the content). Also inscribe the *current*
+    # window to that aspect, since the WM may have opened it larger/off-aspect
+    # than the requested size — set_window_aspect_ratio only constrains future
+    # resizes, it doesn't reshape the existing window.
+    try:
+        glfw.set_window_aspect_ratio(glfw_window, win_w, win_h)
+        _cw0, _ch0 = glfw.get_window_size(glfw_window)
+        if _cw0 > 0 and _ch0 > 0:
+            _f = min(_cw0 / win_w, _ch0 / win_h)
+            glfw.set_window_size(
+                glfw_window, max(1, int(win_w * _f)), max(1, int(win_h * _f)))
+    except Exception as _e:
+        log.debug("window aspect-lock failed: %s", _e)
     # In canvas-cursor mode we render the host's cursor as a wgpu overlay and
     # hide the local system pointer — but NOT yet. Hiding it now, before the
     # overlay has both a shape (a cursor pixmap arrived) and a position (the
@@ -313,26 +352,28 @@ def run(
 
     renderer = Renderer(device, surface_format, canvas_w, canvas_h)
 
-    def _cursor_render_scale() -> float:
-        """On-screen size factor for the cursor sprite.
-
-        Draw the cursor pixmap 1:1 by default. The host delivers it at its
-        *backing* (device-pixel) resolution — a 17x23 arrow is already the
-        Retina 2x arrow — and the wgpu surface is the logical (point) size,
-        so one sprite pixel maps to one logical point, i.e. the host's true
-        device-pixel arrow. Scaling it up by the Retina factor (as an earlier
-        revision did, via glfw content scale or the backing/scaled ratio)
-        double-counts that 2x and makes the cursor twice too large.
-
-        ISS_CURSOR_SCALE multiplies this for manual tuning."""
-        mult = 1.0
+    def _cursor_user_mult() -> float:
+        """Manual ISS_CURSOR_SCALE multiplier (default 1.0)."""
         override = os.environ.get("ISS_CURSOR_SCALE")
         if override:
             try:
-                mult = max(0.1, float(override))
+                return max(0.1, float(override))
             except ValueError:
                 pass
-        return mult
+        return 1.0
+
+    def _cursor_render_scale(surface_w: float = 0.0, logical_w: float = 0.0) -> float:
+        """Calibration multiplier for the cursor sprite (default 1.0).
+
+        The actual on-screen sizing now happens in gpu.Renderer.draw, which
+        scales the sprite by the same uniform letterbox factor as the video
+        (1 sprite pixel = 1 content texel), so the cursor stays proportional to
+        the zoomed content instead of frozen at native size ("tiny cursor").
+        That already accounts for a HiDPI surface (the letterbox factor is in
+        surface pixels), so no separate surface/logical ratio is needed here —
+        this just carries ISS_CURSOR_SCALE for manual tuning. Args are kept for
+        call-site compatibility and ignored."""
+        return _cursor_user_mult()
 
     if _canvas_cursor:
         renderer.set_cursor_scale(_cursor_render_scale())
@@ -352,11 +393,10 @@ def run(
 
         This MUST invert the exact transform in `gpu.Renderer.draw`: the
         decoded content (`content_dims()`, pinned to the top-left of the
-        canvas textures) is scaled by ONE uniform factor — the largest that
-        fits the window — then centered, with black bars filling the rest.
-        So here: undo the centering offset, divide into the centered content
-        rect, then map onto the content's texels. A cursor over a black bar
-        clamps to the nearest content edge. The window→content fractions are
+        canvas textures) is stretched to fill the whole window per-axis (no
+        bars). So here the window→content map is a plain per-axis fraction —
+        and it MUST stay in lockstep with draw()'s viewport, or the host
+        cursor drifts from the OS pointer. The window→content fractions are
         identical whether measured in logical points (this function) or
         physical surface pixels (draw's target), so `glfw.get_window_size`
         points are the right space.
@@ -372,15 +412,14 @@ def run(
         cw, ch = renderer.content_dims()  # real frame size, canvas texels
         if cw <= 0 or ch <= 0 or canvas_w <= 0 or canvas_h <= 0:
             return None
-        # Mirror draw()'s uniform-scale fit: one factor on both axes (so the
-        # mapping never skews), sized to the largest content rect that fits
-        # the window, then centered.
-        scale = min(win_w / cw, win_h / ch)
-        rect_w = cw * scale
-        rect_h = ch * scale
-        ox, oy = (win_w - rect_w) / 2.0, (win_h - rect_h) / 2.0
-        u = (wx - ox) / rect_w if rect_w else 0.0
-        v = (wy - oy) / rect_h if rect_h else 0.0
+        # Mirror draw()'s fill: the content is stretched to fill the whole
+        # window per-axis (no bars), so the window->content map is a plain
+        # per-axis fraction. Keeping this in lockstep with draw() is what keeps
+        # the host cursor aligned with the OS pointer — a uniform/letterbox
+        # map here against a stretched draw makes the cursor drift, visible as
+        # a jump when the overlay hands off to the OS cursor at the edge.
+        u = wx / win_w if win_w else 0.0
+        v = wy / win_h if win_h else 0.0
         u = min(1.0, max(0.0, u))
         v = min(1.0, max(0.0, v))
         sx = min(cw - 1, int(u * cw))
@@ -554,15 +593,47 @@ def run(
     # loop checks this and shuts down cleanly instead of letting the
     # underlying Rust panic kill the process with an unhelpful trace.
     _device_lost: dict[str, bool] = {"v": False}
+    _locked_aspect: list = [0.0]  # last content aspect the window was locked to
 
     def draw_callback():
         try:
             target = surface_ctx.get_current_texture()
+            # Lock the window to the *content* aspect (authoritative once the
+            # first tile lands; the advertised aspect set at window creation is
+            # only a guess and is wrong when the host falls back to a different
+            # resolution — e.g. mirroring a non-16:9 display). Re-applied only
+            # when the content aspect actually changes, so a stable session
+            # leaves the user's manual resizes alone.
+            _ccw, _cch = renderer.content_dims()
+            if _ccw > 0 and _cch > 0:
+                _asp = _ccw / _cch
+                if abs(_asp - _locked_aspect[0]) > 0.01:
+                    _locked_aspect[0] = _asp
+                    try:
+                        glfw.set_window_aspect_ratio(glfw_window, _ccw, _cch)
+                        _gw, _gh = glfw.get_window_size(glfw_window)
+                        if _gw > 0 and _gh > 0:
+                            _ff = min(_gw / _ccw, _gh / _cch)
+                            glfw.set_window_size(
+                                glfw_window, max(1, int(_ccw * _ff)),
+                                max(1, int(_cch * _ff)))
+                    except Exception:
+                        pass
             if _canvas_cursor:
                 # Suppress the overlay while the pointer is outside the window
                 # (None hides it) so it doesn't freeze as a ghost at the edge.
                 renderer.set_cursor_pos(
                     cursor if _pointer_in_window["v"] else None)
+                # The cursor's on-screen size is computed in gpu.Renderer.draw
+                # (sprite scaled by the same letterbox factor as the video, so
+                # it tracks the zoom instead of staying frozen tiny). Here we
+                # only feed the ISS_CURSOR_SCALE calibration multiplier.
+                try:
+                    lw, _lh = glfw.get_window_size(glfw_window)
+                    renderer.set_cursor_scale(
+                        _cursor_render_scale(target.width, lw))
+                except Exception:
+                    pass
             renderer.draw(target.create_view(), target.width, target.height)
         except Exception as e:
             msg = str(e)

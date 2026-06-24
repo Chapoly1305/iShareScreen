@@ -535,6 +535,12 @@ class Session:
         self._cursor_callback: Optional[
             Callable[[Optional["_CursorImage"]], None]
         ] = None
+        # The daemon sends the initial cursor pixmap at the instant of connect
+        # — often a few ms before the desktop frontend installs its callback
+        # (set_cursor_callback) — and never re-sends it. Stash the last real
+        # cursor so a late-registering callback can be replayed it immediately;
+        # without this the cursor overlay never receives a texture.
+        self._last_cursor_notified: Optional["_CursorImage"] = None
         # Safety counter for the cursor-keepalive: any video/raw rect arriving
         # over the RFB channel means an FBU request pulled video (the old
         # full-screen-request bug). Stays 0 with the 1x1 keepalive; surfaced
@@ -641,6 +647,14 @@ class Session:
         looks like (I-beam over text, resize cursors over window edges,
         busy spinner, etc.). Set to None to remove."""
         self._cursor_callback = cb
+        # The daemon's first cursor pixmap can arrive before this callback is
+        # installed (and isn't re-sent); replay the most recent one so a
+        # late-registering frontend still gets the cursor shape.
+        if cb is not None and self._last_cursor_notified is not None:
+            try:
+                cb(self._last_cursor_notified)
+            except Exception as e:
+                log.debug("cursor replay on register failed: %s", e)
 
     @property
     def last_received_clipboard_text(self) -> Optional[str]:
@@ -2563,14 +2577,13 @@ class Session:
                 #
                 # A layout event marks a display/session transition — the
                 # point at which the daemon's cursor sender otherwise goes
-                # silent (the post-login/lock freeze). We re-arm the
-                # free-running TCP update sender (AutoFrameBufferUpdate 0x09 +
-                # non-incremental FBU request — a full-refresh request) at the
-                # END of this branch,
-                # AFTER the new backing dims are parsed below, so the 0x09
-                # region matches the geometry this layout announces rather than
-                # the previous (stale) one. Done on EVERY 0x451 so cursor
-                # (enc 1104) SELECTs keep flowing across a login/lock switch.
+                # silent (the post-login/lock freeze). We re-arm the cursor
+                # (enc 1104) sender with a single non-incremental FBU request
+                # at the END of this branch. We deliberately do NOT send
+                # AutoFrameBufferUpdate (msg 0x09) — it free-runs full video
+                # frames over TCP (~800 pps idle) and isn't needed for the
+                # cursor. Done on EVERY 0x451 so cursor SELECTs keep flowing
+                # across a login/lock switch.
                 if offset + 2 > len(msg):
                     return
                 prefix_len = struct.unpack(">H", msg[offset:offset + 2])[0]
@@ -2633,8 +2646,8 @@ class Session:
                             # encoder; do the media re-offer below, after the
                             # cursor re-arm has sent the non-incremental FBUR.
                             needs_post_layout_arm = True
-                # Re-arm the free-running TCP sender now that _runtime_canvas_w/h
-                # reflect THIS layout (0x09 + non-incremental FBUR). Always, so
+                # Re-arm the cursor (enc 1104) sender now that this layout is
+                # parsed (a single non-incremental FBUR — no 0x09). Always, so
                 # the cursor keeps flowing even on no-geometry-change layouts.
                 self._send_cursor_rearm()
                 if needs_post_layout_arm:
@@ -2672,9 +2685,9 @@ class Session:
         # Re-arm the cursor pipeline. The daemon re-arms its sender after each
         # rect and needs a fresh request to keep cursor (enc 1104) shape
         # updates flowing; re-request a MINIMAL 1x1 region after each cursor
-        # update so shape changes keep flowing, without pulling video. (The
-        # heavier free-running re-arm — 0x09 + non-incremental FBUR — is sent
-        # from the 0x451 handler on a display/session transition.)
+        # update so shape changes keep flowing, without pulling video. (A
+        # non-incremental FBUR re-arm is also sent from the 0x451 handler on a
+        # display/session transition.)
         if saw_cursor and self._input is not None:
             try:
                 self._input.request_framebuffer_update()
@@ -2721,37 +2734,29 @@ class Session:
         self._needs_post_layout_fir = True
 
     def _send_cursor_rearm(self) -> None:
-        """Re-arm the daemon's free-running TCP update sender so the cursor
-        pseudo-encoding (enc 1104) keeps flowing across a display/session
-        transition.
+        """Re-arm the daemon's TCP cursor pseudo-encoding (enc 1104) sender so
+        the cursor keeps flowing across a display/session transition.
 
-        Sends a full-refresh request: AutoFrameBufferUpdate (0x09) followed
-        by a non-incremental FramebufferUpdateRequest, using the backing
-        (pixel) canvas dims for the 0x09 region (matching what native sends).
-        This
-        is lightweight — unlike _schedule_post_layout_arm it does NOT re-offer
-        the media session — so it's safe to call at every 0x451, including the
-        no-geometry-change layout events emitted at a login/lock/agent switch
-        (the case that froze the cursor before).
+        Sends a single non-incremental FramebufferUpdateRequest (msg 0x03).
+        We deliberately do NOT send AutoFrameBufferUpdate (msg 0x09) here: it
+        arms the daemon to free-run full video frames over TCP (~800 pps on a
+        static screen) and our RE notes confirm it is not required for the
+        cursor — the periodic 1x1 incremental FBU poll (_maybe_poll_cursor)
+        already re-arms the enc-1104 sender. This call is lightweight — unlike
+        _schedule_post_layout_arm it does NOT re-offer the media session — so
+        it's safe to call at every 0x451, including the no-geometry-change
+        layout events emitted at a login/lock/agent switch (the case that
+        froze the cursor before).
         """
         neg = self._negotiation
         if neg is None:
             return
-        from .protocol.negotiation import (
-            build_auto_framebuffer_update,
-            build_fbu_request,
-        )
-        # Backing/pixel dims for the AutoFrameBufferUpdate region. Fall back
-        # to full (0xFFFF) only if we don't yet have a runtime canvas.
-        rw = self._runtime_canvas_w or 0xFFFF
-        rh = self._runtime_canvas_h or 0xFFFF
+        from .protocol.negotiation import build_fbu_request
         try:
-            neg.cipher.encrypt_and_send(
-                neg.sock, build_auto_framebuffer_update(rw, rh))
             neg.cipher.encrypt_and_send(
                 neg.sock, build_fbu_request(incremental=False))
         except OSError as e:
-            log.debug("cursor re-arm (0x09 + FBUR) failed: %s", e)
+            log.debug("cursor re-arm (FBUR) failed: %s", e)
 
     def _handle_cursor_rect(
         self, msg: bytes, offset: int,
@@ -2858,6 +2863,8 @@ class Session:
     def _notify_cursor(self, img: Optional[_CursorImage]) -> None:
         self._cursor_msgs_processed += 1
         self._cursor_last_t = time.monotonic()
+        if img is not None:
+            self._last_cursor_notified = img
         if os.environ.get("ISS_CURSOR_DEBUG") == "1":
             if img is None:
                 log.info("cursor-notify: None (cache-miss / revert-to-default)")
