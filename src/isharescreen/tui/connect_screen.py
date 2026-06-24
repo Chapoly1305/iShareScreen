@@ -270,10 +270,12 @@ class ConnectScreen(Screen):
             )
             return
         res = self.query_one("#resolution", Select).value or _DEFAULT_RESOLUTION
-        # "Auto" = dynamic resolution: track the viewer window. `advertise`
-        # then carries only the initial size (the host re-renders on resize).
+        # "Auto" = dynamic resolution: forward advertise="auto" so the frontend
+        # monitor-auto-sizes the initial window (the CLI maps 'auto' -> None),
+        # then re-renders to match the window on resize. Sending a concrete WxH
+        # here would skip that auto-size path and open at a fixed size.
         dynamic = res == "auto"
-        advertise = _DEFAULT_RESOLUTION if dynamic else str(res)
+        advertise = "auto" if dynamic else str(res)
         values = ConnectFormValues(
             host=host,
             user=user,

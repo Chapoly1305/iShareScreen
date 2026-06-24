@@ -662,7 +662,12 @@ class Session:
         gate = self._decoder._gate
         if tile_idx is None:
             gate.force_keyframe_all()
-            for ti in range(self.num_tiles):
+            # Bound by the gate's real tile count: a mid-session SSRC adoption
+            # (notably under dynamic-resolution) can bump num_tiles while the
+            # decoder is restart()ed, not recreated, so its gate keeps the
+            # construction-time size. Avoids an IndexError that would kill the
+            # caller's thread.
+            for ti in range(min(self.num_tiles, len(gate._states))):
                 self._send_fir_for_tile(ti)
         else:
             gate.mark_decode_error(tile_idx)
@@ -1830,9 +1835,13 @@ class Session:
                 # the gate already recognizes as bad — nudge them
                 # by re-marking, which resets their re-arm timer.
                 if self._decoder is not None:
+                    # Clamp to the gate's real size (see request_fir): num_tiles
+                    # can outrun the restart()ed decoder's gate after an SSRC
+                    # adoption, and indexing past _states would IndexError here.
+                    states = self._decoder._gate._states
                     bad_tiles = [
-                        ti for ti in range(self.num_tiles)
-                        if self._decoder._gate._states[ti].bad_streak > 0
+                        ti for ti in range(min(self.num_tiles, len(states)))
+                        if states[ti].bad_streak > 0
                     ]
                     for ti in bad_tiles:
                         # Sourced from the libav "Could not find ref" log →
