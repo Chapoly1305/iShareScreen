@@ -178,6 +178,34 @@ class FrameQualityGate:
         # before the post-IDR grace early-return — so concealment that
         # continues *through* a failed IDR still counts.
         self._last_concealment_t: float = 0.0
+        # Time of the most recent *unreliable* concealment mark — i.e. one
+        # sourced from libav's "Could not find ref" log line rather than a
+        # per-frame `decode_error_flags` / packet-loss / VT-status signal.
+        # The quiet-window guard in `mark_clean` keys off THIS, not
+        # `_last_concealment_t`. Rationale (the Windows over-FIR fix):
+        #   - The `_RECOVERY_QUIET_S` window exists ONLY to defend against a
+        #     decoder that grays out while producing frames with NO per-frame
+        #     error flag (the d3d11va "silent wedge"). The only signal that
+        #     fires *during* that silent gray is libav's continuous "Could
+        #     not find ref" log → an UNRELIABLE-sourced mark. So the quiet
+        #     window must track unreliable marks only.
+        #   - The per-frame `decode_error_flags` path (and the VT status!=0
+        #     and RTP-loss paths) IS reliable: when it goes error-free after
+        #     an IDR, the picture genuinely recovered. On Windows SW decode
+        #     the libav-log path frequently never reaches us ("no libav
+        #     concealment captured"), so the only marks are the reliable
+        #     per-frame post-IDR drain noise — which used to keep
+        #     `_last_concealment_t` fresh and block the clear for ~7 s while
+        #     an IDR decoded cleanly every second. Keying the window off
+        #     unreliable marks lets that clean post-IDR frame clear at once.
+        # Mac (libav-log captured) is unchanged: real gray keeps the
+        # "Could not find ref" log firing → unreliable marks stay fresh →
+        # the quiet window holds exactly as before. VT is unchanged: it
+        # never emits an unreliable mark, and its only concealment signal
+        # (status!=0) is reliable, so a clean recovery clears immediately —
+        # which is correct (VT's silent gray was never quiet-window-
+        # detectable in the first place).
+        self._last_unreliable_concealment_t: float = 0.0
 
     # -- main "publish" hook --------------------------------------------
     # Always publishes. Kept as a callable for API compatibility with
@@ -188,11 +216,23 @@ class FrameQualityGate:
         return True
 
     # -- decoder-error path (the only escalation source) ----------------
-    def mark_decode_error(self, tile_idx: int) -> None:
+    def mark_decode_error(self, tile_idx: int, *, reliable: bool = True) -> None:
         """Trusted signal that libavcodec concealed / failed for this
         tile. Adds the tile to `keyframe_required` (sticky) — the
         session's tx-tick will FIR for it now and again every
         `_RE_ARM_INTERVAL_S` until recovery is observed.
+
+        `reliable` distinguishes the *source* of the concealment signal,
+        which is what the quiet-window recovery guard keys off (see
+        `_last_unreliable_concealment_t`):
+          * `reliable=True` (default) — a per-frame `decode_error_flags`,
+            an explicit codec/VT decode-failure status, or an RTP-loss
+            mark. When this path goes error-free after an IDR, the picture
+            genuinely recovered.
+          * `reliable=False` — the libav "Could not find ref" log line,
+            which is the ONLY signal that fires during a silent gray (the
+            decoder emits gray frames with no per-frame error flag). This
+            is the signal the `_RECOVERY_QUIET_S` window must wait out.
         """
         if tile_idx < 0 or tile_idx >= self._num_tiles:
             return
@@ -200,8 +240,14 @@ class FrameQualityGate:
         # Record concealment time BEFORE the post-IDR grace return below,
         # so gray that persists through a failed IDR keeps pushing back the
         # recovery-quiet window in mark_clean — this is what makes recovery
-        # robust on HW decoders that don't flag concealed frames.
+        # robust on decoders that don't flag concealed frames.
         self._last_concealment_t = now
+        if not reliable:
+            # Only the unreliable (libav-log) source gates the quiet window.
+            # A reliable per-frame error after an IDR is post-IDR drain noise
+            # (already absorbed by `_POST_IDR_GRACE_S`) and must NOT block the
+            # clean-recovery clear — that was the Windows ~7 s over-FIR loop.
+            self._last_unreliable_concealment_t = now
         # Post-IDR grace: errors right after the tile's IDR are
         # almost always in-flight pre-IDR P-frames decoding against
         # the freshly-reset DPB. Suppress them so they don't trigger
@@ -299,14 +345,28 @@ class FrameQualityGate:
         state.needs_real_frame = False
         now = self._time.monotonic()
         # Clear requires THREE things now: an IDR was observed, a frame
-        # published since, AND the decoder has not logged concealment for
-        # `_RECOVERY_QUIET_S`. The quiet gate is what stops a HW decoder's
-        # unflagged gray frame from being mistaken for recovery — while the
-        # screen is gray the "Could not find ref" log keeps firing, so the
-        # window never goes quiet until a real IDR actually lands.
+        # published since, AND the decoder has not logged an *unreliable*
+        # (libav "Could not find ref") concealment for `_RECOVERY_QUIET_S`.
+        # The quiet gate is what stops a decoder's unflagged silent-gray
+        # frame from being mistaken for recovery — while the screen is
+        # silently gray the "Could not find ref" log keeps firing (an
+        # unreliable mark), so the window never goes quiet until a real IDR
+        # actually lands.
+        #
+        # We key the window off `_last_unreliable_concealment_t`, NOT the
+        # all-sources `_last_concealment_t`. A reliable per-frame decode
+        # error after an IDR is just pre-IDR P-frames draining against the
+        # reset DPB (already classed as noise by `_POST_IDR_GRACE_S`); it
+        # must not hold the clear open. On Windows SW decode the libav-log
+        # path frequently never reaches us, so the post-IDR drain was the
+        # ONLY thing keeping `_last_concealment_t` fresh — which blocked
+        # this clear for ~7 s while a fresh IDR decoded cleanly every
+        # second (the over-FIR loop). With the window now keyed off
+        # unreliable marks, the first error-free post-IDR frame clears it.
         if (tile_idx in self._keyframe_required
                 and tile_idx in self._idr_observed
-                and now - self._last_concealment_t >= self._RECOVERY_QUIET_S):
+                and now - self._last_unreliable_concealment_t
+                    >= self._RECOVERY_QUIET_S):
             self._keyframe_required.discard(tile_idx)
             self._idr_observed.discard(tile_idx)
             self._fir_attempts[tile_idx] = 0

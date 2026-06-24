@@ -1835,7 +1835,10 @@ class Session:
                         if self._decoder._gate._states[ti].bad_streak > 0
                     ]
                     for ti in bad_tiles:
-                        self._decoder._gate.mark_decode_error(ti)
+                        # Sourced from the libav "Could not find ref" log →
+                        # reliable=False: this is the silent-gray-capable
+                        # signal that must hold the recovery quiet-window open.
+                        self._decoder._gate.mark_decode_error(ti, reliable=False)
                 return
 
         # Soft-concealment path with steady-state + rate-limit guards.
@@ -1847,7 +1850,8 @@ class Session:
             return
         self._last_libav_fir_t = now
         log.warning("libav decoder error: %s", msg[:120])
-        self._decoder._gate.mark_decode_error(0)
+        # Soft-concealment, also sourced from the libav log → reliable=False.
+        self._decoder._gate.mark_decode_error(0, reliable=False)
 
     # ── video RX: drain + process split ──────────────────────────────
     #
