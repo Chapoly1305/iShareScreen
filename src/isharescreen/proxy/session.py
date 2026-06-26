@@ -43,7 +43,9 @@ from .media.aac_eld import AacEldDecoder, make_aac_eld_decoder
 from .media.hevc import HevcDecoder
 from .media.avc import AvcDecoder
 from .media.nalu import first_donl, reassemble_group
-from .media.avc_nalu import reassemble_h264
+from .media.avc_nalu import (
+    APPLE_CONFIG_MARKER, parse_avc_config, reassemble_h264,
+)
 from .media.registry import resolve_codec
 from .media.quality_gate import TileVisState
 from .. import __version__ as _iss_version
@@ -323,6 +325,13 @@ class Session:
         self._harvest_vps: Optional[bytes] = None
         self._harvest_sps: Optional[bytes] = None
         self._harvest_pps: dict[int, bytes] = {}
+        # AVC-only: a mid-session resize re-sends the 0x92 avcC config (NOT
+        # in-band SPS — Apple's H.264 never sends type-7 on resize). When the
+        # layout changes we arm this flag; the next avcC config in the video
+        # stream re-roots the decoder at the new geometry. `_avc_cfg_sps` is
+        # the SPS we last configured, so we only restart on an actual change.
+        self._avc_needs_reconfig: bool = False
+        self._avc_cfg_sps: bytes = b""
         self._decoder: Optional[object] = None
         self._aac: Optional[AacEldDecoder] = None
         self._input: Optional[InputController] = None
@@ -1059,6 +1068,7 @@ class Session:
         if not prefer_hwaccel:
             log.info("ISS_FORCE_SW_HEVC=1: HW decoders disabled")
         self._decoder.set_params(burst.vps, burst.sps, burst.all_pps)
+        self._avc_cfg_sps = burst.sps or b""
         self._decoder.start()
         # Mark the start of the burst-feed window so the DPB-break
         # fast-path stays graced through it; libav fires "Could not
@@ -2059,6 +2069,11 @@ class Session:
         # The access unit's DONL (decoding-order number) — the LTR ring key
         # the LTRP ack must echo. Same for every NALU in the group.
         donl = first_donl(ordered) if self._ltr_enabled else None
+        # AVC resize: the new geometry's avcC config (0x92) rides the new
+        # stream out-of-band; re-root the decoder on it before decoding any
+        # new-resolution slices (else: stale-sized context → -12909).
+        if self._video_codec == "avc" and self._avc_needs_reconfig:
+            self._maybe_reharvest_avc_config(ordered)
         _reassemble = reassemble_h264 if self._video_codec == "avc" else reassemble_group
         au_cb = self._video_au_callback if self._video_codec == "avc" else None
 
@@ -2102,6 +2117,39 @@ class Session:
                 au_cb(ti, key[1], b"".join(au_parts))
             except Exception:
                 log.debug("video_au_callback raised", exc_info=True)
+
+    def _maybe_reharvest_avc_config(self, payloads: list[bytes]) -> None:
+        """AVC post-resize reconfigure. Apple re-sends the 0x92 avcC config
+        (carrying the new-geometry SPS/PPS) on the resized stream rather than
+        in-band SPS NALs, so `reassemble_h264` drops it and the decoder would
+        keep its old-resolution context → VideoToolbox -12909 on every new
+        slice. Scan this group's raw payloads for the config; on a *changed*
+        SPS, install it and restart the decoder. The decoder's keyframe gate
+        then waits for the new IDR before feeding anything. Armed only while
+        `_avc_needs_reconfig` is set (a layout change), so steady-state frames
+        pay nothing beyond the flag check at the call site."""
+        if self._decoder is None:
+            return
+        for p in payloads:
+            if not p or p[0] != APPLE_CONFIG_MARKER:
+                continue
+            cfg = parse_avc_config(bytes(p))
+            if cfg is None:
+                continue
+            sps, pps = cfg
+            if not sps or sps == self._avc_cfg_sps:
+                continue
+            log.info(
+                "AVC: new avcC config after resize → set_params + restart "
+                "(SPS %dB, PPS %dB)", len(sps), len(pps),
+            )
+            self._avc_cfg_sps = sps
+            self._decoder.set_params(b"", sps, {0: pps})
+            self._decoder.restart()
+            self._avc_needs_reconfig = False
+            self._last_decoder_restart_t = time.monotonic()
+            self.request_fir()
+            return
 
     def _harvest_param_sets(self, nalus: list[bytes]) -> None:
         """Accumulate fresh VPS/SPS/PPS from the new encoder's burst, then
@@ -2670,13 +2718,11 @@ class Session:
                             # resume; skip it and the video goes dead/black (the
                             # window then looks frozen). MUST run for AVC too.
                             needs_post_layout_arm = True
-                            # The param-harvest, by contrast, is HEVC-only: it is
+                            # The in-band param-harvest is HEVC-only: it is
                             # PROCESSED for non-AVC only (see `_video_codec !=
                             # "avc"` at the harvest call site), so flagging it on
                             # the AVC path leaves `_needs_param_harvest` set
                             # forever → SSRC adoption defers indefinitely → gray.
-                            # AVC's SPS/PPS ride the IDR, so the re-offer + the
-                            # new SSRC handle the resize without a harvest.
                             if self._video_codec != "avc":
                                 self._needs_param_harvest = True
                                 # Start a clean harvest — discard any stale
@@ -2686,6 +2732,15 @@ class Session:
                                 self._harvest_sps = None
                                 self._harvest_pps = {}
                                 log.info("AppleDisplayLayout: flagged param harvest for new canvas")
+                            else:
+                                # AVC: params are NOT in-band (verified — no
+                                # type-7 SPS arrives on resize). Apple re-sends
+                                # the 0x92 avcC config on the new stream instead.
+                                # Arm a re-harvest so the next config re-roots
+                                # the decoder at the new geometry; without it the
+                                # context stays old-sized → VideoToolbox -12909.
+                                self._avc_needs_reconfig = True
+                                log.info("AppleDisplayLayout: armed AVC avcC re-harvest for new canvas")
                 # Re-arm the cursor (enc 1104) sender now that this layout is
                 # parsed (a single non-incremental FBUR — no 0x09). Always, so
                 # the cursor keeps flowing even on no-geometry-change layouts.
