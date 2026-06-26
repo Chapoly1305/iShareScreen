@@ -313,15 +313,21 @@ def run(
     # window to that aspect, since the WM may have opened it larger/off-aspect
     # than the requested size — set_window_aspect_ratio only constrains future
     # resizes, it doesn't reshape the existing window.
-    try:
-        glfw.set_window_aspect_ratio(glfw_window, win_w, win_h)
-        _cw0, _ch0 = glfw.get_window_size(glfw_window)
-        if _cw0 > 0 and _ch0 > 0:
-            _f = min(_cw0 / win_w, _ch0 / win_h)
-            glfw.set_window_size(
-                glfw_window, max(1, int(win_w * _f)), max(1, int(win_h * _f)))
-    except Exception as _e:
-        log.debug("window aspect-lock failed: %s", _e)
+    #
+    # Skip in dynamic-resolution mode: there the host canvas re-renders to
+    # whatever size/aspect the user drags the window to, so the content fills
+    # edge-to-edge at any aspect — locking the aspect would stop the user from
+    # freely reshaping the window (the whole point of "track window size").
+    if not dynamic:
+        try:
+            glfw.set_window_aspect_ratio(glfw_window, win_w, win_h)
+            _cw0, _ch0 = glfw.get_window_size(glfw_window)
+            if _cw0 > 0 and _ch0 > 0:
+                _f = min(_cw0 / win_w, _ch0 / win_h)
+                glfw.set_window_size(
+                    glfw_window, max(1, int(win_w * _f)), max(1, int(win_h * _f)))
+        except Exception as _e:
+            log.debug("window aspect-lock failed: %s", _e)
     # In canvas-cursor mode we render the host's cursor as a wgpu overlay and
     # hide the local system pointer — but NOT yet. Hiding it now, before the
     # overlay has both a shape (a cursor pixmap arrived) and a position (the
@@ -604,8 +610,15 @@ def run(
             # resolution — e.g. mirroring a non-16:9 display). Re-applied only
             # when the content aspect actually changes, so a stable session
             # leaves the user's manual resizes alone.
+            # Skip the aspect-lock entirely in dynamic-resolution mode: there
+            # the host canvas tracks the window the user drags, so re-locking
+            # and inscribing the window to the content aspect fights the user's
+            # resize and shrinks the window away from the size they dragged to
+            # (the renderer already letterboxes any transient mismatch). The
+            # lock is only useful for FIXED-resolution sessions where the host
+            # may fall back to a different-aspect canvas.
             _ccw, _cch = renderer.content_dims()
-            if _ccw > 0 and _cch > 0:
+            if (not dynamic) and _ccw > 0 and _cch > 0:
                 _asp = _ccw / _cch
                 if abs(_asp - _locked_aspect[0]) > 0.01:
                     _locked_aspect[0] = _asp

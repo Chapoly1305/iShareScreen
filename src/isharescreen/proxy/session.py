@@ -2564,7 +2564,7 @@ class Session:
                 if consumed < 0:
                     return
                 offset += consumed
-            elif encoding in (1010, 1011, 1105, 1107, 1109, 1110,
+            elif encoding in (1010, 1011, 1107, 1109, 1110,
                               0x3f2, 0x3f3, 0x3ea, 0x453, 0x455, 0x456):
                 # Apple-private pseudo-encodings that all share one wire
                 # format: u16 BE payload_len + payload. We don't decode
@@ -2575,13 +2575,19 @@ class Session:
                 #   Config blobs (known content, none required to render):
                 #     1010 — media-stream negotiation blob (bplist)
                 #     1011 — sibling of 1010 in some sessions
-                #     1105 — display info struct (dims, "main" sentinel, scale)
                 #     1107 — vendor keysyms
                 #     1109 — keyboard input source string
                 #     1110 — device info (host model identifier string)
                 #   Media-stream reconfig rects (0x453/0x455/0x456 and the
                 #     0x3ea/0x3f2/0x3f3 group) the daemon emits at a
                 #     login/session switch.
+                # NOTE: 1105 is DELIBERATELY NOT in this list — 1105 == 0x451
+                # (AppleDisplayLayout). Including it here shadowed the
+                # dedicated 0x451 handler below (the `elif encoding == 0x451`
+                # could never run), so mid-session resizes were silently
+                # skipped instead of parsed → no geometry update, no media
+                # re-offer, stream stalled. The "1105 display info struct"
+                # label was a misattribution: it IS the layout rect.
                 if offset + 2 > len(msg):
                     return
                 sz = struct.unpack(">H", msg[offset:offset + 2])[0]
@@ -2615,7 +2621,10 @@ class Session:
                 if offset + 2 + prefix_len > len(msg):
                     return
                 needs_post_layout_arm = False
-                if prefix_len >= 12:
+                # The four u16 geometry fields span offset+4..offset+12, i.e.
+                # they end 10 bytes into the payload (which starts at offset+2),
+                # so a 10-byte payload is sufficient to read them.
+                if prefix_len >= 10:
                     sw = struct.unpack(">H", msg[offset + 4:offset + 6])[0]
                     sh = struct.unpack(">H", msg[offset + 6:offset + 8])[0]
                     bw = struct.unpack(">H", msg[offset + 8:offset + 10])[0]
