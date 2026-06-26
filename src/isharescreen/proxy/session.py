@@ -2664,19 +2664,28 @@ class Session:
                             sw, sh, bw, bh, changed,
                         )
                         if changed:
-                            self._needs_param_harvest = True
-                            # Start a clean harvest — discard any stale
-                            # accumulators from a prior (old-resolution)
-                            # harvest so they can't complete this one early.
-                            self._harvest_vps = None
-                            self._harvest_sps = None
-                            self._harvest_pps = {}
-                            log.info("AppleDisplayLayout: flagged param harvest for new canvas")
-                            # The server is waiting for a full-refresh request
-                            # at the new geometry before it resumes the HEVC
-                            # encoder; do the media re-offer below, after the
-                            # cursor re-arm has sent the non-incremental FBUR.
+                            # Re-offer the media session (0x1c) below for EVERY
+                            # codec. The server stops encoding after a geometry
+                            # change and waits for this full-refresh request to
+                            # resume; skip it and the video goes dead/black (the
+                            # window then looks frozen). MUST run for AVC too.
                             needs_post_layout_arm = True
+                            # The param-harvest, by contrast, is HEVC-only: it is
+                            # PROCESSED for non-AVC only (see `_video_codec !=
+                            # "avc"` at the harvest call site), so flagging it on
+                            # the AVC path leaves `_needs_param_harvest` set
+                            # forever → SSRC adoption defers indefinitely → gray.
+                            # AVC's SPS/PPS ride the IDR, so the re-offer + the
+                            # new SSRC handle the resize without a harvest.
+                            if self._video_codec != "avc":
+                                self._needs_param_harvest = True
+                                # Start a clean harvest — discard any stale
+                                # accumulators from a prior (old-resolution)
+                                # harvest so they can't complete this one early.
+                                self._harvest_vps = None
+                                self._harvest_sps = None
+                                self._harvest_pps = {}
+                                log.info("AppleDisplayLayout: flagged param harvest for new canvas")
                 # Re-arm the cursor (enc 1104) sender now that this layout is
                 # parsed (a single non-incremental FBUR — no 0x09). Always, so
                 # the cursor keeps flowing even on no-geometry-change layouts.
