@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import av
-import numpy as np
 
 from .tiles import TileFrame
 
@@ -111,28 +110,18 @@ def _av_frame_to_tile(
         fmt = frame.format.name
 
     if fmt in ("nv12", "nv21"):
-        # Biplanar 4:2:0: Y plane + half-resolution interleaved UV.
-        yp = frame.planes[0]
-        uvp = frame.planes[1]
-        chroma_h = height // 2
-        uv_view = (
-            np.frombuffer(bytes(uvp), dtype=np.uint8)
-            .reshape(chroma_h, uvp.line_size)[:, :width]
-        )
-        if fmt == "nv12":
-            u_bytes = uv_view[:, 0::2].tobytes()
-            v_bytes = uv_view[:, 1::2].tobytes()
-        else:
-            v_bytes = uv_view[:, 0::2].tobytes()
-            u_bytes = uv_view[:, 1::2].tobytes()
-        return TileFrame(
-            y=bytes(yp), u=u_bytes, v=v_bytes,
-            width=width, height=height,
-            y_stride=yp.line_size,
-            uv_stride=width // 2,
-            chroma_width=width // 2,
-            chroma_height=chroma_h,
-        ), had_error
+        # Biplanar 4:2:0 (VideoToolbox's AVC output). Deinterleaving the UV
+        # plane in numpy is a strided gather — ~5.7ms/frame at HiDPI, enough
+        # to blow the frame budget and stutter. libswscale does the same
+        # nv12/nv21 → planar deinterleave in SIMD (~0.6ms), so reformat to
+        # yuv420p and fall through to the contiguous-copy planar branch.
+        if reformatter_holder[0] is None:
+            from av.video.reformatter import VideoReformatter
+            reformatter_holder[0] = VideoReformatter()
+        frame = reformatter_holder[0].reformat(frame, format="yuv420p")
+        fmt = frame.format.name
+        width = frame.width
+        height = frame.height
 
     if fmt in ("yuv420p", "yuvj420p"):
         yp, up, vp = frame.planes
