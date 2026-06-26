@@ -145,10 +145,12 @@ def _resolve_hidpi_request(
       mode 'auto' → match the LOCAL display: 2× on a Retina client (host
                     backing maps 1:1 to the client's Retina pixels), 1× on a
                     non-Retina client (1:1 to the client's pixels — crisp and
-                    low-bandwidth). 2× is downgraded to 1× when it wouldn't fit
-                    the host backing cap (window logical > 1920×1080), so a
-                    fullscreen Retina client still gets the true large desktop
-                    rather than an upscaled small one.
+                    low-bandwidth). A Retina client STAYS 2× even on a large
+                    window — the logical request is capped at 1920×1080 points
+                    (elements stay normal-sized, matching Screen Sharing.app)
+                    instead of downgrading to a 1× full-pixel desktop where the
+                    host UI renders microscopic. `--hidpi off` opts into that 1×
+                    high-real-estate desktop.
     """
     win_w = max(1, win_w)
     win_h = max(1, win_h)
@@ -156,10 +158,14 @@ def _resolve_hidpi_request(
         scale = 1
     elif mode == "on":
         scale = 2
-    else:  # auto: match the client display scale, but only 2× when it fits
-        scale = 2 if (client_scale >= 2
-                      and win_w * 2 <= _HOST_MAX_BACKING_W
-                      and win_h * 2 <= _HOST_MAX_BACKING_H) else 1
+    else:  # auto: match the client display scale (Retina client → 2×), like
+           # Screen Sharing.app. Do NOT downgrade to 1× on a large window — that
+           # packs the host UI into the full pixel resolution at 1× and makes
+           # every element microscopic ("everything tiny"). Keep 2× and let the
+           # logical-size cap (max_w//scale below) bound the request; the window
+           # then shows that Retina desktop scaled to fill. (`--hidpi off` is
+           # the opt-in for the 1× high-real-estate desktop.)
+        scale = 2 if client_scale >= 2 else 1
     max_w = _HOST_MAX_BACKING_W // scale
     max_h = _HOST_MAX_BACKING_H // scale
     fit = min(max_w / win_w, max_h / win_h, 1.0)  # shrink-only, keep aspect
