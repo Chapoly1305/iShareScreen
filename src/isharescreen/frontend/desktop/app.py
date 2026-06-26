@@ -375,17 +375,19 @@ def run(
         return 1.0
 
     def _cursor_render_scale(surface_w: float = 0.0, logical_w: float = 0.0) -> float:
-        """Calibration multiplier for the cursor sprite (default 1.0).
+        """Multiplier for the cursor sprite (folds in the HiDPI backing factor).
 
-        The actual on-screen sizing now happens in gpu.Renderer.draw, which
-        scales the sprite by the same uniform letterbox factor as the video
-        (1 sprite pixel = 1 content texel), so the cursor stays proportional to
-        the zoomed content instead of frozen at native size ("tiny cursor").
-        That already accounts for a HiDPI surface (the letterbox factor is in
-        surface pixels), so no separate surface/logical ratio is needed here —
-        this just carries ISS_CURSOR_SCALE for manual tuning. Args are kept for
-        call-site compatibility and ignored."""
-        return _cursor_user_mult()
+        gpu.Renderer.draw sizes the sprite by the video letterbox factor
+        `sclx = target_w / content_backing`, which is in BACKING texels. But
+        the host ships the cursor pixmap in ~logical points (Apple's I-beam is
+        9×18), so on a HiDPI canvas (backing = hidpi_scale × logical) the sprite
+        comes out hidpi_scale× too small — the "tiny cursor in HiDPI" bug. Fold
+        the backing factor back in so the cursor lands at a consistent on-screen
+        size in every mode. (Non-HiDPI: hidpi_scale == 1, unchanged.) Args kept
+        for call-site compatibility; ISS_CURSOR_SCALE still tunes via
+        _cursor_user_mult()."""
+        backing = (config.advertise.hidpi_scale if config.advertise else 1) or 1
+        return _cursor_user_mult() * backing
 
     if _canvas_cursor:
         renderer.set_cursor_scale(_cursor_render_scale())
