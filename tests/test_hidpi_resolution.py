@@ -75,9 +75,13 @@ def test_resolve_hidpi_request_explicit_modes():
     assert app._resolve_hidpi_request("off", 1366, 768, 2)[2] == 1
 
 
-def test_resolve_hidpi_auto_downgrades_when_backing_exceeds_cap():
+def test_resolve_hidpi_auto_stays_retina_and_caps_logical():
     app = pytest.importorskip("isharescreen.frontend.desktop.app")
-    # A Retina client at a large logical size: 2× backing would exceed the
-    # host's 3840×2160 cap, so auto downgrades to 1× (keeps the true desktop).
-    _w, _h, scale = app._resolve_hidpi_request("auto", 2560, 1440, 2)
-    assert scale == 1
+    # A Retina client at a large logical size: auto STAYS 2× (elements stay
+    # normal-sized, like Screen Sharing.app) and caps the logical request so
+    # the 2× backing still fits the host's 3840×2160 ceiling — rather than
+    # dropping to a 1× full-pixel desktop where the host UI renders microscopic.
+    req_w, req_h, scale = app._resolve_hidpi_request("auto", 2560, 1440, 2)
+    assert scale == 2                        # Retina kept, not downgraded to 1×
+    assert req_w * scale <= 3840             # 2× backing fits the host cap
+    assert req_h * scale <= 2160
