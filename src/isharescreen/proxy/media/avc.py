@@ -25,7 +25,6 @@ import logging
 import os
 import sys
 import threading
-from collections import deque
 from typing import Callable, Optional
 
 import av
@@ -57,6 +56,36 @@ def _h264_hwaccels() -> tuple[str, ...]:
     return _H264_HWACCELS.get(sys.platform, _H264_HWACCELS["*"])
 
 
+# pts→tile routing map bounds. Each fed slice gets a monotonic pts and the map
+# is drained as frames emit (one in → one out under low-delay), so it normally
+# holds ≤ num_tiles entries. The cap only guards a pathological non-emitting
+# decoder from unbounded growth; prune keeps the most-recent window.
+_PTS_MAP_SOFT_MAX = 256
+_PTS_MAP_PRUNE_KEEP = 64
+
+
+def _nal_is_keyframe(nalu: bytes) -> bool:
+    """True if a raw H.264 NAL re-roots the DPB (a keyframe). Type-5 is a
+    real IDR; Apple's HP encoder also keys via intra (I) slices in ordinary
+    type-1 NALs, detected from the slice header's slice_type ∈ {2,7} (I /
+    I-only-picture). The slice header after the 1-byte NAL header is
+    first_mb_in_slice ue(v), slice_type ue(v) on the EPB-stripped RBSP."""
+    if len(nalu) < 2:
+        return False
+    t = nalu[0] & 0x1F
+    if t == 5:               # NAL_SLICE_IDR
+        return True
+    if t == 1:               # NAL_SLICE_NONIDR — intra if slice_type is I
+        from .bitstream import BitReader, remove_emulation_prevention
+        try:
+            br = BitReader(remove_emulation_prevention(nalu[1:]))
+            br.read_ue()                  # first_mb_in_slice
+            return br.read_ue() in (2, 7)  # slice_type
+        except Exception:
+            return False
+    return False
+
+
 class AvcDecoder:
     def __init__(
         self,
@@ -81,14 +110,21 @@ class AvcDecoder:
         # ordered stream (verified — feeding all tiles' NALs to one context in
         # ts order is what decodes clean; separate contexts / out-of-order
         # feeding conceal). Output frames are routed back to the tile that fed
-        # them via a FIFO, since H.264 here has no B-frame reordering.
+        # them via a pts→tile map (each slice gets a monotonic pts), since
+        # H.264 here has no B-frame reordering.
         self._codec: Optional[av.codec.context.CodecContext] = None
         # Guards every _codec access. feed_nalu runs on the video-process
         # thread while restart()/close() can fire from the stall-watchdog
         # thread — without this lock a teardown could free the context mid-
         # decode (use-after-free). Mirrors HevcDecoder._codec_lock.
         self._codec_lock = threading.Lock()
-        self._fed_tiles: deque = deque()
+        # pts→tile routing (mirrors HevcDecoder): each fed slice gets a
+        # monotonic pts; emitted frames are mapped back to their source tile
+        # via frame.pts. Robust against any decoder drop/reorder, unlike a
+        # strict in/out FIFO.
+        self._next_pts = 0
+        self._pts_to_tile: dict[int, int] = {}
+        self._pts_submit_t: dict[int, float] = {}
         self._reformatter: list = [None]
         self._seen_fmts: set = set()
         self._gate = FrameQualityGate(num_tiles, enabled=enable_quality_gate)
@@ -97,6 +133,10 @@ class AvcDecoder:
         # Opens on the first emitted frame (Apple has no type-5 IDR — keyframes
         # are intra slices in type-1 NALs); until then output is cold-DPB fill.
         self._dpb_ready = False
+        # After a restart the DPB is empty; drop slices until the first keyframe
+        # re-roots it (see feed_nalu). Armed at construction so the initial
+        # burst's IDR opens the gate.
+        self._await_key = True
         self._hw_name: Optional[str] = None  # software-only for now
         self.nalu_counts_per_tile: list[dict[int, int]] = [
             {} for _ in range(num_tiles)
@@ -188,46 +228,94 @@ class AvcDecoder:
         bucket = self.nalu_counts_per_tile[tile_idx]
         bucket[t] = bucket.get(t, 0) + 1
         if t in (7, 8):  # SPS/PPS already in extradata
+            # Apple's AVC stream carries params out-of-band in the 0x92 avcC
+            # config, NOT in-band — verified: no type-7 arrives on resize. So
+            # there's nothing to capture here; the session re-harvests the
+            # avcC config and calls set_params()+restart() when the geometry
+            # changes (see Session._maybe_reharvest_avc_config).
             return
-        # Each Apple tile-frame is one slice = one access unit. Feed through the
-        # parser (ctx.parse) so libav frames AUs + establishes the I keyframe;
-        # raw decode() per NAL loses references and conceals. Route each emitted
-        # frame back to the tile that fed it via the FIFO (no B-frame reorder).
-        # The whole parse+decode runs under _codec_lock so a concurrent
+        nb = nalu if isinstance(nalu, bytes) else bytes(nalu)
+        is_key = _nal_is_keyframe(nb)
+        # Post-restart keyframe gate. After a restart (incl. the session's
+        # SSRC-adoption / VT-wedge restart) the DPB is empty, so feeding the
+        # inter (P) slices that arrive before the next IDR makes the decoder
+        # reference frames it never decoded → "reference frames N+1 exceeds
+        # max" / -12909, and the session's restart-on-wedge then re-wedges on
+        # the next P-slice flood — a permanent freeze on resize. Drop slices
+        # until a keyframe re-roots the DPB. Direct-decode (no parser) has no
+        # tolerance here, so this gate is what makes it safe; the FIR the
+        # session sends on restart fetches the keyframe that clears it.
+        if self._await_key:
+            if is_key:
+                self._await_key = False
+            else:
+                return
+        # Each Apple tile-frame is one slice = one complete access unit, so we
+        # build the av.Packet directly and decode() it — NO ctx.parse(). The
+        # libav H.264 parser can't tell an AU is complete until the *next* slice
+        # delimits it (Apple sends no AUD), so it holds every frame back ~one
+        # frame-interval (~45ms @ 22fps) — invisible to the decode queue but
+        # felt as input lag. Direct-decode emits immediately under LOW_DELAY.
+        # Emitted frames route back to their source tile via frame.pts (a map,
+        # not an in/out FIFO), surviving any decoder drop/reorder. Mirrors
+        # HevcDecoder._decode_one. Runs under _codec_lock so a concurrent
         # restart()/close() can't free the context mid-decode.
         import time as _time
-        _t0 = _time.monotonic()
         published: list[int] = []
         with self._codec_lock:
             ctx = self._ensure_codec_locked()
             if ctx is None:
-                return
-            self._fed_tiles.append(tile_idx)
+                return  # no params yet — don't register a pts that never drains
+            # Every keyframe re-roots the shared DPB for all tiles, so re-mark
+            # IDR observation on each one (mirrors HevcDecoder). Without this
+            # the gate only ever marks the first frame: a tile that drops into
+            # `keyframe_required` mid-stream (a post-SSRC-adoption P-frame
+            # error) can never satisfy mark_clean's IDR-observed condition, so
+            # it FIR-storms / grays out forever even as fresh IDRs arrive.
+            if is_key:
+                for _t in range(self.num_tiles):
+                    self._gate.mark_idr_observed(_t)
+            pkt = av.Packet(_NAL_START_CODE + nb)
+            pts = self._next_pts
+            pkt.pts = pts
+            pkt.dts = pts
+            self._next_pts += 1
+            self._pts_to_tile[pts] = tile_idx
+            self._pts_submit_t[pts] = _time.monotonic()
+            if len(self._pts_to_tile) > _PTS_MAP_SOFT_MAX:
+                cutoff = pts - _PTS_MAP_PRUNE_KEEP
+                self._pts_to_tile = {
+                    k: v for k, v in self._pts_to_tile.items() if k > cutoff
+                }
+                self._pts_submit_t = {
+                    k: v for k, v in self._pts_submit_t.items() if k > cutoff
+                }
             try:
-                packets = ctx.parse(_NAL_START_CODE + bytes(nalu))
+                frames = ctx.decode(pkt)
             except Exception:
+                # Decode raised → no frame will carry this pts; drop it so the
+                # map doesn't leak the in-flight entry.
+                self._pts_to_tile.pop(pts, None)
+                self._pts_submit_t.pop(pts, None)
+                self._gate.mark_decode_error(tile_idx)
                 return
-            for pkt in packets:
-                try:
-                    frames = ctx.decode(pkt)
-                except Exception:
-                    if self._fed_tiles:
-                        self._gate.mark_decode_error(self._fed_tiles.popleft())
-                    continue
-                ti = self._fed_tiles.popleft() if self._fed_tiles else tile_idx
-                if frames and not self._dpb_ready:
+            for frame in frames:
+                ti = self._pts_to_tile.pop(frame.pts, tile_idx)
+                submit_t = self._pts_submit_t.pop(frame.pts, None)
+                if submit_t is not None:
+                    latency_ms = (_time.monotonic() - submit_t) * 1000
+                    self._decode_latency_ms = (
+                        0.1 * latency_ms + 0.9 * self._decode_latency_ms
+                    )
+                if not self._dpb_ready:
                     self._dpb_ready = True
                     for _t in range(self.num_tiles):
                         self._gate.mark_idr_observed(_t)
-                for frame in frames:
-                    slot = self._tiles[ti]
-                    with slot.lock:
-                        slot.raw_frame = frame
-                        slot.good_count += 1
-                    published.append(ti)
-        if published:
-            latency_ms = (_time.monotonic() - _t0) * 1000
-            self._decode_latency_ms = 0.1 * latency_ms + 0.9 * self._decode_latency_ms
+                slot = self._tiles[ti]
+                with slot.lock:
+                    slot.raw_frame = frame
+                    slot.good_count += 1
+                published.append(ti)
         # Notify outside the codec lock to avoid holding it across the callback.
         if self._on_frame_published is not None:
             for ti in published:
@@ -282,7 +370,7 @@ class AvcDecoder:
 
     @property
     def decode_queue_depth(self) -> int:
-        return len(self._fed_tiles)
+        return len(self._pts_to_tile)
 
     @property
     def decode_queue_cap(self) -> int:
@@ -312,8 +400,10 @@ class AvcDecoder:
                 except Exception:
                     pass
                 self._codec = None
-            self._fed_tiles.clear()
+            self._pts_to_tile.clear()
+            self._pts_submit_t.clear()
             self._dpb_ready = False
+            self._await_key = True
             self._decode_latency_ms = 0.0
             self._gate.reset()
             if self._sps and self._pps:
