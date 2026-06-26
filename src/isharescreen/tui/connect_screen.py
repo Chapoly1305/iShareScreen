@@ -56,6 +56,16 @@ _RESOLUTION_PRESETS: list[tuple[str, str]] = [
 ]
 _DEFAULT_RESOLUTION = "1920x1080"  # native-FHD = the safest pick
 
+_DECODER_PRESETS: list[tuple[str, str]] = [
+    ("Auto",                 "auto"),
+    ("HEVC — VideoToolbox",  "vt-hevc444"),
+    ("HEVC — Generic HW",    "libav-hevc444"),
+    ("HEVC — Intel QSV",     "qsv-hevc444"),
+    ("HEVC — Software",      "libav-hevc444-sw"),
+    ("H.264",                "libav-avc420"),
+]
+_DEFAULT_DECODER = "auto"
+
 
 @dataclass(slots=True)
 class ConnectFormValues:
@@ -78,6 +88,7 @@ class ConnectFormValues:
     # initial size. HiDPI scale: "auto" (match local display) / "on" / "off".
     dynamic_resolution: bool = False
     hidpi: str = "auto"
+    decoder: str = "auto"  # decoder name or "auto"
 
 
 class ConnectScreen(Screen):
@@ -129,6 +140,7 @@ class ConnectScreen(Screen):
             advertise=_DEFAULT_RESOLUTION,
             audio=True, curtain=True, hdr=False,
             share_console=False, alt_session=False,
+            decoder=_DEFAULT_DECODER,
         )
         self._probe_task: Optional[asyncio.Task] = None
 
@@ -159,6 +171,13 @@ class ConnectScreen(Screen):
                          ("On (2×)", "on"), ("Off (1×)", "off")],
                 value=self._prefill.hidpi,
                 id="hidpi",
+                allow_blank=False,
+            )
+            yield Label("Decoder")
+            yield Select(
+                options=_DECODER_PRESETS,
+                value=self._prefill.decoder,
+                id="decoder",
                 allow_blank=False,
             )
             with Horizontal(classes="switch-row"):
@@ -289,6 +308,7 @@ class ConnectScreen(Screen):
             frontend=frontend,
             dynamic_resolution=dynamic,
             hidpi=str(self.query_one("#hidpi", Select).value or "auto"),
+            decoder=str(self.query_one("#decoder", Select).value or _DEFAULT_DECODER),
         )
         self.post_message(self.Connect(values))
 

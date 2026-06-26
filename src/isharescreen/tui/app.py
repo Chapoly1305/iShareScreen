@@ -25,6 +25,10 @@ from .control_client import ControlClient
 from .session_screen import SessionScreen
 from .storage import bug_snapshot_path, load_last, save_last
 from .supervisor import Supervisor, ViewerArgs
+from ..proxy.media.registry import all_specs as _all_decoder_specs
+
+# decoder name → codec, built once from the registry so it stays in sync.
+_DECODER_TO_CODEC: dict[str, str] = {s.name: s.codec for s in _all_decoder_specs()}
 
 
 log = logging.getLogger("iss.tui.app")
@@ -55,7 +59,7 @@ class IssTuiApp(App):
         # but should pass through to the worker subprocess.
         raw = dict(cli_overrides or {})
         self._cli_viewer_flags: dict[str, Any] = {}
-        for k in ("verbose", "log_file"):
+        for k in ("verbose", "log_file", "codec"):
             if k in raw:
                 self._cli_viewer_flags[k] = raw.pop(k)
         self._cli_overrides = raw
@@ -72,8 +76,8 @@ class IssTuiApp(App):
         else:
             base = last or ConnectFormValues(
                 host="", user="", password="",
-                advertise="1920x1080",
-                audio=True, curtain=True, hdr=False,
+                advertise="auto",
+                audio=True, curtain=True, hdr=False, hidpi="auto",
                 share_console=False, alt_session=False,
             )
             prefill = dataclasses.replace(base, **self._cli_overrides)
@@ -203,6 +207,9 @@ class IssTuiApp(App):
             hidpi=form.hidpi,
             verbose=int(self._cli_viewer_flags.get("verbose", 0) or 0),
             log_file=self._cli_viewer_flags.get("log_file"),
+            codec=(self._cli_viewer_flags.get("codec")
+                   or _DECODER_TO_CODEC.get(form.decoder or "")),
+            decoder=form.decoder if form.decoder and form.decoder != "auto" else None,
         )
         try:
             await self._supervisor.start(args)

@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 # Flags that route to `cli.py` instead of the TUI. Anything else goes
 # to the TUI (with the typed values pre-filled into the connect form).
-_CLI_ROUTING_FLAGS = {"--headless", "--help", "-h", "--version"}
+_CLI_ROUTING_FLAGS = {"--headless", "--help", "-h", "--version", "--list-decoders"}
 
 
 def main() -> int:
@@ -86,6 +86,8 @@ def _build_cli_overrides(argv: list[str]) -> Optional[dict[str, Any]]:
         overrides["verbose"] = args.verbose
     if args.log_file:
         overrides["log_file"] = args.log_file
+    if "--codec" in typed:
+        overrides["codec"] = args.codec
     return overrides or None
 
 

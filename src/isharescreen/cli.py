@@ -74,11 +74,6 @@ def _make_parser() -> argparse.ArgumentParser:
     )
     g.add_argument("--port", type=int, default=5900, help="TCP port (default 5900)")
     g.add_argument(
-        "--codec", choices=["hevc", "avc"], default=None,
-        help="Video codec: hevc = Apple's HEVC 4:4:4 (default; best quality, "
-        "needs 4:4:4 HW or fast CPU); avc = H.264 4:2:0 (hardware-decodable on "
-        "Windows/Linux where 4:4:4 isn't, ~5x bitrate of HEVC)")
-    g.add_argument(
         "--auth", choices=("srp", "nonsrp"), default="srp",
         help="authentication mode (default srp; falls back to nonsrp on rejection)",
     )
@@ -126,6 +121,30 @@ def _make_parser() -> argparse.ArgumentParser:
             "Retina client, 1x otherwise; downgrades to 1x when 2x wouldn't fit "
             "the host backing cap)"
         ),
+    )
+    g.add_argument(
+        "--decoder", metavar="NAME", default="auto",
+        help=(
+            "video decoder to use. 'auto' (default) picks the best available "
+            "decoder for the negotiated codec; or force one by name — "
+            "vt-hevc444 / libav-hevc444 / qsv-hevc444 / libav-avc420 (legacy "
+            "aliases vt / qsv / libav also accepted). Run --list-decoders to "
+            "see the matrix and which are available on this machine."
+        ),
+    )
+    g.add_argument(
+        "--codec", choices=["auto", "hevc", "avc"], default="auto",
+        help=(
+            "video codec: 'auto' (default) probes GPU capability and picks "
+            "HEVC 4:4:4 when available, else H.264 4:2:0; 'hevc' forces "
+            "HEVC; 'avc' forces H.264 (hardware-decodable on Windows/Linux "
+            "where 4:4:4 isn't)"
+        ),
+    )
+    g.add_argument(
+        "--list-decoders", action="store_true",
+        help=("print the decoder capability matrix (with live availability on "
+              "this machine) and exit"),
     )
     g.add_argument(
         "--curtain", action=argparse.BooleanOptionalAction, default=True,
@@ -355,12 +374,22 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
     WebCodecs, H.264 pass-through) since every machine has a browser; the
     native wgpu/desktop viewer stays available via --frontend desktop."""
     if args.frontend == "desktop":
+        # Auto codec ladder: offer HEVC when this machine has a HEVC 4:4:4
+        # hardware decoder (VideoToolbox / generic HW / QSV), else fall back to
+        # H.264 (libav-avc420, HW with SW floor). Only force AVC here — when
+        # HEVC HW is present we leave ISS_VIDEO_CODEC unset so the proven
+        # "both"-bank offer (Apple-byte-identical → server sends HEVC) is
+        # unchanged. An explicit --codec / --decoder still wins (env already set).
+        if args.codec == "auto" and "ISS_VIDEO_CODEC" not in os.environ:
+            from .proxy.media.registry import resolve_codec
+            if resolve_codec("auto") == "avc":
+                os.environ["ISS_VIDEO_CODEC"] = "avc"
         from isharescreen.frontend.desktop.app import run as run_desktop
         return run_desktop(config, auto_quit_secs=args.auto_quit_secs)
     # browser (default): H.264 pass-through needs the AVC codec path. The
     # Session reads ISS_VIDEO_CODEC at construction, so force it unless the
     # user explicitly chose a codec.
-    if args.codec is None:
+    if args.codec == "auto":
         os.environ["ISS_VIDEO_CODEC"] = "avc"
     # Use the cursor pseudo-encoding (RFB enc 1104), same as the wgpu viewer:
     # the daemon does NOT bake the cursor into the framebuffer, it sends cursor
@@ -381,10 +410,16 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
 def main(argv: Optional[list[str]] = None) -> int:
     args = _make_parser().parse_args(argv)
     _setup_logging(args)
-    # --codec drives the offer (offers.py) + decoder (session.py), both of which
-    # read ISS_VIDEO_CODEC. avc advertises only the H.264 bank; hevc forces
-    # HEVC-only; unset leaves the byte-identical "both" offer (server picks HEVC).
-    if args.codec:
+    if args.list_decoders:
+        from .proxy.media import registry
+        print(registry.describe())
+        return 0
+    # `--decoder` feeds the registry override via the env var session.py reads
+    # (keeps the protocol layer free of a CLI dependency).
+    if getattr(args, "decoder", "auto") and args.decoder != "auto":
+        import os as _os
+        _os.environ["ISS_DECODER"] = args.decoder
+    if args.codec and args.codec != "auto":
         os.environ["ISS_VIDEO_CODEC"] = args.codec
     signal.signal(signal.SIGINT, signal.default_int_handler)
 
