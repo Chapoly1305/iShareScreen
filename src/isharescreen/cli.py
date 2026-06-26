@@ -157,20 +157,23 @@ def _make_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "--share-console", action="store_true",
         help=(
-            "when authenticating as a non-console user, ask the currently "
-            "logged-in user to share their session (Apple's 'Ask to share' "
-            "choice). The console user gets a permission popup; on accept, "
-            "this viewer joins their existing session in observe-only mode "
-            "instead of starting a separate alt-user session."
+            "force 'share the logged-in user's session'. This is now the "
+            "AUTO-DEFAULT: iss detects whether someone is logged in at the "
+            "console and shares their session unless --alt-session is given, "
+            "so this flag is rarely needed. The console user gets a "
+            "permission popup; on accept, this viewer joins their existing "
+            "session. Mutually exclusive with --alt-session."
         ),
     )
     g.add_argument(
         "--alt-session", action="store_true",
         help=(
-            "when authenticating as a non-console user, log them in to a "
-            "fresh virtual display via Apple's cmd=2 SessionSelect path. "
-            "No popup. Daemon spawns the alt-user's vdisplay and we get "
-            "their desktop. Mutually exclusive with --share-console."
+            "override the auto-default: instead of sharing the logged-in "
+            "user's session, log in to a fresh virtual display as the auth "
+            "user via Apple's cmd=2 SessionSelect path (no popup; the daemon "
+            "spawns the alt-user's vdisplay). Use this when someone is logged "
+            "in but you want your own separate desktop. Mutually exclusive "
+            "with --share-console."
         ),
     )
 

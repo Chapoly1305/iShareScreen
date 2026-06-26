@@ -373,6 +373,25 @@ def _read_ss_prompt(sock: socket.socket) -> Optional[tuple[int, str]]:
     return flags, console_user
 
 
+def _peek_ss_prompt(sock: socket.socket, wait: float = 2.0) -> bool:
+    """Non-destructively test whether the daemon appended a SessionSelect
+    prompt after ServerInit. The daemon emits it only when the auth user ≠
+    the console user (i.e. someone else is logged in), so its presence is the
+    auto-detect signal — no pre-set --share-console/--alt-session needed.
+
+    Uses MSG_PEEK: when a prompt is absent (the auth user IS the console
+    user), the next bytes stay in the socket buffer for the normal
+    post-ServerInit handshake, so always calling this is safe."""
+    sock.settimeout(wait)
+    try:
+        peek = sock.recv(4, socket.MSG_PEEK)
+    except (TimeoutError, socket.timeout, OSError):
+        return False
+    finally:
+        sock.settimeout(15)
+    return peek == _SS_MAGIC
+
+
 def _phase_session_select(
     sock: socket.socket,
     *,
@@ -679,7 +698,12 @@ def connect_and_negotiate(
                                 recorder)
     server_w, server_h = _phase_client_init(sock)
 
-    if share_console or alt_session:
+    # Auto-detect the SessionSelect prompt rather than requiring a pre-set
+    # flag: the daemon emits it only when someone other than the auth user is
+    # logged in. Peek non-destructively — if absent, the bytes stay buffered
+    # for the normal handshake below; if present, route by flag (default
+    # share-console = view their session; --alt-session = log in separately).
+    if _peek_ss_prompt(sock):
         # Apple Screen Sharing's two-TCP convention for the cmd=2 alt-session
         # path: open conn1, do SRP, see the SessionSelect prompt, close
         # conn1, then open a fresh conn2 and redo SRP from scratch

@@ -185,8 +185,13 @@ class ConnectScreen(Screen):
                 yield Label("Curtain"); yield Switch(value=self._prefill.curtain, id="curtain")
                 yield Label("HDR"); yield Switch(value=self._prefill.hdr, id="hdr")
             with Horizontal(classes="switch-row"):
-                yield Label("Share console"); yield Switch(value=self._prefill.share_console, id="share-console")
                 yield Label("Alt session"); yield Switch(value=self._prefill.alt_session, id="alt-session")
+            yield Static(
+                "[dim]Console vs alt-session is auto-detected. Leave Alt "
+                "session off to share whoever is logged in; turn it on to "
+                "log in as a separate user instead.[/]",
+                id="session-hint",
+            )
             yield Static(
                 "[dim]Browser = open in a browser tab · Desktop = native window[/]",
                 id="frontend-hint",
@@ -303,7 +308,10 @@ class ConnectScreen(Screen):
             audio=self.query_one("#audio", Switch).value,
             curtain=self.query_one("#curtain", Switch).value,
             hdr=self.query_one("#hdr", Switch).value,
-            share_console=self.query_one("#share-console", Switch).value,
+            # Console-share is auto-detected (no switch); the proxy peeks for
+            # the SessionSelect prompt and defaults to share-console unless
+            # alt-session is requested below.
+            share_console=False,
             alt_session=self.query_one("#alt-session", Switch).value,
             frontend=frontend,
             dynamic_resolution=dynamic,
