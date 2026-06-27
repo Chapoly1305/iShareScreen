@@ -350,8 +350,25 @@ def run(
     # rather than pinning the image to the top-left corner. Matches
     # Apple's native viewer.
 
-    adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
+    # GPU diagnostics: ISS_GPU_BACKEND pins the wgpu backend (Vulkan / D3D12 /
+    # Metal / OpenGL) via wgpu's WGPU_BACKEND_TYPE, and ISS_GPU_FALLBACK=1
+    # forces the software fallback adapter (WARP on Windows). The selected
+    # adapter is logged below so the active GPU + backend is visible when
+    # triaging render problems on a given machine.
+    _gpu_backend = os.environ.get("ISS_GPU_BACKEND", "").strip()
+    if _gpu_backend:
+        os.environ["WGPU_BACKEND_TYPE"] = _gpu_backend
+    _gpu_fallback = os.environ.get("ISS_GPU_FALLBACK", "0") == "1"
+    adapter = wgpu.gpu.request_adapter_sync(
+        power_preference="high-performance",
+        force_fallback_adapter=_gpu_fallback,
+    )
     device = adapter.request_device_sync()
+    _adapter_info = adapter.info
+    log.info("wgpu adapter: backend=%s type=%s device=%r vendor=%r%s",
+             _adapter_info.get("backend_type"), _adapter_info.get("adapter_type"),
+             _adapter_info.get("device"), _adapter_info.get("vendor"),
+             " [fallback]" if _gpu_fallback else "")
     surface_ctx = window.get_context("wgpu")
     # Pick the linear variant so we don't double-encode sRGB.
     preferred = surface_ctx.get_preferred_format(adapter)
