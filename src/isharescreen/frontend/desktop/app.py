@@ -350,8 +350,25 @@ def run(
     # rather than pinning the image to the top-left corner. Matches
     # Apple's native viewer.
 
-    adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
+    # GPU diagnostics: ISS_GPU_BACKEND pins the wgpu backend (Vulkan / D3D12 /
+    # Metal / OpenGL) via wgpu's WGPU_BACKEND_TYPE, and ISS_GPU_FALLBACK=1
+    # forces the software fallback adapter (WARP on Windows). The selected
+    # adapter is logged below so the active GPU + backend is visible when
+    # triaging render problems on a given machine.
+    _gpu_backend = os.environ.get("ISS_GPU_BACKEND", "").strip()
+    if _gpu_backend:
+        os.environ["WGPU_BACKEND_TYPE"] = _gpu_backend
+    _gpu_fallback = os.environ.get("ISS_GPU_FALLBACK", "0") == "1"
+    adapter = wgpu.gpu.request_adapter_sync(
+        power_preference="high-performance",
+        force_fallback_adapter=_gpu_fallback,
+    )
     device = adapter.request_device_sync()
+    _adapter_info = adapter.info
+    log.info("wgpu adapter: backend=%s type=%s device=%r vendor=%r%s",
+             _adapter_info.get("backend_type"), _adapter_info.get("adapter_type"),
+             _adapter_info.get("device"), _adapter_info.get("vendor"),
+             " [fallback]" if _gpu_fallback else "")
     surface_ctx = window.get_context("wgpu")
     # Pick the linear variant so we don't double-encode sRGB.
     preferred = surface_ctx.get_preferred_format(adapter)
@@ -608,6 +625,7 @@ def run(
     # underlying Rust panic kill the process with an unhelpful trace.
     _device_lost: dict[str, bool] = {"v": False}
     _locked_aspect: list = [0.0]  # last content aspect the window was locked to
+    _geom_last: list = [()]  # last logged render-geom tuple (re-log only on change)
 
     def draw_callback():
         try:
@@ -655,6 +673,26 @@ def run(
                         _cursor_render_scale(target.width, lw))
                 except Exception:
                     pass
+            # Geometry trace: logged on the first frame and re-logged only when
+            # it changes (window resize / canvas swap), so it's always available
+            # for triage without spamming. Healthy render = surface == framebuffer
+            # and content == canvas; a mismatch is why the picture can fail to
+            # fill the window (e.g. a software surface sized to half the window).
+            try:
+                _fb = glfw.get_framebuffer_size(glfw_window)
+                _ws = glfw.get_window_size(glfw_window)
+            except Exception:
+                _fb = _ws = (0, 0)
+            _geom = (target.width, target.height, _fb[0], _fb[1], _ws[0], _ws[1],
+                     renderer._w, renderer._h)
+            if _geom != _geom_last[0]:
+                _geom_last[0] = _geom
+                _cd = renderer.content_dims()
+                log.info(
+                    "render-geom: surface=%dx%d framebuffer=%dx%d window=%dx%d "
+                    "canvas=%dx%d content=%dx%d",
+                    *_geom, _cd[0], _cd[1],
+                )
             renderer.draw(target.create_view(), target.width, target.height)
         except Exception as e:
             msg = str(e)
