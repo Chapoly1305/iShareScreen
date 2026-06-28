@@ -70,6 +70,11 @@ _HW_FRAME_FORMATS = frozenset({
     "videotoolbox", "videotoolbox_vld",
 })
 
+# Packed 4:4:4 outputs. vuyx = V,U,Y,X(pad); Intel QSV's hevc_qsv emits these
+# for Apple's HEVC RExt 4:4:4 stream. They carry FULL chroma (no subsample),
+# so the reformat to planar yuv444p is a lossless de-interleave.
+_PACKED_444_FORMATS = frozenset({"vuyx", "vuya", "ayuv", "uyva", "xyuv"})
+
 
 def _av_frame_to_tile(
     frame: av.VideoFrame,
@@ -106,6 +111,16 @@ def _av_frame_to_tile(
         # Preserve full chroma. yuv444p is universally supported by
         # libswscale; the GPU upload path already handles it as planar
         # full-resolution Y/U/V.
+        frame = reformatter_holder[0].reformat(frame, format="yuv444p")
+        fmt = frame.format.name
+
+    if fmt in _PACKED_444_FORMATS:
+        # Intel QSV 4:4:4 (vuyx etc.): de-interleave to planar yuv444p. Full
+        # chroma preserved — the full-quality HEVC 4:4:4 path. Falls through to
+        # the yuv444p planar-extraction branch below.
+        if reformatter_holder[0] is None:
+            from av.video.reformatter import VideoReformatter
+            reformatter_holder[0] = VideoReformatter()
         frame = reformatter_holder[0].reformat(frame, format="yuv444p")
         fmt = frame.format.name
 

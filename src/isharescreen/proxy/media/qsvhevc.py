@@ -115,6 +115,11 @@ class QsvHevcDecoder:
         self._lifecycle_lock = threading.RLock()
         self._hw_name: Optional[str] = "qsv"
         self._dpb_has_idr = False
+        # Interface parity with HevcDecoder: the session's LTR-ack path reads
+        # decoder.last_clean_donl[0]. QSV doesn't thread DONLs through its async
+        # worker, so this stays all-None → _send_ltr_ack is a safe no-op rather
+        # than an AttributeError when a tile-0 frame publishes.
+        self.last_clean_donl: list[Optional[int]] = [None] * num_tiles
 
         self._vps: Optional[bytes] = None
         self._sps: Optional[bytes] = None
@@ -270,10 +275,15 @@ class QsvHevcDecoder:
         good = sum(t.good_count for t in self._tiles)
         log.info("qsv burst complete: fed %d NALUs, decoded %d frames", fed, good)
 
-    def feed_nalu(self, nalu: bytes, tile_idx: int) -> None:
+    def feed_nalu(self, nalu: bytes, tile_idx: int, donl: Optional[int] = None) -> None:
         """Accumulate NALUs into an access unit; submit the AU when its VCL
         slice arrives (Apple = one slice per tile picture). Parameter-set NALUs
-        ride inline with the slice."""
+        ride inline with the slice.
+
+        `donl` is accepted for interface parity with HevcDecoder (the session
+        passes it for the LTR-ack path), but QSV manages its own DPB and we
+        don't currently thread DONLs to the async worker, so LTR-ack stays a
+        no-op (last_clean_donl is left None → full-IDR recovery on loss)."""
         if not nalu:
             return
         t = _hevc_nal_type(nalu[0])

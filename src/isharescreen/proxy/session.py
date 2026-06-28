@@ -2355,6 +2355,18 @@ class Session:
                 # NALUs and the new context starves until an unprompted
                 # IDR shows up (often never).
                 self._dpb_error_window.clear()
+                # QSV manages its own DPB and cross-tile references
+                # internally (see QsvHevcDecoder): a fresh SSRC generation's
+                # IDR re-roots it in place, so a full teardown/recreate is
+                # unnecessary. Under a rapid re-key storm the MFX session
+                # teardown is also fragile — it has access-violated in the
+                # decode worker mid-reformat. So for QSV, skip the restart and
+                # let the FIR'd IDR re-anchor the live context; only the libav
+                # decoders (which must flush their DPB) take the restart path.
+                is_qsv = getattr(self._decoder, "hw_accel", None) == "qsv"
+                if is_qsv:
+                    self.request_fir()
+                    return
                 # Guard against rapid back-to-back SSRC rotations (e.g.
                 # Apple emitting two new groups within 2 s at curtain
                 # start): the second full restart discards IDR frames
