@@ -1022,16 +1022,16 @@ class Session:
         # Per-codec hardware-accel preference, then registry-driven selection
         # (media/registry.py owns the capability matrix + override handling).
         if self._video_codec == "avc":
-            # AVC path: the host streams H.264 4:2:0. d3d11va's H.264 decoder
-            # corrupts Apple's stream at the frame_num/POC wrap (~34 s in): the
-            # 4 tiles are one interleaved low-delay stream anchored on per-tile
-            # long-term references, and the D3D11 decoder's reference resolution
-            # collapses when poc_lsb wraps (log2_max_poc_lsb=13 → every ~34 s) —
-            # all four tiles start decoding off the same picture, so the canvas
-            # dissolves into four identical bands. Software libav decodes the
-            # identical bitstream correctly indefinitely (verified clean past
-            # the wrap), so force software for AVC on Windows. Override with
-            # ISS_AVC_HWACCEL=1, or ISS_AVC_HW_REANCHOR for HW + periodic IDR.
+            # AVC path: the host streams H.264 4:2:0 as a single self-contained
+            # picture per frame (tiles_per_frame()==1 for AVC), decoded on the
+            # GPU via d3d11va (Windows) / vaapi (Linux). Hardware decode is
+            # verified clean well past the frame_num/POC wrap (log2_max_poc_lsb
+            # =13 → ~34 s) on AMD, so it is the default. The earlier default
+            # forced software as a conservative workaround for an observed
+            # d3d11va POC-wrap corruption; that no longer reproduces on the
+            # single-tile stream. If corruption ever reappears, set
+            # ISS_AVC_HWACCEL=0 to force software (libav decodes the identical
+            # bitstream correctly indefinitely).
             avc_prefer_hwaccel = prefer_hwaccel
             if self._avc_reanchor_enabled:
                 # Keep hardware decode; avoid the d3d11va POC-wrap bug by
@@ -1042,10 +1042,10 @@ class Session:
                          "(every ~%d frames since IDR, d3d11va POC-wrap "
                          "workaround)", self._AVC_REANCHOR_FRAMES)
             elif (_sys.platform == "win32"
-                    and _os.environ.get("ISS_AVC_HWACCEL", "0") == "0"):
+                    and _os.environ.get("ISS_AVC_HWACCEL", "1") == "0"):
                 avc_prefer_hwaccel = False
                 log.info("AVC: forcing software decode "
-                         "(d3d11va H.264 POC-wrap corruption workaround)")
+                         "(ISS_AVC_HWACCEL=0; d3d11va POC-wrap workaround)")
             _pf = avc_prefer_hwaccel
             _override = registry.normalize_override(_decoder_choice, "avc")
         else:
