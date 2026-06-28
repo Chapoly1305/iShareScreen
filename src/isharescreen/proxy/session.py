@@ -410,6 +410,8 @@ class Session:
         self._last_rx_bytes: tuple[int, int] = (0, 0)
         self._last_tx_pkts: int = 0
         self._last_profile_nalu: list[dict[int, int]] = []
+        # Separate interval clock for the pass-through (browser) snapshot path.
+        self._last_passthrough_t: float = 0.0
 
         # Per-(SSRC, ts) accumulating groups + their first-arrival time
         # for TTL eviction. `_recently_flushed` dedupes late retransmits of
@@ -3056,11 +3058,62 @@ class Session:
                 log.debug("tx loop tick error: %s", e)
             self._stop_evt.wait(_TX_INTERVAL_S)
 
+    def _publish_passthrough_snapshot(self) -> None:
+        """Pass-through (browser) frontend: there's no local decoder, so the
+        decode-centric snapshot below never runs and the TUI's panels go blank.
+        Publish the proxy-level stats the session *does* have — packet rates,
+        loss, bitrate, queue depths — so the TUI reflects a browser session
+        too. No decoder/tile data exists here (the browser decodes)."""
+        if self._control is None:
+            return
+        now = time.monotonic()
+        last_t = self._last_passthrough_t
+        self._last_passthrough_t = now
+        elapsed = now - last_t
+        rx_v = self._rx_pkts_video; rx_c = self._rx_pkts_ctrl; rx_t = self._rx_pkts_tcp
+        bv = self._rx_bytes_video; bc = self._rx_bytes_ctrl
+        tx = self._input.tx_pkts if self._input is not None else 0
+        last_rx_v, last_rx_c, last_rx_t = self._last_rx_pkts
+        last_bv, last_bc = self._last_rx_bytes
+        last_tx = self._last_tx_pkts
+        self._last_rx_pkts = (rx_v, rx_c, rx_t)
+        self._last_rx_bytes = (bv, bc)
+        self._last_tx_pkts = tx
+        # First tick (or no interval): baselines are now seeded; publish from
+        # the next call so the per-second rates are meaningful, not a spike.
+        if last_t <= 0 or elapsed <= 0:
+            return
+        loss_total = self._lost_pkts
+        loss_unmapped = loss_total - sum(self._lost_pkts_per_tile)
+        self._control.publish_snapshot({
+            "uptime_s": (time.time() - self._connect_wall_ts
+                         if self._connect_wall_ts > 0 else 0.0),
+            "decoder": "(no local decoder)",
+            "tiles": [],
+            "loss_total": loss_total,
+            "loss_unmapped": loss_unmapped,
+            "udp_q": {
+                "video": {"depth": self._video_q.qsize(),
+                          "cap": _UDP_DRAIN_QUEUE_MAX,
+                          "drop": self._video_q_dropped},
+                "ctrl":  {"depth": self._ctrl_q.qsize(),
+                          "cap": _UDP_DRAIN_QUEUE_MAX,
+                          "drop": self._ctrl_q_dropped},
+            },
+            "rx": {"video_pps": round((rx_v - last_rx_v) / elapsed, 1),
+                   "video_mbps": round((bv - last_bv) * 8 / elapsed / 1_000_000, 2),
+                   "ctrl_pps": round((rx_c - last_rx_c) / elapsed, 1),
+                   "ctrl_kbps": round((bc - last_bc) * 8 / elapsed / 1_000, 1),
+                   "tcp_pps": round((rx_t - last_rx_t) / elapsed, 2)},
+            "tx": {"pps": round((tx - last_tx) / elapsed, 2)},
+        })
+
     def _log_profile_snapshot(self) -> None:
         """Per-tile decoded-frame counts + decoder path + adoption state.
         Logged at INFO so it's visible without -v; cadence is the loop
         tick multiplier so the volume stays manageable on long sessions."""
         if self._decoder is None:
+            self._publish_passthrough_snapshot()
             return
         good = self._decoder.good_counts
         baseline = self._last_profile_good if len(self._last_profile_good) == len(good) else [0] * len(good)
