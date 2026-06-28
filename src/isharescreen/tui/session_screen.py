@@ -26,10 +26,11 @@ import time
 
 from collections import deque
 
-# Textual handles text selection natively (App.ALLOW_SELECT), so selecting is
-# just a plain mouse drag — no Shift/Option/Fn modifier (those interfere). Copy
-# the selection with C (action_copy_log_selection → App.copy_to_clipboard).
-_SELECT_HINT = "M to select/copy text"
+# Text selection is the terminal's/Textual's job, not a custom mode: drag to
+# select (on macOS Terminal.app / iTerm2 hold Option, Shift on most others, to
+# bypass the TUI's mouse capture), then copy with the terminal's own copy — or
+# press `c`, which copies Textual's selection via the local clipboard tool.
+_SELECT_HINT = "drag to select · c to copy"
 
 
 def _copy_to_system_clipboard(text: str) -> bool:
@@ -296,21 +297,31 @@ _LEVEL_LABEL = {"DEBUG": "DEBUG", "INFO": "INFO", "WARNING": "WARN", "ERROR": "E
 
 
 class _AutoPauseRichLog(RichLog):
-    """`RichLog` with an explicit pause toggle (not an auto-detector).
+    """`RichLog` that holds its scroll position when you scroll up.
 
-    Earlier versions tried to detect user scroll-up via mouse / key
-    handlers on the widget and auto-pause when scroll_y dropped below
-    max. That claimed mouse events and broke text selection — so this
-    widget intentionally adds NO event handlers, leaving Textual's native
-    text selection (a plain mouse drag, App.ALLOW_SELECT) intact. Copy the
-    selection with C (SessionScreen.action_copy_log_selection).
+    Stock `RichLog` snaps back to the bottom on every write even after the
+    user scrolls up (Textual #6311); the plain `Log` widget doesn't. This
+    subclass watches the scroll position and keeps `auto_scroll` enabled
+    only while the viewport is at the end — so scrolling up to read / select
+    pauses the follow, and scrolling back to the bottom resumes it, with no
+    explicit pause key and no mouse handlers (which would claim drag events
+    and break text selection).
 
-    The parent `SessionScreen` provides a screen-level key (default
-    `space`) that toggles `auto_scroll` directly. `_pending_while_paused`
-    is bumped by `LogPanel.append` on every write that lands while
-    paused so the title can surface "↓ N new" as a nudge."""
+    `_pending_while_paused` is bumped by `LogPanel.append` on every write
+    that lands while scrolled up, so the title can surface "↓ N new"."""
 
     _pending_while_paused: int = 0
+
+    def watch_scroll_y(self, old: float, new: float) -> None:
+        # Follow the tail only while the viewport is at the end; scrolling up
+        # pauses, scrolling back to the bottom resumes. Driven by the scroll
+        # reactive (not mouse events), so drag-to-select is unaffected. This is
+        # reliable under write bursts, unlike a per-write is_vertical_scroll_end
+        # check (the prior write's scroll may not have applied yet).
+        sup = getattr(super(), "watch_scroll_y", None)
+        if sup is not None:
+            sup(old, new)
+        self.auto_scroll = new >= self.max_scroll_y - 1
 
     def get_selection(self, selection):
         """Extract text under a mouse selection. RichLog renders line Strips
@@ -367,18 +378,17 @@ class LogPanel(Container):
             return
         lvl = _LEVEL_LABEL.get(self.min_level, self.min_level)
         pending = view._pending_while_paused
-        if not view.auto_scroll and pending > 0:
+        scrolled_up = not view.auto_scroll
+        if scrolled_up and pending > 0:
             suffix = f"  [reverse yellow] {pending} new — End to jump [/]"
         else:
             suffix = ""
-        # Textual selects text natively on a plain mouse drag (no modifier);
-        # C copies the selection (see action_copy_log_selection). P pauses the
-        # live stream so you can scroll back and select without it scrolling.
-        paused = not view.auto_scroll
-        state = "[reverse yellow] PAUSED [/]  " if paused else ""
+        # Scroll up to pause the follow (auto-resumes at the bottom); End jumps
+        # back. Select by dragging; copy with the terminal's copy or `c`.
+        state = "[reverse yellow] SCROLLED UP [/]  " if scrolled_up else ""
         self.query_one("#log-title", Label).update(
-            f"[b]Log[/] {state}[dim](level: {lvl} — L to cycle, "
-            f"P to pause, End to jump, {_SELECT_HINT})[/]{suffix}"
+            f"[b]Log[/] {state}[dim](level: {lvl} — L to cycle · End → bottom · "
+            f"{_SELECT_HINT})[/]{suffix}"
         )
 
     def jump_to_bottom(self) -> None:
@@ -414,10 +424,8 @@ class SessionScreen(Screen):
         Binding("f", "force_idr", "Force IDR"),
         Binding("d", "disconnect", "Disconnect"),
         Binding("l", "cycle_log_level", "Log level"),
-        Binding("p", "toggle_log_pause", "Pause log"),
         Binding("end", "log_bottom", "Log → bottom"),
-        Binding("c", "copy_log_selection", "Copy selection"),
-        Binding("m", "toggle_mouse", "Select mode"),
+        Binding("c", "copy_log_selection", "Copy selection", show=False),
         Binding("ctrl+b", "bug_snapshot", "Bug snapshot"),
     ]
 
@@ -458,8 +466,6 @@ class SessionScreen(Screen):
         # bloating the snapshot file.
         self._log_ring: list[str] = []
         self._LOG_RING_MAX: int = 1000
-        # Whether we've released the terminal mouse (M) for native selection.
-        self._mouse_released: bool = False
 
     def compose(self) -> ComposeResult:
         yield HeaderBar(id="hdr")
@@ -560,40 +566,12 @@ class SessionScreen(Screen):
             log_tail=list(self._log_ring),
         ))
 
-    def action_toggle_mouse(self) -> None:
-        """`M` → release / re-grab the terminal mouse. The TUI normally captures
-        the mouse (for scroll/click), which suppresses the terminal's own text
-        selection — and terminals like macOS Terminal.app don't feed Textual the
-        drag events it would need to select itself. Releasing the mouse hands it
-        back to the terminal so you can select log text the normal way (drag,
-        then the terminal's copy — Cmd+C in Terminal.app), exactly like you can
-        anywhere else. Press M again to restore TUI mouse control."""
-        drv = getattr(self.app, "_driver", None)
-        enable = getattr(drv, "_enable_mouse_support", None)
-        disable = getattr(drv, "_disable_mouse_support", None)
-        if enable is None or disable is None:
-            self.notify("mouse toggle not supported on this build", timeout=3)
-            return
-        try:
-            if self._mouse_released:
-                enable()
-                self._mouse_released = False
-                self.notify("mouse restored — TUI controls active", timeout=3)
-            else:
-                disable()
-                self._mouse_released = True
-                self.notify(
-                    "mouse released — select log text with drag + Cmd/Ctrl+C; "
-                    "press M to restore TUI control", timeout=6)
-        except Exception as e:
-            self.notify(f"mouse toggle failed: {e}", timeout=3)
-
     def action_copy_log_selection(self) -> None:
-        """`C` → copy the mouse-selected text to the clipboard. Drag over the
-        log to select first (RichLog selection works now via the subclass's
-        get_selection). Copies through the local OS clipboard tool (pbcopy on
-        macOS) because Terminal.app has no OSC52, so Textual's own ⌘C copy
-        can't reach the clipboard; we also fire OSC52 for the remote/SSH case."""
+        """`c` → copy the selected log text to the clipboard. Drag over the log
+        to select first (works where the terminal feeds Textual drag events; on
+        macOS Terminal.app use Option+drag and your terminal's own copy). Copies
+        via the local OS clipboard tool (pbcopy/clip/wl-copy/xclip) and also
+        fires OSC52 for the remote/SSH case."""
         try:
             text = self.get_selected_text()
         except Exception:
@@ -617,21 +595,6 @@ class SessionScreen(Screen):
         auto-scroll. Used after you've paused + read / selected text and
         want to resume following the live stream."""
         self.query_one("#log", LogPanel).jump_to_bottom()
-
-    def action_toggle_log_pause(self) -> None:
-        """`P` → pause / resume the log panel's auto-scroll. Pausing
-        lets you scroll, read, and bypass-select text without the live
-        stream yanking you back to the bottom. Resume snaps to the end
-        and clears the pending counter."""
-        panel = self.query_one("#log", LogPanel)
-        view = panel.query_one("#log-view", _AutoPauseRichLog)
-        if view.auto_scroll:
-            view.auto_scroll = False
-            panel._refresh_title()
-            self.notify("log paused — P to resume, End to jump to bottom", timeout=2)
-        else:
-            panel.jump_to_bottom()
-            self.notify("log resumed", timeout=2)
 
     def action_cycle_log_level(self) -> None:
         """Cycle the log-panel display filter (INFO → DEBUG → WARNING →
