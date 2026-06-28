@@ -24,12 +24,19 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import faulthandler
 import logging
 import os
 import signal
 import sys
 import time
 from typing import Optional
+
+# Enable faulthandler early so native-thread crashes (e.g. the QSV decode
+# worker, the GPU renderer) print a thread traceback to stderr before the
+# process dies, instead of a bare STATUS_ACCESS_VIOLATION (0xC0000005) exit
+# code. Best-effort for pure-native faults; lets WER catch the dump regardless.
+faulthandler.enable()
 
 from . import __version__
 from .proxy.protocol.negotiation import AdvertiseDims
