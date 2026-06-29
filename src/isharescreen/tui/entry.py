@@ -1,10 +1,12 @@
-"""`iss` console-script entry. Routes between the TUI (default) and the
-script-friendly CLI (`--headless` / `--help` / `--version`).
+"""`iss` console-script entry. Routes between the browser connect GUI
+(default), the script-friendly CLI (`--host …`, `--headless`, `--help`,
+`--version`), and the legacy terminal TUI (`--tui`).
 
-CLI flags supplied alongside the bare `iss` invocation pre-fill the
-connect form — `iss --host mac.local -u me --advertise 1920x1080` opens
-the TUI with those values already filled in. Last-session storage fills
-anything the CLI didn't touch; defaults fill the rest.
+Bare `iss` opens the browser connect form + live diagnostics dashboard. A
+full connection on the command line (`iss --host mac.local -u me
+--password-stdin`) runs the session directly — that's also how the GUI form
+launches a session under the hood. `iss --tui [...]` launches the old TUI
+with any typed values pre-filled into its connect form.
 """
 from __future__ import annotations
 
@@ -19,21 +21,21 @@ _CLI_ROUTING_FLAGS = {"--headless", "--help", "-h", "--version", "--list-decoder
 
 def main() -> int:
     argv = sys.argv[1:]
-    # `--frontend browser` runs the WebTransport bridge, which serves its own
-    # browser UI and needs no terminal TUI — route it straight to the cli.
-    # (The TUI wraps the native wgpu viewer only.)
-    _browser = (
-        "browser" in (argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "--frontend")
-    )
-    if _browser or any(a in _CLI_ROUTING_FLAGS for a in argv):
+    # The terminal TUI is opt-in now — the default UI is the browser connect
+    # form + live diagnostics dashboard. `iss --tui [...]` still launches the
+    # TUI, with any typed values pre-filled into its connect form.
+    if "--tui" in argv:
+        from isharescreen.tui.app import main as tui_main
+        return tui_main(_build_cli_overrides([a for a in argv if a != "--tui"]))
+    # A connection / session on the command line (`--host …`), or the
+    # script/help flags, run the cli directly with no GUI — this is also how
+    # the GUI form launches the actual session under the hood.
+    if "--host" in argv or any(a in _CLI_ROUTING_FLAGS for a in argv):
         from isharescreen.cli import main as cli_main
         return cli_main()
-    # TUI default. Parse argv with cli's parser so unrecognised flags
-    # still raise the same helpful argparse error, and build an override
-    # dict the App merges into the connect-form prefill.
-    overrides = _build_cli_overrides(argv)
-    from isharescreen.tui.app import main as tui_main
-    return tui_main(overrides)
+    # Default: the browser connect form + live diagnostics dashboard.
+    from isharescreen.gui.connect import main as gui_main
+    return gui_main()
 
 
 def _build_cli_overrides(argv: list[str]) -> Optional[dict[str, Any]]:

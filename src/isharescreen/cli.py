@@ -249,11 +249,36 @@ def _password_from_args(args: argparse.Namespace) -> Optional[str]:
     handles it interactively. We deliberately don't accept a password
     on the command line — argv shows up in `ps` and shell history."""
     if args.password_stdin:
+        if sys.stdin.isatty():
+            # Typed at a terminal, not piped: read it masked (getpass) so the
+            # password isn't echoed. Piped input (a GUI / script) is unaffected.
+            import getpass
+            return getpass.getpass("password: ")
         line = sys.stdin.readline()
         if not line:
             raise SystemExit("--password-stdin: no input on stdin")
         return line.rstrip("\r\n")
     return None
+
+
+def _ask_session_choice(console_user: str = "") -> str:
+    """Ask the launcher (the GUI) whether to share the console session or start
+    an alt-session by POSTing to its local HTTP server (URL passed in
+    ISS_SESSION_CHOICE_URL) and blocking on the reply. Returns "share_console"
+    on any error/timeout."""
+    url = os.environ.get("ISS_SESSION_CHOICE_URL")
+    if not url:
+        return "share_console"
+    import urllib.request
+    import urllib.parse
+    try:
+        data = urllib.parse.urlencode({"console_user": console_user}).encode()
+        with urllib.request.urlopen(url, data=data, timeout=60) as r:
+            choice = r.read().decode("utf-8").strip().lower()
+        return "alt_session" if choice.startswith("alt") else "share_console"
+    except Exception:
+        log.info("session-choice: no reply, defaulting to share-console")
+        return "share_console"
 
 
 # ── logging setup ────────────────────────────────────────────────────
@@ -316,7 +341,7 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
     if missing:
         raise SystemExit(
             "missing required arg(s): " + ", ".join(missing) +
-            " (interactive prompt is the TUI -- run plain `iss` for that)"
+            " (run plain `iss` for the interactive connect GUI)"
         )
     return SessionConfig(
         host=args.host, port=args.port,
@@ -329,6 +354,7 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
         curtain=args.curtain,
         audio=args.audio,
         share_console=args.share_console, alt_session=args.alt_session,
+        on_session_choice=_ask_session_choice if os.environ.get("ISS_SESSION_CHOICE_URL") else None,
         control_socket=args.control_socket,
         record_pcap=args.record,
     )
