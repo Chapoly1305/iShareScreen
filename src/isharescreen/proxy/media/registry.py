@@ -121,8 +121,9 @@ def _build_avc(num_tiles, *, enable_quality_gate=True, on_frame_published=None,
 #                          (weaker than discrete), but the ONLY working HEVC
 #                          4:4:4 HW path on Windows today (see above).
 #    50  libav-avc420      H.264 4:2:0 — libav + platform hwaccel, SW floor
-#                          (covers NVIDIA/AMD/Intel; incl. AMD VCN POC-wrap
-#                          workaround). The H.264 rung of the cross-codec ladder.
+#                          (covers NVIDIA/AMD/Intel; HW by default, opt back to
+#                          SW via ISS_AVC_HWACCEL=0). The H.264 rung of the
+#                          cross-codec ladder.
 #    20  libav-hevc444-sw  SOFTWARE HEVC 4:4:4 — manual override only (slow for
 #                          live 4-tile streams); not on the auto ladder.
 _REGISTRY: list[DecoderSpec] = [
@@ -140,7 +141,7 @@ _REGISTRY: list[DecoderSpec] = [
                 note="libav software HEVC 4:4:4 — last resort; slow for live 4-tile streams"),
     DecoderSpec("libav-avc420", "avc", "420", ("*",), "hardware", 50,
                 available=lambda: True, build=_build_avc,
-                note="libav H.264 + platform hwaccel, SW fallback (incl. AMD VCN POC-wrap workaround)"),
+                note="libav H.264 + platform hwaccel (HW by default; SW fallback, opt back to SW via ISS_AVC_HWACCEL=0)"),
 ]
 
 
