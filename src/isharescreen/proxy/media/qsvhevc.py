@@ -144,17 +144,42 @@ class QsvHevcDecoder:
         self._stop = threading.Event()
         self._sync_decode_mode = False
         self._queue_full_drops: int = 0
+        self._restart_suppressed: int = 0
 
     # -- configuration / lifecycle ------------------------------------
 
     def set_params(self, vps: bytes, sps: bytes, all_pps: dict[int, bytes]) -> None:
+        """Install parameter sets. Re-callable: when the SPS changes on a
+        live codec (a real resolution/format change harvested mid-session),
+        rebuild the QSV session at the new geometry. This is the ONLY path
+        that tears down + recreates the codec — restart() is a no-op (see
+        restart), mirroring VTHevcDecoder where set_params() owns the rebuild."""
+        sps_changed = sps != self._sps
         self._vps, self._sps, self._all_pps = vps, sps, dict(all_pps)
+        if sps_changed and self._codec is not None:
+            self._rebuild()
 
     def start(self) -> None:
         with self._lifecycle_lock:
             if self._codec is None:
                 self._create_codec()
             self._start_worker()
+        # QSV doesn't thread DONLs to its async worker, so last_clean_donl
+        # stays None and the session's LTR-ack path is a permanent no-op:
+        # the host never gets PT=204 acks and falls back to full-IDR recovery
+        # on loss (vs. the SW/VT partial-repair via long-term references).
+        # Logged once so worse-than-SW loss recovery on QSV is explainable.
+        log.info("qsv: LTR-ack disabled (no DONL threading) — "
+                 "loss recovery is full-IDR via FIR")
+
+    def _rebuild(self) -> None:
+        """Tear down + recreate the codec at the current params. Only reached
+        from set_params() on a real SPS change — never from the watchdogs."""
+        with self._lifecycle_lock:
+            self._teardown()
+            if self._sps:
+                self._create_codec()
+                self._start_worker()
 
     def _build_extradata(self) -> bytes:
         ed = bytearray()
@@ -211,11 +236,23 @@ class QsvHevcDecoder:
         log.debug("hevc_qsv codec (re)created")
 
     def restart(self) -> None:
-        with self._lifecycle_lock:
-            self._teardown()
-            if self._sps:
-                self._create_codec()
-                self._start_worker()
+        """DPB-PRESERVING no-op by design — mirrors VTHevcDecoder.restart().
+
+        session.py calls restart() on SSRC adoption AND from three stall/
+        saturation watchdogs to "reset" the decoder. For hevc_qsv a real
+        teardown is actively dangerous: tearing the MFX session down while the
+        decode worker is mid-flight has access-violated in native code (see
+        _teardown's flush note), and it also wipes QSV's internal DPB, forcing
+        an all-tiles conceal burst that re-trips the same watchdog → restart
+        cascade. QSV manages its own DPB and re-roots on the IDR the paired
+        request_fir() pulls, so every restart path degrades to native-aligned
+        FIR-only recovery while the live context stays intact. Only
+        set_params() — a real resolution/format change with a new SPS —
+        rebuilds the session."""
+        self._restart_suppressed += 1
+        log.debug("qsv restart() suppressed (DPB-preserving, #%d) — "
+                  "recovering via FIR/IDR, not a session teardown",
+                  self._restart_suppressed)
 
     def close(self) -> None:
         with self._lifecycle_lock:
@@ -233,6 +270,7 @@ class QsvHevcDecoder:
             with slot.lock:
                 slot.raw_frame = None
                 slot.good_count = 0
+                slot.clean_count = 0
                 slot.last_evaluated_count = 0
                 self._tile_had_error[ti] = False
         with self._codec_lock:
@@ -435,6 +473,8 @@ class QsvHevcDecoder:
             slot.raw_frame = tile_frame  # type: ignore[assignment]
             self._tile_had_error[ti] = had_err
             slot.good_count += 1
+            if not had_err:
+                slot.clean_count += 1
         if self._on_frame_published is not None:
             try:
                 self._on_frame_published(ti)
@@ -498,6 +538,14 @@ class QsvHevcDecoder:
     @property
     def good_counts(self) -> list[int]:
         return [t.good_count for t in self._tiles]
+
+    @property
+    def clean_counts(self) -> list[int]:
+        return [t.clean_count for t in self._tiles]
+
+    @property
+    def bad_tiles(self) -> set[int]:
+        return self._gate.bad_tiles
 
 
 __all__ = ["QsvHevcDecoder", "qsv_hevc444_available"]
