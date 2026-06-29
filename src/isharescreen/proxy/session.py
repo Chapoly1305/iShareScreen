@@ -228,6 +228,11 @@ class SessionConfig:
     # screen). Mutually exclusive with `share_console`.
     alt_session: bool = False
 
+    # Optional callback () -> "share_console" | "alt_session". Invoked during
+    # negotiation when a different user is at the console and neither flag was
+    # forced — lets a launcher (the GUI) prompt the user at connect time.
+    on_session_choice: "Optional[Callable[[str], str]]" = None
+
     # Curtain mode: send the SetDisplayConfiguration message during
     # negotiation so the daemon spins up a SkyLight virtual display
     # and blanks the host's physical screen while we view. When False,
@@ -1254,6 +1259,7 @@ class Session:
             video_offer=video_offer,
             share_console=cfg.share_console,
             alt_session=cfg.alt_session,
+            on_session_choice=cfg.on_session_choice,
             recorder=self._recorder,
         )
 

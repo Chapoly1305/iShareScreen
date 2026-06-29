@@ -392,6 +392,22 @@ def _peek_ss_prompt(sock: socket.socket, wait: float = 2.0) -> bool:
     return peek == _SS_MAGIC
 
 
+def _peek_ss_console_user(sock: socket.socket, wait: float = 2.0) -> str:
+    """Non-destructively read the console user's name from the SessionSelect
+    prompt (offset 0xc, null-terminated) so a launcher prompt can name them.
+    Returns '' if absent/short; the bytes stay buffered for _read_ss_prompt."""
+    sock.settimeout(wait)
+    try:
+        peek = sock.recv(76, socket.MSG_PEEK)
+    except (TimeoutError, socket.timeout, OSError):
+        return ""
+    finally:
+        sock.settimeout(15)
+    if len(peek) < 0xd or peek[:4] != _SS_MAGIC:
+        return ""
+    return peek[0xc:].split(b"\x00", 1)[0].decode("utf-8", "replace")
+
+
 def _phase_session_select(
     sock: socket.socket,
     *,
@@ -663,6 +679,7 @@ def connect_and_negotiate(
     video_offer: Optional[bytes] = None,
     share_console: bool = False,
     alt_session: bool = False,
+    on_session_choice=None,   # callable () -> "share_console" | "alt_session"
     recorder=None,
 ) -> NegotiationResult:
     """Drive the full handshake. The returned socket is in encrypted-RFB
@@ -704,6 +721,18 @@ def connect_and_negotiate(
     # for the normal handshake below; if present, route by flag (default
     # share-console = view their session; --alt-session = log in separately).
     if _peek_ss_prompt(sock):
+        # Neither mode was forced and the launcher gave us a way to ask the
+        # user (a different user is logged in at the host's console): prompt
+        # now for share-console vs alt-session and route on their answer.
+        if not alt_session and not share_console and on_session_choice is not None:
+            console_user = _peek_ss_console_user(sock)
+            try:
+                choice = on_session_choice(console_user)
+            except Exception:
+                log.exception("session-choice prompt failed; defaulting to share")
+                choice = "share_console"
+            alt_session = (choice == "alt_session")
+            log.info("session-select: %r chose %s", console_user, choice)
         # Apple Screen Sharing's two-TCP convention for the cmd=2 alt-session
         # path: open conn1, do SRP, see the SessionSelect prompt, close
         # conn1, then open a fresh conn2 and redo SRP from scratch
