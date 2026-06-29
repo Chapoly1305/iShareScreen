@@ -30,7 +30,7 @@ from collections import deque
 # select (on macOS Terminal.app / iTerm2 hold Option, Shift on most others, to
 # bypass the TUI's mouse capture), then copy with the terminal's own copy — or
 # press `c`, which copies Textual's selection via the local clipboard tool.
-_SELECT_HINT = "drag to select · c to copy"
+_SELECT_HINT = "⌥/⇧-drag to select (terminal)"
 
 
 def _copy_to_system_clipboard(text: str) -> bool:

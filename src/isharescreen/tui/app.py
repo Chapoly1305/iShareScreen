@@ -42,6 +42,15 @@ class IssTuiApp(App):
 
     CSS = ""  # screen-level styles live with each Screen.
 
+    # Leave text selection to the terminal. Textual's in-app selection (default
+    # on) paints an I-beam over the whole app and turns mouse-down into a
+    # selection instead of a click/focus — but terminals like macOS Terminal.app
+    # don't send the drag events it needs, so it just breaks clicking/typing
+    # while never actually selecting. With this off, the mouse behaves normally
+    # and you select with the terminal's own selection (Option/Fn+drag on
+    # Terminal.app, Shift+drag elsewhere) + the terminal's copy.
+    ALLOW_SELECT = False
+
     BINDINGS = [
         Binding("ctrl+c", "quit_app", "Quit", show=False, priority=True),
     ]
