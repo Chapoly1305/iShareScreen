@@ -410,8 +410,12 @@ class WebTransportBridge:
         except OSError as e:
             log.debug("v4 bind skipped (dual-stack already covers it): %s", e)
         await self._start_http_bootstrap()
-        local_ip = _detect_local_ip()
-        url = f"http://{local_ip}:{self._port}/"
+        # Use localhost, not the LAN IP: Chrome/Edge only expose WebTransport in
+        # a secure context, and http://localhost qualifies while http://<LAN-IP>
+        # does not. localhost also matches the self-signed cert (cert.py issues
+        # it for localhost / 127.0.0.1, not the LAN address), and the dual-stack
+        # listeners above exist precisely so localhost (::1 / 127.0.0.1) works.
+        url = f"http://localhost:{self._port}/"
         log.info("WebTransport bridge ready:")
         log.info("  open this URL in Chrome/Edge/Firefox: %s", url)
         log.info("  (HTML on tcp/%d, WebTransport on udp/%d)",
@@ -1009,16 +1013,6 @@ def _cursor_envelope(width: int, height: int, hx: int, hy: int, rgba: bytes) -> 
     return (bytes([_TYPE_CURSOR, 0]) + (0).to_bytes(4, "big") + (0).to_bytes(8, "big")
             + width.to_bytes(2, "big") + height.to_bytes(2, "big")
             + hx.to_bytes(2, "big") + hy.to_bytes(2, "big") + rgba)
-
-
-def _detect_local_ip() -> str:
-    """Best-effort guess of an externally-routable LAN IP."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            return s.getsockname()[0]
-    except Exception:
-        return "localhost"
 
 
 # ── module entry ─────────────────────────────────────────────────────
