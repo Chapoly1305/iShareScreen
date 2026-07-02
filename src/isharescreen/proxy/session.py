@@ -524,6 +524,13 @@ class Session:
         # Audio sink. Set by consumer; called whenever a PCM chunk decodes.
         self._audio_callback: Optional[Callable[[np.ndarray], None]] = None
 
+        # Frame-wake hook. Fire-and-forget notification (no args) invoked
+        # from the decoder worker thread each time a frame is published, so
+        # an event-driven consumer (e.g. the desktop viewer blocking in
+        # glfw.wait_events) can wake immediately instead of polling. Must be
+        # thread-safe on the callee side; glfw.post_empty_event qualifies.
+        self._frame_wake_cb: Optional[Callable[[], None]] = None
+
         # Per-tile H.264 access-unit tap (AVC only). When set, each tile's
         # reassembled Annex-B access unit is handed to the callback as
         # (tile_idx, rtp_timestamp, au_bytes) from the video-process thread —
@@ -632,6 +639,16 @@ class Session:
         """Install a callback invoked from the audio RX thread with each
         decoded PCM chunk: `(N, 2) float32` at 48 kHz. Pass None to remove."""
         self._audio_callback = cb
+
+    def set_frame_wake_callback(
+        self, cb: Optional[Callable[[], None]],
+    ) -> None:
+        """Install a fire-and-forget hook invoked (no args) from the decoder
+        worker thread whenever a frame is published. Lets an event-driven
+        consumer wake from a blocking wait instead of polling for fresh tiles.
+        The callee MUST be thread-safe (called off the render thread). Pass
+        None to remove."""
+        self._frame_wake_cb = cb
 
     def set_video_au_callback(
         self, cb: Optional[Callable[[int, int, bytes], None]],
@@ -1535,6 +1552,12 @@ class Session:
         published. Wakes anyone in `wait_for_fresh_tile`."""
         self._last_publish_t = time.monotonic()
         self._fresh_evt.set()
+        cb = self._frame_wake_cb
+        if cb is not None:
+            try:
+                cb()
+            except Exception:
+                pass
         self._send_ltr_ack(tile_idx)
 
     def _send_ltr_ack(self, tile_idx: int) -> None:

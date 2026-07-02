@@ -39,9 +39,17 @@ _KEYSYM_SUPER_R = 0xffec
 log = logging.getLogger(__name__)
 
 
-# How long the loop blocks waiting for the next tile before pumping
-# events again. Short enough to stay responsive, long enough that we
-# don't busy-spin and starve the decoder thread.
+# Idle-wake cap for the event-driven render loop. The loop blocks in
+# glfw.wait_events_timeout and is woken *events-first*: by input (mouse /
+# keyboard) and by glfw.post_empty_event() posted from the decoder worker
+# thread on each published frame (see Session.set_frame_wake_callback). This
+# timeout is only the fallback that guarantees periodic housekeeping
+# (resize poll, connection/deadline checks) when nothing else fires — it does
+# NOT pace cursor or video, so it can be generous without adding motion
+# latency. Present cadence is set by vsync inside force_draw (Fifo).
+_EVENT_WAIT_S = 0.1
+
+# Legacy poll interval, kept for reference / non-event-driven callers.
 _FRESH_TILE_WAIT_S = 0.005
 
 
@@ -269,12 +277,25 @@ def run(
     _canvas_cursor = os.environ.get("ISS_LOCAL_CURSOR") != "1"
     _last_cursor_img: dict[str, object] = {"img": None}
 
+    def _wake_render_loop():
+        """Wake the main render loop out of glfw.wait_events_timeout. Safe to
+        call from any thread (glfw.post_empty_event is documented thread-safe)
+        and before/after the window exists — errors are swallowed so a late
+        wake during teardown can't crash a worker thread."""
+        try:
+            glfw.post_empty_event()
+        except Exception:
+            pass
+
     def _on_cursor(img):
         if _canvas_cursor:
             # Defer to the render thread — the overlay texture upload has to
-            # run on the thread that owns the wgpu device.
+            # run on the thread that owns the wgpu device. Wake the loop so a
+            # shape change (e.g. I-beam over a text field) is applied promptly
+            # instead of waiting out the idle-wake timeout on a static screen.
             with _cursor_lock:
                 _pending_cursor["img"] = img
+            _wake_render_loop()
             return
         if _cursor_direct_apply:
             _set_cursor_now(img)
@@ -283,6 +304,10 @@ def run(
                 _pending_cursor["img"] = img
 
     session.set_cursor_callback(_on_cursor)
+    # Wake the event-driven render loop on every published frame so video
+    # advances without the loop polling. Fires from the decoder worker thread;
+    # _wake_render_loop is thread-safe. Cleared before window teardown below.
+    session.set_frame_wake_callback(_wake_render_loop)
 
     canvas_w, canvas_h = session.canvas_dims  # backing/pixel size for GPU
     scaled_w, scaled_h = session.scaled_dims  # logical size for window
@@ -976,7 +1001,17 @@ def run(
                 return
 
     while time.monotonic() < deadline:
-        glfw.poll_events()
+        # Event-driven pacing: block here until something actually needs a
+        # redraw — an input event (mouse/keyboard, which also updates `cursor`
+        # via on_cursor_pos) or a glfw.post_empty_event() posted from the
+        # decoder worker on a fresh frame / from the cursor RX thread on a
+        # shape change (_wake_render_loop). The timeout is only an idle-wake
+        # fallback for housekeeping; it does not pace motion. This replaces the
+        # old poll_events()+wait_for_fresh_tile() combo, which stacked a fixed
+        # poll delay in front of the vsync wait and capped pointer motion well
+        # below the display refresh. Now the sole pacer is vsync inside
+        # force_draw (Fifo), so cursor + video present at the panel refresh rate.
+        glfw.wait_events_timeout(_EVENT_WAIT_S)
         _apply_pending_cursor()
         # Hide the local OS cursor only once the overlay can actually draw —
         # a shape has been uploaded (_last_cursor_img) AND a pointer position
@@ -1008,8 +1043,6 @@ def run(
         if (new_cw, new_ch) != (canvas_w, canvas_h) and new_cw and new_ch:
             _apply_new_canvas()
 
-        session.wait_for_fresh_tile(timeout=_FRESH_TILE_WAIT_S)
-
         # Drain fresh decoded frames + upload.
         any_fresh = False
         for ti in range(num_tiles):
@@ -1029,7 +1062,9 @@ def run(
         # Present after a fresh upload, OR when the overlay cursor moved or
         # changed shape — otherwise a pointer that moves/reshapes over a
         # static screen (no fresh tile) would never repaint, freezing the
-        # last-drawn cursor (e.g. an I-beam stuck after login).
+        # last-drawn cursor (e.g. an I-beam stuck after login). `cursor` was
+        # updated by on_cursor_pos during wait_events above; a burst of moves
+        # is coalesced into this single present, which vsync then paces.
         cursor_moved = _canvas_cursor and cursor != _last_drawn_cursor
         if (any_fresh or cursor_moved or _cursor_dirty["v"]) and any(first_seen):
             window.force_draw()
@@ -1037,6 +1072,10 @@ def run(
             _cursor_dirty["v"] = False
 
     log.info("desktop frontend closing")
+    # Stop worker threads from poking glfw once we start tearing the window
+    # down (post_empty_event into a terminated glfw is pointless and racy).
+    session.set_frame_wake_callback(None)
+    session.set_cursor_callback(None)
     if kbd_grab is not None:
         kbd_grab.disable()
     if audio_sink is not None:
