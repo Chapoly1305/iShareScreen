@@ -615,6 +615,37 @@ def run(
     _last_drawn_cursor: "Optional[tuple[int, int]]" = None
     deadline = time.monotonic() + auto_quit_secs if auto_quit_secs > 0 else float("inf")
 
+    # ── frame-rate conversion (FRC) — opt-in; docs/frame_interpolation_*.md ──
+    # ISS_FRC=1 routes video through the renderer's offscreen scene ring + blit
+    # path so we can insert synthetic frames between real ones.
+    #   ISS_FRC_MODE=copy  (default, P0): frame-double — present each real frame
+    #                      twice. Zero added latency, zero artifact; proves the
+    #                      render path + double-present scheduling.
+    #   ISS_FRC_MODE=blend (P1): show mix(prev,cur,0.5) then cur — smoother
+    #                      motion but +1 display frame latency and motion-region
+    #                      double-image (the interpolation baseline).
+    # Synthetic insertion is gated on the display having refresh headroom over
+    # the ~60fps source; on a ≤60Hz panel we present each real frame once (the
+    # path is still exercised, just no doubling — inserting there would stall on
+    # vsync with no headroom).
+    _frc_on = os.environ.get("ISS_FRC") == "1"
+    _frc_mode = os.environ.get("ISS_FRC_MODE", "copy").strip().lower()
+    _frc_blend = 0.5 if _frc_mode == "blend" else 0.0
+    _frc_refresh_hz = 0
+    try:
+        _vm = glfw.get_video_mode(glfw.get_primary_monitor())
+        _frc_refresh_hz = int(getattr(_vm, "refresh_rate", 0) or 0)
+    except Exception:
+        _frc_refresh_hz = 0
+    _frc_double = _frc_on and _frc_refresh_hz >= 90
+    _frc = {"tick": "a", "cur": -1, "prev": -1}
+    _frc_count = {"real": 0, "synth": 0}
+    _frc_log_t = [time.monotonic()]
+    if _frc_on:
+        log.info("FRC enabled: mode=%s display=%dHz synthetic-frames=%s",
+                 _frc_mode, _frc_refresh_hz,
+                 "on" if _frc_double else "off (no refresh headroom)")
+
     # rendercanvas presents only from inside the draw callback (it owns
     # the swap chain). We do the GPU work here and trigger via
     # `force_draw()` from the main loop so render is paced to tile
@@ -693,7 +724,36 @@ def run(
                     "canvas=%dx%d content=%dx%d",
                     *_geom, _cd[0], _cd[1],
                 )
-            renderer.draw(target.create_view(), target.width, target.height)
+            if _frc_on:
+                tw, th = target.width, target.height
+                tick = _frc["tick"]
+                if tick == "a":
+                    # New real frame: render YUV→RGB into the next scene slot,
+                    # then present either the real frame (copy / no headroom) or
+                    # the interpolated mid-frame (blend, once 2 scenes exist).
+                    idx = renderer.render_scene(tw, th)
+                    _frc["prev"], _frc["cur"] = _frc["cur"], idx
+                    if (_frc_blend > 0.0 and _frc_double
+                            and renderer.frc_scenes_ready() >= 2):
+                        renderer.present_scene(
+                            target.create_view(), tw, th,
+                            _frc["prev"], _frc["cur"], _frc_blend)
+                    else:
+                        renderer.present_scene(
+                            target.create_view(), tw, th,
+                            _frc["cur"], _frc["cur"], 0.0)
+                elif tick == "b":
+                    # Second present of the pair: the real current frame.
+                    renderer.present_scene(
+                        target.create_view(), tw, th,
+                        _frc["cur"], _frc["cur"], 0.0)
+                else:  # "cursor": repaint last real scene + overlay only
+                    if _frc["cur"] >= 0:
+                        renderer.present_scene(
+                            target.create_view(), tw, th,
+                            _frc["cur"], _frc["cur"], 0.0)
+            else:
+                renderer.draw(target.create_view(), target.width, target.height)
         except Exception as e:
             msg = str(e)
             if "device is lost" in msg.lower() or "Validation Error" in msg:
@@ -906,6 +966,10 @@ def run(
         slot_h_resolved = False
         first_seen = [False] * num_tiles
         renderer = Renderer(device, surface_format, canvas_w, canvas_h)
+        # The new renderer's FRC scene ring is empty; invalidate the tracked
+        # slot indices so no synthetic/cursor present blits an unrendered scene
+        # before the first real frame lands on the new renderer.
+        _frc["cur"] = _frc["prev"] = -1
         # The new renderer has no cursor texture/scale; re-apply both so the
         # overlay doesn't vanish or mis-size across a resolution change.
         if _canvas_cursor:
@@ -1031,7 +1095,37 @@ def run(
         # static screen (no fresh tile) would never repaint, freezing the
         # last-drawn cursor (e.g. an I-beam stuck after login).
         cursor_moved = _canvas_cursor and cursor != _last_drawn_cursor
-        if (any_fresh or cursor_moved or _cursor_dirty["v"]) and any(first_seen):
+        if _frc_on:
+            if any(first_seen):
+                if any_fresh:
+                    # Real frame: present tick "a" (renders scene + presents),
+                    # then tick "b" (the paired second present) when the display
+                    # has headroom and a previous scene exists to pair with.
+                    _frc["tick"] = "a"
+                    window.force_draw()
+                    did_synth = _frc_double and renderer.frc_scenes_ready() >= 2
+                    if did_synth:
+                        _frc["tick"] = "b"
+                        window.force_draw()
+                    _frc_count["real"] += 1
+                    _frc_count["synth"] += 1 if did_synth else 0
+                    now = time.monotonic()
+                    if now - _frc_log_t[0] >= 2.0:
+                        dt = now - _frc_log_t[0]
+                        log.info(
+                            "FRC: real=%.1ffps synth=%.1ffps present=%.1ffps "
+                            "mode=%s double=%s",
+                            _frc_count["real"] / dt, _frc_count["synth"] / dt,
+                            (_frc_count["real"] + _frc_count["synth"]) / dt,
+                            _frc_mode, _frc_double)
+                        _frc_count["real"] = _frc_count["synth"] = 0
+                        _frc_log_t[0] = now
+                elif cursor_moved or _cursor_dirty["v"]:
+                    _frc["tick"] = "cursor"
+                    window.force_draw()
+            _last_drawn_cursor = cursor
+            _cursor_dirty["v"] = False
+        elif (any_fresh or cursor_moved or _cursor_dirty["v"]) and any(first_seen):
             window.force_draw()
             _last_drawn_cursor = cursor
             _cursor_dirty["v"] = False

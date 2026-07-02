@@ -183,6 +183,51 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 """
 
 
+# Frame-rate-conversion (FRC) blit/interpolate: sample two full-frame RGBA
+# "scene" textures (already YUV→RGB converted, cursor NOT yet applied) and
+# output mix(A, B, t). t=0 → pure A, t=1 → pure B, t=0.5 → linear blend
+# (the P1 interpolation baseline). The scene textures are the exact pixels
+# that would have gone to the swapchain, so blitting one back (t=0/1) is a
+# lossless passthrough. Interpolation happens BEFORE the cursor overlay, so
+# the cursor is never blended/ghosted — see docs/frame_interpolation_*.md.
+WGSL_BLIT = """
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+struct BlendU { t: vec4<f32>, };   // t.x = blend factor A→B
+@group(0) @binding(0) var tex_a: texture_2d<f32>;
+@group(0) @binding(1) var tex_b: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
+@group(0) @binding(3) var<uniform> B: BlendU;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> VsOut {
+    let xy = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 3.0, -1.0),
+        vec2<f32>(-1.0,  3.0),
+    );
+    let uv = array<vec2<f32>, 3>(
+        vec2<f32>(0.0, 1.0),
+        vec2<f32>(2.0, 1.0),
+        vec2<f32>(0.0, -1.0),
+    );
+    var o: VsOut;
+    o.pos = vec4<f32>(xy[i], 0.0, 1.0);
+    o.uv = uv[i];
+    return o;
+}
+
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4<f32> {
+    let a = textureSample(tex_a, samp, in.uv);
+    let b = textureSample(tex_b, samp, in.uv);
+    return mix(a, b, B.t.x);
+}
+"""
+
+
 class Renderer:
     """Build once, call `upload_tile` per fresh tile, then `draw`."""
 
@@ -386,6 +431,25 @@ class Renderer:
             },
             primitive={"topology": wgpu.PrimitiveTopology.triangle_strip},
         )
+
+        # ── frame-rate conversion (FRC) scaffolding ─────────────────────
+        # Off unless the app routes frames through render_scene/present_scene
+        # (gated by ISS_FRC in app.py). Two offscreen RGBA "scene" textures
+        # form a 2-slot history ring: the video (YUV→RGB, no cursor) is
+        # rendered into a slot, and present_scene blits mix(slotA, slotB, t)
+        # to the swapchain + cursor overlay. Built lazily on first use so the
+        # non-FRC path allocates nothing. Scene textures track the swapchain
+        # size and are rebuilt on resize.
+        self._blit_pipeline = None
+        self._blit_bind_layout = None
+        self._blit_uniform_buf = None
+        self._blit_sampler = None
+        self._frc_scene: list = [None, None]
+        self._frc_scene_view: list = [None, None]
+        self._frc_bg: dict = {}          # (a,b) -> bind group for the blit pass
+        self._frc_scene_size: tuple = (0, 0)
+        self._frc_ring_idx = 0           # next slot render_scene writes
+        self._frc_have = 0               # valid scenes so far (caps at 2)
 
     def _ensure_biplanar(self) -> None:
         """Lazily build the nv24 (Y r8 + interleaved-UV rg8) render pipeline on
@@ -598,6 +662,209 @@ class Renderer:
         video zoom); this multiplier (ISS_CURSOR_SCALE) tunes it further."""
         self._cursor_scale = max(0.1, float(scale))
 
+    def _write_video_uniform(self) -> None:
+        """Write the YUV→RGB shader's uv_scale/chroma_scale uniform from the
+        current content/canvas ratio. Shared by draw() and render_scene().
+
+        uv_scale crops texture sampling to the decoded-content sub-rect
+        (top-left of the textures); padding outside content_dims is never
+        sampled. chroma_scale = uv_scale shrunk by the chroma subsample ratio
+        (== uv_scale for 4:4:4, half for 4:2:0), so half-res chroma written
+        into the top-left of the full-size U/V textures is sampled correctly
+        and the bilinear sampler upsamples it — no CPU 4:2:0→4:4:4 upsample."""
+        cw, ch = self.content_dims()
+        ux = cw / self._w if self._w else 1.0
+        uy = ch / self._h if self._h else 1.0
+        crx, cry = self._chroma_ratio
+        self._device.queue.write_buffer(
+            self._uniform_buf, 0,
+            np.array([ux, uy, ux * crx, uy * cry], dtype=np.float32).tobytes(),
+        )
+
+    def _encode_video(self, rpass, target_w: int, target_h: int) -> None:
+        """Encode the video (YUV→RGB) full-screen triangle into `rpass`,
+        filling the whole target. Caller writes the uniform first.
+
+        Fills the whole window (pre-rework baseline). The window is
+        aspect-locked to the content (see app.py) so a free resize fills with
+        no distortion; `uv_scale` (via _write_video_uniform) still crops
+        sampling to the decoded sub-rect so texture padding is never shown."""
+        if self._mode == "biplanar":
+            rpass.set_pipeline(self._pipeline_biplanar)
+            rpass.set_bind_group(0, self._bind_biplanar)
+        else:
+            rpass.set_pipeline(self._pipeline_planar)
+            rpass.set_bind_group(0, self._bind_planar)
+        rpass.set_viewport(0.0, 0.0, float(target_w), float(target_h), 0.0, 1.0)
+        rpass.draw(3)
+
+    def _encode_cursor(self, rpass, target_w: int, target_h: int) -> None:
+        """Encode the cursor overlay quad into `rpass`, alpha-blended over
+        whatever the pass already holds. No-op until a cursor pixmap AND a
+        pointer position are known. Shared by draw() and present_scene().
+
+        Placement: content texels map onto the full window per-axis (fill);
+        the sprite is sized by the smaller axis so it stays square (never
+        stretched). `_cursor_scale` is the ISS_CURSOR_SCALE calibration."""
+        cw, ch = self.content_dims()
+        sclx = target_w / cw if cw > 0 else 1.0
+        scly = target_h / ch if ch > 0 else 1.0
+        _overlay_ok = (
+            self._cursor_tex is not None and self._cursor_bind_group is not None
+            and self._cursor_pos is not None and target_w > 0 and target_h > 0)
+        if _CURSOR_DEBUG:
+            self._dbg_n = getattr(self, "_dbg_n", 0) + 1
+            if self._dbg_n % 30 == 0:
+                log.info(
+                    "cursor-overlay draw=%s tex=%s bind=%s pos=%s size=%dx%d "
+                    "sprite=%dx%d scale=%.2f",
+                    _overlay_ok, self._cursor_tex is not None,
+                    self._cursor_bind_group is not None, self._cursor_pos,
+                    target_w, target_h, self._cur_w, self._cur_h,
+                    self._cursor_scale,
+                )
+        if not _overlay_ok:
+            return
+        cx, cy = self._cursor_pos
+        d = min(sclx, scly) * self._cursor_scale
+        px = cx * sclx
+        py = cy * scly
+        sw = self._cur_w * d
+        sh = self._cur_h * d
+        sx = px - self._cur_hx * d
+        sy = py - self._cur_hy * d
+        x0 = sx / target_w * 2.0 - 1.0
+        x1 = (sx + sw) / target_w * 2.0 - 1.0
+        y0 = 1.0 - sy / target_h * 2.0
+        y1 = 1.0 - (sy + sh) / target_h * 2.0
+        self._device.queue.write_buffer(
+            self._cursor_uniform_buf, 0,
+            np.array([x0, y0, x1, y1], dtype=np.float32).tobytes(),
+        )
+        rpass.set_pipeline(self._cursor_pipeline)
+        rpass.set_bind_group(0, self._cursor_bind_group)
+        rpass.set_viewport(0.0, 0.0, float(target_w), float(target_h), 0.0, 1.0)
+        rpass.draw(4)
+
+    # ── frame-rate conversion (opt-in; see docs/frame_interpolation_*.md) ──
+    def _ensure_frc(self, target_w: int, target_h: int) -> None:
+        """Lazily build the blit/interpolate pipeline and (re)allocate the
+        2-slot scene ring at the swapchain size. Idempotent; rebuilds the
+        scene textures + bind groups on resize."""
+        device = self._device
+        if self._blit_pipeline is None:
+            shader = device.create_shader_module(code=WGSL_BLIT)
+            self._blit_sampler = device.create_sampler(
+                mag_filter=wgpu.FilterMode.nearest,
+                min_filter=wgpu.FilterMode.nearest,
+            )
+            self._blit_uniform_buf = device.create_buffer(
+                size=16,
+                usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+            )
+            self._blit_bind_layout = device.create_bind_group_layout(entries=[
+                {"binding": 0, **self._tex_entry},
+                {"binding": 1, **self._tex_entry},
+                {"binding": 2, "visibility": wgpu.ShaderStage.FRAGMENT, "sampler": {}},
+                {"binding": 3, **self._uniform_entry},
+            ])
+            self._blit_pipeline = device.create_render_pipeline(
+                layout=device.create_pipeline_layout(
+                    bind_group_layouts=[self._blit_bind_layout]),
+                vertex={"module": shader, "entry_point": "vs"},
+                fragment={
+                    "module": shader, "entry_point": "fs",
+                    "targets": [{"format": self._surface_format}],
+                },
+                primitive={"topology": wgpu.PrimitiveTopology.triangle_list},
+            )
+        if (self._frc_scene_size == (target_w, target_h)
+                and self._frc_scene[0] is not None):
+            return
+        self._frc_scene = [None, None]
+        self._frc_scene_view = [None, None]
+        for i in range(2):
+            tex = device.create_texture(
+                format=self._surface_format,
+                usage=(wgpu.TextureUsage.RENDER_ATTACHMENT
+                       | wgpu.TextureUsage.TEXTURE_BINDING),
+                size=(max(1, target_w), max(1, target_h), 1),
+            )
+            self._frc_scene[i] = tex
+            self._frc_scene_view[i] = tex.create_view()
+        self._frc_bg = {}
+        for a in range(2):
+            for b in range(2):
+                self._frc_bg[(a, b)] = device.create_bind_group(
+                    layout=self._blit_bind_layout,
+                    entries=[
+                        {"binding": 0, "resource": self._frc_scene_view[a]},
+                        {"binding": 1, "resource": self._frc_scene_view[b]},
+                        {"binding": 2, "resource": self._blit_sampler},
+                        {"binding": 3, "resource": {
+                            "buffer": self._blit_uniform_buf,
+                            "offset": 0, "size": 16}},
+                    ],
+                )
+        self._frc_scene_size = (target_w, target_h)
+        self._frc_ring_idx = 0
+        self._frc_have = 0
+
+    def render_scene(self, target_w: int, target_h: int) -> int:
+        """FRC: render the current video frame (YUV→RGB, NO cursor) into the
+        next scene-ring slot; return its index. The scene holds exactly the
+        pixels draw() would put on screen minus the cursor, so present_scene
+        can blit it back losslessly or blend two of them. Call once per real
+        decoded frame."""
+        self._ensure_frc(target_w, target_h)
+        idx = self._frc_ring_idx
+        self._frc_ring_idx ^= 1
+        self._write_video_uniform()
+        encoder = self._device.create_command_encoder()
+        rpass = encoder.begin_render_pass(color_attachments=[{
+            "view": self._frc_scene_view[idx],
+            "load_op": wgpu.LoadOp.clear,
+            "store_op": wgpu.StoreOp.store,
+            "clear_value": (0, 0, 0, 1),
+        }])
+        self._encode_video(rpass, target_w, target_h)
+        rpass.end()
+        self._device.queue.submit([encoder.finish()])
+        if self._frc_have < 2:
+            self._frc_have += 1
+        return idx
+
+    def present_scene(
+        self, target_view: wgpu.GPUTextureView, target_w: int, target_h: int,
+        idx_a: int, idx_b: int, t: float,
+    ) -> None:
+        """FRC: composite mix(scene[a], scene[b], t) into `target_view`, then
+        the cursor overlay on top. t=0 → scene a (lossless passthrough), t=0.5
+        → linear blend. Cursor is applied AFTER the blend so it never ghosts."""
+        self._ensure_frc(target_w, target_h)
+        self._device.queue.write_buffer(
+            self._blit_uniform_buf, 0,
+            np.array([float(t), 0.0, 0.0, 0.0], dtype=np.float32).tobytes(),
+        )
+        encoder = self._device.create_command_encoder()
+        rpass = encoder.begin_render_pass(color_attachments=[{
+            "view": target_view,
+            "load_op": wgpu.LoadOp.clear,
+            "store_op": wgpu.StoreOp.store,
+            "clear_value": (0, 0, 0, 1),
+        }])
+        rpass.set_pipeline(self._blit_pipeline)
+        rpass.set_bind_group(0, self._frc_bg[(idx_a, idx_b)])
+        rpass.set_viewport(0.0, 0.0, float(target_w), float(target_h), 0.0, 1.0)
+        rpass.draw(3)
+        self._encode_cursor(rpass, target_w, target_h)
+        rpass.end()
+        self._device.queue.submit([encoder.finish()])
+
+    def frc_scenes_ready(self) -> int:
+        """Number of valid scenes currently in the ring (0..2)."""
+        return self._frc_have
+
     def draw(
         self, target_view: wgpu.GPUTextureView,
         target_w: int, target_h: int,
@@ -615,33 +882,7 @@ class Renderer:
         Apple's viewer. `uv_scale` separately crops sampling to the content
         sub-rect, so black texture padding (host fell back to a frame
         smaller than the advertised canvas) is never sampled."""
-        cw, ch = self.content_dims()
-        # uv_scale crops texture sampling to the decoded content sub-rect
-        # (top-left of the textures); padding outside content_dims is never
-        # sampled. Per-axis: the real frame can be smaller than the canvas
-        # on either axis independently.
-        ux = cw / self._w if self._w else 1.0
-        uy = ch / self._h if self._h else 1.0
-        # chroma_scale = uv_scale shrunk by the chroma subsample ratio
-        # (== uv_scale for 4:4:4, half for 4:2:0). The half-res chroma is
-        # written into the top-left of the full-size U/V textures, so the
-        # shader samples just that sub-region and the bilinear sampler
-        # upsamples it to luma resolution — no CPU 4:2:0→4:4:4 upsample.
-        crx, cry = self._chroma_ratio
-        self._device.queue.write_buffer(
-            self._uniform_buf, 0,
-            np.array([ux, uy, ux * crx, uy * cry], dtype=np.float32).tobytes(),
-        )
-        # Fill the whole window (the pre-rework baseline behavior). The window
-        # is aspect-locked to the content (see app.py), so a free resize fills
-        # with no distortion; when the window can't hold the aspect (maximize
-        # overrides the lock) the content stretches to fill rather than showing
-        # black bars. `uv_scale` (above) still crops sampling to the decoded
-        # sub-rect, so texture padding is never shown (no green/black bottom).
-        viewport = (0.0, 0.0, float(target_w), float(target_h))
-        # Per-axis content->screen scale, for placing the cursor overlay.
-        sclx = target_w / cw if cw > 0 else 1.0
-        scly = target_h / ch if ch > 0 else 1.0
+        self._write_video_uniform()
         encoder = self._device.create_command_encoder()
         rpass = encoder.begin_render_pass(color_attachments=[{
             "view": target_view,
@@ -649,59 +890,8 @@ class Renderer:
             "store_op": wgpu.StoreOp.store,
             "clear_value": (0, 0, 0, 1),
         }])
-        if self._mode == "biplanar":
-            rpass.set_pipeline(self._pipeline_biplanar)
-            rpass.set_bind_group(0, self._bind_biplanar)
-        else:
-            rpass.set_pipeline(self._pipeline_planar)
-            rpass.set_bind_group(0, self._bind_planar)
-        rpass.set_viewport(*viewport, 0.0, 1.0)
-        rpass.draw(3)
-
-        # Cursor overlay: place the pixmap at the pointer (canvas texels),
-        # mapped through the same letterbox transform as the video. The
-        # content sub-rect maps onto `viewport` at uniform `scale`, so a
-        # canvas coord c → screen px = viewport_offset + c * scale.
-        _overlay_ok = (
-            self._cursor_tex is not None and self._cursor_bind_group is not None
-            and self._cursor_pos is not None and target_w > 0 and target_h > 0)
-        if _CURSOR_DEBUG:
-            self._dbg_n = getattr(self, "_dbg_n", 0) + 1
-            if self._dbg_n % 30 == 0:
-                log.info(
-                    "cursor-overlay draw=%s tex=%s bind=%s pos=%s size=%dx%d "
-                    "sprite=%dx%d scale=%.2f",
-                    _overlay_ok, self._cursor_tex is not None,
-                    self._cursor_bind_group is not None, self._cursor_pos,
-                    target_w, target_h, self._cur_w, self._cur_h,
-                    self._cursor_scale,
-                )
-        if _overlay_ok:
-            cx, cy = self._cursor_pos
-            # Content texels map onto the full window per-axis (fill). Place
-            # the cursor by the per-axis scale; size the sprite by the smaller
-            # axis so it stays square (never stretched). `_cursor_scale` is a
-            # calibration / ISS_CURSOR_SCALE multiplier (default 1.0).
-            d = min(sclx, scly) * self._cursor_scale
-            px = cx * sclx
-            py = cy * scly
-            sw = self._cur_w * d
-            sh = self._cur_h * d
-            sx = px - self._cur_hx * d
-            sy = py - self._cur_hy * d
-            x0 = sx / target_w * 2.0 - 1.0
-            x1 = (sx + sw) / target_w * 2.0 - 1.0
-            y0 = 1.0 - sy / target_h * 2.0
-            y1 = 1.0 - (sy + sh) / target_h * 2.0
-            self._device.queue.write_buffer(
-                self._cursor_uniform_buf, 0,
-                np.array([x0, y0, x1, y1], dtype=np.float32).tobytes(),
-            )
-            rpass.set_pipeline(self._cursor_pipeline)
-            rpass.set_bind_group(0, self._cursor_bind_group)
-            rpass.set_viewport(0.0, 0.0, float(target_w), float(target_h), 0.0, 1.0)
-            rpass.draw(4)
-
+        self._encode_video(rpass, target_w, target_h)
+        self._encode_cursor(rpass, target_w, target_h)
         rpass.end()
         self._device.queue.submit([encoder.finish()])
 
