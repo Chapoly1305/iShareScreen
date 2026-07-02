@@ -93,6 +93,13 @@ def _make_parser() -> argparse.ArgumentParser:
         "--bridge-port", type=int, default=4433,
         help="browser frontend: WebTransport/HTTP3 listen port (default 4433)",
     )
+    g.add_argument(
+        "--trust-cert-for-safari", action="store_true",
+        help="macOS only: install iss's WebTransport cert into the login "
+        "keychain (one-time auth prompt) so Safari works. Safari can't use "
+        "the self-signed cert otherwise — WebKit lacks serverCertificateHashes. "
+        "Chrome/Edge/Firefox don't need this.",
+    )
 
     g = p.add_argument_group("display")
     g.add_argument(
@@ -438,7 +445,10 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
     # cleanly with one decoder, no compositing.
     os.environ.setdefault("ISS_TILES_PER_FRAME", "1")
     from isharescreen.frontend.wt.server import run as run_browser
-    return run_browser(config, port=args.bridge_port)
+    return run_browser(
+        config, port=args.bridge_port,
+        trust_cert_for_safari=getattr(args, "trust_cert_for_safari", False),
+    )
 
 
 # ── entry point ──────────────────────────────────────────────────────

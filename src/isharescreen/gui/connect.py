@@ -18,6 +18,7 @@ import http.server
 import json
 import os
 import queue
+import signal
 import socket
 import subprocess
 import sys
@@ -43,6 +44,8 @@ _PROC = None                # current iss subprocess (Reconnect / new replaces i
 _CTRL_SOCK = None           # connected control socket, for sending commands (fir)
 _LAST: dict = {}            # last form values, for Reconnect
 _LAUNCH_N = 0               # per-launch counter → unique control-socket path
+_BRIDGE_PORT = 4433         # iss --bridge-port default; the GUI never overrides it
+_VIDEO_URL = None           # browser-frontend video page URL → the Open-video button
 _GUI_PORT = 0               # this server's port, for the iss → GUI choice callback
 _CHOICE_EVENT = threading.Event()   # set when the user answers the session modal
 _CHOICE_RESULT = "share"            # "alt" | "share" — the user's last answer
@@ -153,14 +156,60 @@ def _set_session_choice(choice: str) -> None:
 
 
 def _kill_current() -> None:
-    """Terminate the current session, if any (Reconnect / new connection)."""
-    global _PROC
+    """Terminate the current session, if any (Reconnect / new connection).
+
+    Waits for the child to actually exit so its bridge port (and control
+    socket) is released before a relaunch — otherwise a fresh launch races
+    the old process and fails to bind with 'address already in use'. Escalates
+    to SIGKILL if it doesn't stop promptly (a WebTransport bridge whose viewer
+    never connected — e.g. a failed Safari attempt — otherwise lingers)."""
+    global _PROC, _VIDEO_URL
+    _VIDEO_URL = None
     p, _PROC = _PROC, None
     if p is not None and p.poll() is None:
         try:
             p.terminate()
+            p.wait(timeout=3)
         except Exception:
-            pass
+            try:
+                p.kill()
+                p.wait(timeout=2)
+            except Exception:
+                pass
+
+
+def _free_bridge_port(port: int) -> None:
+    """Kill any orphaned iss bridge still LISTENing on `port` (a prior GUI
+    session that crashed / had a failed WebTransport handshake). Scoped by port
+    AND to iss processes, so it never touches a bridge on another port or any
+    non-iss process — and skips our own pid."""
+    try:
+        out = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        return
+    killed = False
+    for pid_s in out.split():
+        try:
+            pid = int(pid_s)
+        except ValueError:
+            continue
+        if pid == os.getpid():
+            continue
+        try:
+            cmd = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                                 capture_output=True, text=True, timeout=2).stdout
+        except Exception:
+            cmd = ""
+        if "isharescreen" in cmd:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                killed = True
+            except Exception:
+                pass
+    if killed:
+        time.sleep(0.4)  # let the socket release before we bind
 
 
 def _reconnect() -> None:
@@ -170,6 +219,17 @@ def _reconnect() -> None:
         return
     _emit("log", "[gui] reconnecting…")
     _launch(dict(_LAST))
+
+
+def _browser_is_safari(ua: str) -> bool:
+    """True for desktop/iOS Safari from its User-Agent. Safari's UA
+    contains 'Safari' + 'Version/', but so does Chrome/Edge/etc. — they
+    additionally carry their own token, so exclude those."""
+    u = ua.lower()
+    if "safari" not in u:
+        return False
+    return not any(t in u for t in
+                   ("chrome", "chromium", "crios", "edg", "fxios", "android", "opr"))
 
 
 def _launch(values: dict) -> None:
@@ -183,6 +243,12 @@ def _launch(values: dict) -> None:
         _emit("status", dict(_STATE))
         return
     _kill_current()            # Reconnect / new connection replaces the old one
+    # Also clear any ORPHANED iss bridge (a previous GUI session that crashed,
+    # was force-quit, or had a failed WebTransport handshake) still holding the
+    # bridge port, else it blocks this launch with 'address already in use'.
+    # Scoped to the SPECIFIC bridge port and to iss processes only, so it can't
+    # touch a bridge on another port or any non-iss process.
+    _free_bridge_port(_BRIDGE_PORT)
     _LAST = dict(values)
     frontend = values.get("frontend", "browser")
     _STATE.update(host=host, frontend=frontend, status="connecting")
@@ -191,10 +257,12 @@ def _launch(values: dict) -> None:
     _LAUNCH_N += 1
     sock_path = os.path.join(
         os.path.expanduser("~/.iss"), f"gui-{os.getpid()}-{_LAUNCH_N}.sock")
+    log_path = sock_path[:-5] + ".log"   # gui-<pid>-<n>.log, next to the socket
     cmd = [
         sys.executable, "-m", "isharescreen.cli",
         "--host", host, "-u", user, "--password-stdin",
         "--frontend", frontend, "--control-socket", sock_path,
+        "--log-file", log_path,
     ]
     advertise = values.get("advertise", "").strip()
     if advertise:
@@ -203,6 +271,8 @@ def _launch(values: dict) -> None:
         cmd.append("--no-curtain")
     if values.get("audio") != "on":
         cmd.append("--no-audio")
+    if values.get("safari") == "on" and frontend == "browser":
+        cmd.append("--trust-cert-for-safari")
 
     env = dict(os.environ)
     if _GUI_PORT:
@@ -226,9 +296,16 @@ def _launch(values: dict) -> None:
     threading.Thread(target=_control_reader, args=(sock_path,), daemon=True).start()
 
     def _pump() -> None:
+        global _VIDEO_URL
         assert proc.stdout is not None
         for line in proc.stdout:
-            _emit("log", line.rstrip("\n"))
+            line = line.rstrip("\n")
+            _emit("log", line)
+            if frontend == "browser" and "open this URL" in line:
+                i = line.find("http")
+                if i != -1:
+                    _VIDEO_URL = line[i:].strip()
+                    _emit("video_url", {"url": _VIDEO_URL})
         try:
             proc.wait(timeout=5)
         except Exception:
@@ -256,7 +333,7 @@ _FORM = """<!doctype html><html><head><title>iShareScreen — Connect</title>__H
  .row { display:flex; gap:10px; align-items:center; margin:2px 0 12px; } .row input { width:auto; margin:0; }
  button { width:100%; margin-top:8px; padding:12px; font-size:15px; font-weight:600; color:#fff; background:#4f8cff; border:0; border-radius:9px; cursor:pointer; } button:hover { background:#5f97ff; }
 </style></head><body>
- <form class="card" method="post" action="/connect">
+ <form class="card" method="post" action="/connect" onsubmit="return prepVideo()">
   <h1>iShareScreen</h1><p class="sub">Connect to a Mac</p>
   <label>Host</label><input type="text" name="host" placeholder="Mac hostname or IP" value="__HOST__" autofocus>
   <label>User</label><input type="text" name="user" placeholder="macOS account" value="__USER__">
@@ -282,7 +359,21 @@ _FORM = """<!doctype html><html><head><title>iShareScreen — Connect</title>__H
   <div class="row"><input type="checkbox" name="audio" id="audio" checked><label for="audio" style="margin:0">Audio</label></div>
   <div class="row"><input type="checkbox" name="curtain" id="curtain" checked><label for="curtain" style="margin:0">Curtain (private virtual display)</label></div>
   <button type="submit">Connect</button>
- </form></body></html>"""
+ </form>
+ <script>
+ // Open the video tab DURING the Connect click (a real user gesture, so no
+ // popup-block) — but the URL doesn't exist yet, so point it at a local
+ // "Connecting…" page that polls for the real URL and redirects itself. Only
+ // for the browser frontend; the desktop frontend has no video page.
+ function prepVideo(){ try{ var f=document.querySelector('[name=frontend]');
+   if(f&&f.value==='browser') window.open('/video-wait','_blank'); }catch(e){} return true; }
+ </script></body></html>"""
+
+_VIDEO_WAIT = """<!doctype html><html><head><meta charset="utf-8"><title>Connecting…</title>
+<style>body{background:#16171a;color:#c7c9cf;font:15px -apple-system,system-ui,sans-serif;display:flex;height:100vh;margin:0;align-items:center;justify-content:center;flex-direction:column;gap:16px}.s{width:34px;height:34px;border:3px solid #2c2e33;border-top-color:#4f8cff;border-radius:50%;animation:r .8s linear infinite}@keyframes r{to{transform:rotate(360deg)}}</style></head>
+<body><div class="s"></div><div>Connecting to the stream…</div>
+<script>(function p(){fetch('/video-url',{cache:'no-store'}).then(r=>r.json()).then(d=>{if(d&&d.url){location.replace(d.url);}else{setTimeout(p,400);}}).catch(function(){setTimeout(p,700);});})();</script>
+</body></html>"""
 
 _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title>__HEAD__
 <style>
@@ -320,6 +411,7 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
   <span class="meta" id="uptime"></span><span class="meta" id="decoder"></span>
   <button class="btn" onclick="act('fir')" title="Request a fresh keyframe (IDR) on every tile. Use when a tile is frozen, gray, or showing stale / garbled content.">Force IDR</button>
   <button class="btn" onclick="act('reconnect')" title="Drop and re-establish the session with the same settings. Use after a stall the stream can't recover from on its own.">Reconnect</button>
+  <a id="videobtn" class="btn primary" style="display:none;text-decoration:none" target="_blank" rel="noopener" title="Open the live video stream in a new tab — in this same browser.">▶ Open video</a>
   <a class="new" href="/new">+ new connection</a></div>
  <div class="cards">
   <div class="card"><h3 title="What's being streamed and how it's decoded.">Stream</h3>
@@ -391,6 +483,7 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
    const lvl = line.includes(' ERROR ')?'lvl-ERROR':line.includes(' WARNING ')?'lvl-WARN':line.includes(' DEBUG ')?'lvl-DEBUG':'';
    const s=document.createElement('span'); s.className=lvl; s.textContent=line+'\\n'; logEl.appendChild(s);
    if(atBottom) logEl.scrollTop=logEl.scrollHeight; });
+ es.addEventListener('video_url', e => { try{ const u=(JSON.parse(e.data)||{}).url; const b=document.getElementById('videobtn'); if(u&&b){ b.href=u; b.style.display=''; } }catch(_){} });
  es.addEventListener('session_choice', e => { let u=''; try{ u=(JSON.parse(e.data)||{}).console_user||''; }catch(_){}
    document.getElementById('modaluser').textContent = u ? (u+' is signed in at this Mac.') : 'Someone is signed in at this Mac.';
    document.getElementById('modal').classList.add('show'); });
@@ -451,6 +544,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._html(_dash_page())
         elif self.path == "/events":
             self._sse()
+        elif self.path == "/video-wait":
+            self._html(_VIDEO_WAIT.encode("utf-8"))
+        elif self.path == "/video-url":
+            self._html(json.dumps({"url": _VIDEO_URL}).encode())
         else:
             self._html(b"not found", 404)
 
@@ -478,6 +575,15 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             got = _CHOICE_EVENT.wait(timeout=50)
             self._html((_CHOICE_RESULT if got else "share").encode())
             return
+        global _VIDEO_URL
+        _VIDEO_URL = None   # clear the prior session's URL so the waiting tab waits for THIS one
+        # The video page auto-opens in the SAME browser as this connect form,
+        # so the connect request's User-Agent tells us whether the viewer is
+        # Safari — which needs the cert keychain-trusted (WebKit has no
+        # serverCertificateHashes). Auto-enable it; the install is idempotent
+        # (no prompt once trusted), so no checkbox is needed.
+        if _browser_is_safari(self.headers.get("User-Agent", "")):
+            values.setdefault("safari", "on")
         threading.Thread(target=_launch, args=(values,), daemon=True).start()
         self._html(_dash_page())
 
@@ -499,6 +605,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._event("hello", hello)
             if latest:
                 self._event("snapshot", latest)
+            if _VIDEO_URL:
+                self._event("video_url", {"url": _VIDEO_URL})
             for line in backlog:
                 self._event("log", line)
             while True:

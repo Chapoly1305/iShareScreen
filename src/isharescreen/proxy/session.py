@@ -96,6 +96,12 @@ _TX_PROFILE_EVERY_N_TICKS = 4
 # How long we wait on a UDP socket recv before re-checking the stop flag.
 _UDP_RECV_TIMEOUT_S = 1.0
 _TCP_RECV_TIMEOUT_S = 1.0
+_PROFILE_RX = os.environ.get("ISS_WT_PROFILE", "0") == "1"
+# AVC → browser pass-through: skip iss's own (redundant) VideoToolbox decode of
+# forwarded AUs — the browser decodes them in WebCodecs. Halves decode CPU and
+# removes the decode latency the forward was gated behind. Default on; set
+# ISS_WT_LOCAL_DECODE=1 to keep the local decode (e.g. for the iss quality gate).
+_PASSTHROUGH_LOCAL_DECODE = os.environ.get("ISS_WT_LOCAL_DECODE", "0") == "1"
 
 # Initial-burst re-arm: occasionally TCP negotiation fully succeeds and the
 # host accepts the canvas, but screensharingd never starts sending RTP -- a
@@ -1965,6 +1971,13 @@ class Session:
                 return
             self._rx_pkts_video += 1
             self._rx_bytes_video += len(pkt)
+            if _PROFILE_RX:
+                _now = time.monotonic()
+                _last = getattr(self, "_prof_last_rx", 0.0)
+                if _last and (_now - _last) * 1000 > 80:
+                    log.info("iss RTP RECV GAP %.0fms (bytes=%d)",
+                             (_now - _last) * 1000, len(pkt))
+                self._prof_last_rx = _now
             prev = src_seen.get(_addr, 0)
             src_seen[_addr] = prev + 1
             if prev == 0:
@@ -2115,16 +2128,41 @@ class Session:
             # dropped one.
             return
 
-        au_parts: list[bytes] = []
-        for nalu in nalus:
-            self._decoder.feed_nalu(nalu, ti, donl=donl)
-            if au_cb is not None:
-                au_parts.append(b"\x00\x00\x00\x01" + bytes(nalu))
-        if au_cb is not None and au_parts:
-            try:
-                au_cb(ti, key[1], b"".join(au_parts))
-            except Exception:
-                log.debug("video_au_callback raised", exc_info=True)
+        # Forward the raw AU to the browser BEFORE decoding it here. The browser
+        # frontend decodes in WebCodecs and does not consume iss's decode output
+        # — gating the forward behind self._decoder.feed_nalu() (a synchronous
+        # VideoToolbox decode that stalls ~250 ms once per second) is what made
+        # the browser frontend stutter at 1 Hz while the desktop frontend, which
+        # consumes the decode directly, stayed smooth. Decode after forwarding so
+        # iss's local decode (quality gate / recovery FIRs) no longer paces the
+        # browser's frames.
+        if au_cb is not None:
+            # AVC → browser pass-through. Forward the raw AU FIRST (lowest
+            # latency), then optionally decode locally. The browser decodes in
+            # WebCodecs, so iss's own decode is redundant here; skipping it
+            # halves decode CPU and removes the decode latency the forward used
+            # to sit behind. Advance the stall clock off the forward so
+            # _check_stall (which normally keys off decoded frames) still sees
+            # liveness — the meaningful "stall" for pass-through is AUs no longer
+            # arriving, not a local decoder freeze.
+            au_parts = [b"\x00\x00\x00\x01" + bytes(n) for n in nalus]
+            if au_parts:
+                try:
+                    au_cb(ti, key[1], b"".join(au_parts))
+                    # Advance the stall clock ONLY on a successful forward —
+                    # in pass-through this is the sole liveness signal (no local
+                    # decode), so a persistently-failing forward must let
+                    # _check_stall fire recovery instead of looking healthy.
+                    self._last_publish_t = time.monotonic()
+                    self._fresh_evt.set()
+                except Exception:
+                    log.debug("video_au_callback raised", exc_info=True)
+            if _PASSTHROUGH_LOCAL_DECODE:
+                for nalu in nalus:
+                    self._decoder.feed_nalu(nalu, ti, donl=donl)
+        else:
+            for nalu in nalus:
+                self._decoder.feed_nalu(nalu, ti, donl=donl)
 
     def _maybe_reharvest_avc_config(self, payloads: list[bytes]) -> None:
         """AVC post-resize reconfigure. Apple re-sends the 0x92 avcC config

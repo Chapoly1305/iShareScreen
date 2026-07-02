@@ -288,21 +288,58 @@ async function main() {
     return;
   }
 
+  // Safari (incl. iOS) reliably exposes GestureEvent; Chrome/Edge/Firefox
+  // don't. WebKit deliberately does NOT implement serverCertificateHashes,
+  // so Safari can only do WebTransport against a cert the system trusts.
+  const ua = navigator.userAgent;
+  const isSafari = (typeof window.GestureEvent !== "undefined") ||
+    (/safari/i.test(ua) && !/chrome|chromium|crios|edg|fxios|android|opr/i.test(ua));
+  let safariTrusted = false;
+  let singleStream = false;
+  try {
+    const cfg = await (await fetch("/wt-config")).json();
+    safariTrusted = !!cfg.safariTrusted;
+    singleStream = !!cfg.videoSingleStream;
+  } catch (e) { /* older server without /wt-config — assume not trusted */ }
+
+  if (isSafari && !safariTrusted) {
+    setStatus(
+      "Safari can't use this tool's self-signed certificate — WebKit doesn't " +
+      "support serverCertificateHashes. Restart iss with --trust-cert-for-safari " +
+      "(one-time keychain prompt), or open this URL in Chrome, Edge, or Firefox.",
+      "err",
+    );
+    srvLog("error", "Safari without a keychain-trusted cert — refusing to connect");
+    return;
+  }
+
   // WebTransport is on the SAME host:port as the HTTP page but on UDP
-  // (HTTP/3 over QUIC). Browsers route to it by the https:// scheme +
-  // serverCertificateHashes for the self-signed cert.
+  // (HTTP/3 over QUIC). Chrome/Edge/Firefox authenticate the self-signed
+  // cert via serverCertificateHashes. Safari (with --trust-cert-for-safari)
+  // ignores hashes and validates against the keychain-trusted cert, so we
+  // omit the option entirely for it.
   const wtUrl = `https://${location.host}/wt`;
   setStatus("opening WebTransport…");
-  srvLog("info", `WT connect: ${wtUrl} hash=${certHash}`);
-  const wt = new WebTransport(wtUrl, {
-    serverCertificateHashes: [{
-      algorithm: "sha-256",
-      value: hexToBytes(certHash),
-    }],
-  });
+  const useHashes = !(isSafari && safariTrusted);
+  srvLog("info", `WT connect: ${wtUrl} ${useHashes ? "hash=" + certHash : "(keychain trust)"}`);
+  const wt = useHashes
+    ? new WebTransport(wtUrl, {
+        serverCertificateHashes: [{
+          algorithm: "sha-256",
+          value: hexToBytes(certHash),
+        }],
+      })
+    : new WebTransport(wtUrl);
+  // Diagnostic: the session-close reason carries the real cause when
+  // wt.ready rejects with a generic WebTransportError (e.g. a SETTINGS
+  // mismatch shows up as the close code/reason, not in .message).
+  wt.closed
+    .then((info) => srvLog("info", `WT closed: ${JSON.stringify(info)}`))
+    .catch((e) => srvLog("error",
+      `WT closed-err: name=${e.name} msg=${e.message} source=${e.source} streamErrorCode=${e.streamErrorCode}`));
   try { await wt.ready; }
   catch (e) {
-    const msg = `WT failed: ${e.message || e}`;
+    const msg = `WT failed: name=${e.name} msg=${e.message || e} source=${e.source} streamErrorCode=${e.streamErrorCode}`;
     srvLog("error", msg);
     setStatus(msg, "err");
     return;
@@ -343,13 +380,21 @@ async function main() {
   // forward order (per-frame QUIC streams have no cross-stream ordering).
   let nextSeq = -1;
   const pending = new Map();  // seq -> {isKey, tileId, payload}
-  const REORDER_GAP_MAX = 24;
+  const REORDER_GAP_MAX = 6;          // count budget — was 24 (~400ms worst-case stall)
+  const REORDER_GAP_MAX_MS = 45;      // ...or skip ahead after this long stuck on a gap
+  let gapSince = 0;
   let videoTs = 0;            // synthetic monotonic decode timestamp (µs)
 
   // Render at the display's vsync, NOT at the decoder's (irregular, bursty)
   // output cadence — drawing straight from the output callback races the
   // compositor and shows up as stutter/tear during motion. Stash the latest
   // frame per tile and paint them together in requestAnimationFrame.
+  // Opt-in pipeline profiling (?prof=1): arrival intervals (jitter source),
+  // decoded vs painted (skip rate), paint intervals. Read via window.__prof.
+  const PROF = new URLSearchParams(location.search).has("prof");
+  window.__prof = PROF ? { arr: [], paint: [], decoded: 0, painted: 0 } : null;
+  let __lastArr = 0, __lastPaint = 0;
+
   const pendingFrames = [];   // tile_id -> latest undrawn VideoFrame
   let rafScheduled = false;
   function drawPending() {
@@ -362,6 +407,12 @@ async function main() {
         const yOff = tid * slotHeight;
         const dh = Math.min(frame.codedHeight, canvas.height - yOff);
         if (dh > 0) ctx.drawImage(frame, 0, 0, frame.codedWidth, dh, 0, yOff, frame.codedWidth, dh);
+        if (PROF) {
+          const n = performance.now();
+          if (__lastPaint) window.__prof.paint.push(n - __lastPaint);
+          __lastPaint = n; window.__prof.painted++;
+          if (window.__prof.paint.length > 3000) window.__prof.paint.shift();
+        }
       } finally { frame.close(); }
     }
   }
@@ -377,6 +428,7 @@ async function main() {
         pendingFrames[tid] = frame;
         if (!rafScheduled) { rafScheduled = true; requestAnimationFrame(drawPending); }
         decoded++;
+        if (PROF) window.__prof.decoded++;
       },
       error: (e) => {
         lastDecoderError = e.message || String(e);
@@ -421,15 +473,22 @@ async function main() {
     while (pending.has(nextSeq)) {
       feedAU(pending.get(nextSeq)); pending.delete(nextSeq);
       nextSeq = (nextSeq + 1) >>> 0;
+      gapSince = 0;
     }
-    // If the head seq never arrives (dropped frame), don't stall forever: once
-    // the backlog exceeds the gap budget, skip ahead to the oldest buffered seq.
-    if (pending.size > REORDER_GAP_MAX) {
-      let mn = Infinity; for (const k of pending.keys()) if (k < mn) mn = k;
-      nextSeq = mn;
-      while (pending.has(nextSeq)) {
-        feedAU(pending.get(nextSeq)); pending.delete(nextSeq);
-        nextSeq = (nextSeq + 1) >>> 0;
+    // Head seq is missing (late/dropped stream). Don't stall waiting on it: skip
+    // ahead to the oldest buffered seq once the backlog passes the COUNT budget
+    // OR the gap has persisted past the TIME budget — whichever first. Bounds one
+    // late frame to a <=45ms hitch instead of the old ~400ms (24-frame) stall.
+    if (pending.size) {
+      if (!gapSince) gapSince = performance.now();
+      if (pending.size > REORDER_GAP_MAX ||
+          performance.now() - gapSince > REORDER_GAP_MAX_MS) {
+        let mn = Infinity; for (const k of pending.keys()) if (k < mn) mn = k;
+        nextSeq = mn; gapSince = 0;
+        while (pending.has(nextSeq)) {
+          feedAU(pending.get(nextSeq)); pending.delete(nextSeq);
+          nextSeq = (nextSeq + 1) >>> 0;
+        }
       }
     }
   }
@@ -438,6 +497,16 @@ async function main() {
     if (au.isKey) awaitingKey = false;
     if (awaitingKey) return;
     frames++;
+    if (PROF) {
+      const n = performance.now();
+      if (__lastArr) {
+        const gap = n - __lastArr;
+        window.__prof.arr.push(gap);
+        if (gap > 80) srvLog("info", `ARRIVAL GAP ${gap.toFixed(0)}ms`);
+        if (window.__prof.arr.length > 3000) window.__prof.arr.shift();
+      }
+      __lastArr = n;
+    }
     routeFifo.push(au.tileId);
     try {
       decoder.decode(new EncodedVideoChunk({
@@ -789,7 +858,13 @@ async function main() {
     }
   }
   async function resumeAudioOnGesture() {
-    if (!audioCtx || audioCtx.state !== "suspended" || audioPendingResume) return;
+    // Only unlock on a gesture when the user actually wants audio (unmuted).
+    // While muted the context is intentionally suspended, so resuming it on
+    // every keystroke just flip-flops suspended→running and spams the log
+    // (each keystroke is a "user gesture"). The unmute button's own click
+    // gesture resumes it when the user opts in.
+    if (!audioCtx || !audioIntent || audioCtx.state !== "suspended"
+        || audioPendingResume) return;
     audioPendingResume = true;
     try {
       await audioCtx.resume();
@@ -899,19 +974,70 @@ async function main() {
     }
   })().catch(e => srvLog("error", `datagram reader: ${e.message || e}`));
 
-  // The server opens a fresh unidirectional stream PER FRAME. Each stream's
-  // body is one envelope: [tag][tile][seq:4][ts:8][payload] (tag 0=delta,
-  // 1=key, 3=config, 4=cursor). A stream-per-frame lets a behind client back
-  // up at QUIC's stream-count limit, so the server drops the newest frames
-  // rather than buffering unboundedly — that bounds end-to-end latency. (A
-  // single persistent stream buffers forever: latency creeps up until a
-  // keyframe head-of-line stall flushes it = a periodic freeze.)
+  // Dispatch one envelope ([tag][tile][seq:4][ts:8][payload]; tag 0=delta,
+  // 1=key, 3=config, 4=cursor). `ordered`=true (single-stream) feeds the
+  // decoder directly; false (per-frame) buffers by seq so drainReorder() can
+  // restore order across out-of-order streams.
+  function handleEnvelope(fbuf, ordered) {
+    if (fbuf.length < 14) return;
+    const tag = fbuf[0];
+    const seq = (fbuf[2] * 0x1000000) + (fbuf[3] << 16) + (fbuf[4] << 8) + fbuf[5];
+    const payload = fbuf.subarray(14);
+    if (tag === 3) {               // config
+      try { applyConfig(JSON.parse(new TextDecoder().decode(payload))); }
+      catch (e) { srvLog("error", `bad config: ${e}`); }
+      return;
+    }
+    if (tag === 4) { applyCursor(payload); return; }  // enc-1104 cursor
+    if (tag !== 0 && tag !== 1) return;
+    if (!decoder) return;          // config not seen yet
+    if (ordered) {
+      feedAU({ seq, isKey: tag === 1, tileId: fbuf[1], payload });
+    } else {
+      pending.set(seq, { seq, isKey: tag === 1, tileId: fbuf[1], payload });
+      drainReorder();
+    }
+  }
+
+  if (singleStream) {
+    // SINGLE-STREAM mode: the server sends every envelope length-prefixed
+    // ([u32 len][envelope]) on ONE long-lived uni stream. It's ordered, so we
+    // feed the decoder directly — no reorder buffer, 1 stream credit (Safari).
+    srvLog("info", "video transport: single-stream");
+    const { value: stream } = await reader.read();
+    if (stream) {
+      const r = stream.getReader();
+      let buf = new Uint8Array(0);
+      while (true) {
+        const { value, done } = await r.read();
+        if (done) break;
+        bytesReceived += value.byteLength;
+        const nb = new Uint8Array(buf.length + value.byteLength);
+        nb.set(buf); nb.set(value, buf.length); buf = nb;
+        let off = 0;
+        while (buf.length - off >= 4) {
+          const len = (buf[off] * 0x1000000) + (buf[off + 1] << 16) +
+                      (buf[off + 2] << 8) + buf[off + 3];
+          if (buf.length - off - 4 < len) break;   // wait for the rest
+          handleEnvelope(buf.subarray(off + 4, off + 4 + len), true);
+          off += 4 + len;
+        }
+        if (off > 0) buf = buf.subarray(off);
+      }
+    }
+    setStatus("WT closed", "err");
+    return;
+  }
+
+  // PER-FRAME mode (default): the server opens a fresh uni stream per frame.
+  // A behind client backs up at QUIC's stream-count limit so the server drops
+  // newest frames rather than buffering unboundedly (bounds latency). Streams
+  // can surface out of order → drainReorder() restores seq order.
   while (true) {
     const { value: stream, done } = await reader.read();
     if (done) break;
     // Read each stream fully, SERIALLY (await): the shared decoder must be fed
-    // in the server's forward order. drainReorder() restores order by seq if
-    // streams surface out of order.
+    // in the server's forward order.
     await (async (s) => {
       const chunks = [];
       let total = 0;
@@ -927,19 +1053,7 @@ async function main() {
       const fbuf = new Uint8Array(total);
       let off = 0;
       for (const c of chunks) { fbuf.set(c, off); off += c.byteLength; }
-      const tag = fbuf[0];
-      const seq = (fbuf[2] * 0x1000000) + (fbuf[3] << 16) + (fbuf[4] << 8) + fbuf[5];
-      const payload = fbuf.subarray(14);
-      if (tag === 3) {             // config
-        try { applyConfig(JSON.parse(new TextDecoder().decode(payload))); }
-        catch (e) { srvLog("error", `bad config: ${e}`); }
-        return;
-      }
-      if (tag === 4) { applyCursor(payload); return; }  // enc-1104 cursor
-      if (tag !== 0 && tag !== 1) return;
-      if (!decoder) return;        // config not seen yet
-      pending.set(seq, { seq, isKey: tag === 1, tileId: fbuf[1], payload });
-      drainReorder();
+      handleEnvelope(fbuf, false);
     })(stream);
   }
   setStatus("WT closed", "err");
