@@ -683,15 +683,20 @@ def run(
                 _ws = glfw.get_window_size(glfw_window)
             except Exception:
                 _fb = _ws = (0, 0)
+            _cd = renderer.content_dims()
             _geom = (target.width, target.height, _fb[0], _fb[1], _ws[0], _ws[1],
                      renderer._w, renderer._h)
-            if _geom != _geom_last[0]:
-                _geom_last[0] = _geom
-                _cd = renderer.content_dims()
+            # Re-log when content/uv/tile-packing changes too (populates AFTER
+            # the first upload), so the per-tile diagnostics are actually captured.
+            _key = _geom + (_cd, renderer._dbg_uv, tuple(sorted(renderer._dbg_tiles.items())))
+            if _key != _geom_last[0]:
+                _geom_last[0] = _key
                 log.info(
                     "render-geom: surface=%dx%d framebuffer=%dx%d window=%dx%d "
-                    "canvas=%dx%d content=%dx%d",
+                    "canvas=%dx%d content=%dx%d | tiles=%d slot_h=%d uv_scale=%s "
+                    "per-tile{idx:(w,h,slot,origin_y,rows)}=%s",
                     *_geom, _cd[0], _cd[1],
+                    num_tiles, slot_h, renderer._dbg_uv, dict(renderer._dbg_tiles),
                 )
             renderer.draw(target.create_view(), target.width, target.height)
         except Exception as e:

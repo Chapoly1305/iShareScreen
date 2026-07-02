@@ -200,6 +200,11 @@ class Renderer:
         # padding and letterbox the real frame.
         self._content_w = 0
         self._content_h = 0
+        # Diagnostics: last uv_scale written + per-tile upload extents, so the
+        # render-geom trace can show WHERE decoded rows actually land (the outer
+        # surface/canvas dims look healthy even when tile packing is wrong).
+        self._dbg_uv = (1.0, 1.0)
+        self._dbg_tiles: dict = {}
 
         # Two chroma layouts are supported and chosen per session from the
         # first uploaded tile (see `upload_tile`):
@@ -461,6 +466,8 @@ class Renderer:
             self._content_w = w
         if origin_y + rows > self._content_h:
             self._content_h = origin_y + rows
+        # Diagnostics: how this tile actually landed in the texture.
+        self._dbg_tiles[tile_index] = (w, tile.height, slot_height, origin_y, rows)
 
         y = np.frombuffer(tile.y, dtype=np.uint8)
         if tile.y_stride == w:
@@ -622,6 +629,7 @@ class Renderer:
         # on either axis independently.
         ux = cw / self._w if self._w else 1.0
         uy = ch / self._h if self._h else 1.0
+        self._dbg_uv = (round(ux, 3), round(uy, 3))
         # chroma_scale = uv_scale shrunk by the chroma subsample ratio
         # (== uv_scale for 4:4:4, half for 4:2:0). The half-res chroma is
         # written into the top-left of the full-size U/V textures, so the
