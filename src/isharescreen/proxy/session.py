@@ -3304,8 +3304,10 @@ class Session:
             f"{t:02x}:{n}" for t, n in sorted(self._rx_msg_type_counts.items())
         )
         decoder_name = self._decoder._hw_name or "software"
+        # SSRCs-per-group = tiles (4 for HEVC tiled, 1 for AVC/browser single
+        # picture); hardcoding 4 made ssrc_groups read 0 on the 1-tile stream.
         ssrc_groups = (
-            len(self._video_decryptor.ssrc_counts) // 4
+            len(self._video_decryptor.ssrc_counts) // max(1, self.num_tiles)
             if self._video_decryptor else 0
         )
         last_publish_age = (
