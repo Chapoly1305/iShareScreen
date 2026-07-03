@@ -56,6 +56,12 @@ _RESIZE_DEBOUNCE_S = 0.5        # window must hold a new size this long
 _RESIZE_MIN_DELTA_PX = 32       # ignore sub-threshold jitter on either axis
 _RESIZE_MIN_INTERVAL_S = 2.5    # floor between consecutive resize requests
 _MIN_ADVERTISE_W = 640
+
+# Scroll-wheel: base amplification applied to EVERY scroll (on top of the
+# speed-based curve below), so a normal deliberate scroll isn't glacial. The
+# host gets `ticks` wheel press/release pairs; 1 tick per notch feels far too
+# slow, so scale each notch up (3× tuned to feel like native scroll).
+_WHEEL_MULT = 3.0
 _MIN_ADVERTISE_H = 480
 _MAX_ADVERTISE_W = 1920  # server backing 3840 / mode-table ratio 2
 _MAX_ADVERTISE_H = 1080
@@ -490,22 +496,23 @@ def run(
         now = time.monotonic() * 1000.0  # ms
         dt = now - _wheel_last_t[0]
         _wheel_last_t[0] = now
-        if dt < 25:    mult = 10.0
-        elif dt < 50:  mult = 6.0
-        elif dt < 100: mult = 3.5
-        elif dt < 200: mult = 2.0
-        elif dt < 350: mult = 1.4
-        else:          mult = 1.0
-        # glfw's dy is in wheel ticks already (1.0 per notch on a
-        # discrete wheel; fractional on trackpads). `scroll_event`
-        # interprets dy<0 as scroll-up.
-        _wheel_accum[0] += -dy * mult
-        ticks = int(_wheel_accum[0])
+        if dt < 25:    accel = 10.0
+        elif dt < 50:  accel = 6.0
+        elif dt < 100: accel = 3.5
+        elif dt < 200: accel = 2.0
+        elif dt < 350: accel = 1.4
+        else:          accel = 1.0
+        # glfw's dy is in wheel ticks (1.0 per notch on a discrete wheel;
+        # fractional on trackpads / high-res wheels). Apply a base multiplier
+        # (so even a slow, deliberate scroll advances several ticks) times the
+        # speed curve, and ACCUMULATE the fraction across events — never reset
+        # it, or sub-tick motion from a high-res wheel is thrown away and the
+        # scroll can never build past 1 tick. `scroll_event` reads dy<0 as up.
+        _wheel_accum[0] += -dy * _WHEEL_MULT * accel
+        ticks = int(_wheel_accum[0])      # truncate toward zero
+        _wheel_accum[0] -= ticks          # keep the remainder for next event
         if ticks == 0:
-            ticks = -1 if dy > 0 else 1
-            _wheel_accum[0] = 0.0
-        else:
-            _wheel_accum[0] -= ticks
+            return                        # nothing whole yet — let it build up
         ticks = max(-50, min(50, ticks))
         session.input.scroll_event(cursor[0], cursor[1], 0, ticks)
 
