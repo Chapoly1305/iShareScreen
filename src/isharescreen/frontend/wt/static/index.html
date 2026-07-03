@@ -301,6 +301,17 @@ async function main() {
     safariTrusted = !!cfg.safariTrusted;
     singleStream = !!cfg.videoSingleStream;
   } catch (e) { /* older server without /wt-config — assume not trusted */ }
+  // Safari grants only ~100 WebTransport uni-stream credits and we don't send
+  // capsules to replenish them, so the one-stream-per-frame default would stall
+  // after a second or two. Force the single-long-lived-stream transport for
+  // Safari (Chrome/Edge/Firefox keep the per-frame path). The server picks the
+  // matching send path per-viewer from the ?transport query below.
+  if (isSafari) singleStream = true;
+  // Explicit override for testing/tuning: ?transport=single|perframe wins over
+  // the auto choice above (server reads the same choice from the CONNECT path).
+  const tsp = new URLSearchParams(location.search).get("transport");
+  if (tsp === "single") singleStream = true;
+  else if (tsp === "perframe" || tsp === "per-frame") singleStream = false;
 
   if (isSafari && !safariTrusted) {
     setStatus(
@@ -318,7 +329,8 @@ async function main() {
   // cert via serverCertificateHashes. Safari (with --trust-cert-for-safari)
   // ignores hashes and validates against the keychain-trusted cert, so we
   // omit the option entirely for it.
-  const wtUrl = `https://${location.host}/wt`;
+  const wtUrl = `https://${location.host}/wt` +
+    (singleStream ? "?transport=single" : "");
   setStatus("opening WebTransport…");
   const useHashes = !(isSafari && safariTrusted);
   srvLog("info", `WT connect: ${wtUrl} ${useHashes ? "hash=" + certHash : "(keychain trust)"}`);
@@ -393,6 +405,10 @@ async function main() {
   // decoded vs painted (skip rate), paint intervals. Read via window.__prof.
   const PROF = new URLSearchParams(location.search).has("prof");
   window.__prof = PROF ? { arr: [], paint: [], decoded: 0, painted: 0 } : null;
+  // Latency probe: drift between the source frame timestamp (envelope ts_us)
+  // and local receive time. Absolute value has a clock offset, but its GROWTH
+  // over the session = accumulating transport latency (immune to rAF throttle).
+  window.__lat = PROF ? { base: null, cur: 0, n: 0 } : null;
   let __lastArr = 0, __lastPaint = 0;
 
   const pendingFrames = [];   // tile_id -> latest undrawn VideoFrame
@@ -594,19 +610,30 @@ async function main() {
   // line blocking on the reliable bidi stream which carries
   // keystrokes / button clicks. Coalesced to vsync (~60Hz when
   // moving) so we don't flood the wire on every pointer event.
-  const dgWriter = wt.datagrams.writable.getWriter();
+  // Safari's WebTransport doesn't expose a datagram writer, so feature-detect
+  // it. When present (Chrome/Edge/Firefox) moves go via datagrams; when absent
+  // (Safari) fall back to the SAME {type:"mouse"} JSON on the reliable input
+  // stream that clicks already use — the server dispatches both identically.
+  // Either way moves are coalesced to vsync below, so the stream isn't flooded.
+  const dgrams = wt.datagrams;
+  const dgWriter = (dgrams && dgrams.writable) ? dgrams.writable.getWriter() : null;
+  if (!dgWriter) srvLog("info", "no datagram writer (Safari) — mouse moves go over the input stream");
   let pendingMove = null;
   function flushMove() {
     if (pendingMove !== null) {
-      // 13-byte fixed-format mouse-move datagram.
-      // [type=0x10][buttons:u32 BE][x:i32 BE][y:i32 BE]
-      const buf = new ArrayBuffer(13);
-      const v = new DataView(buf);
-      v.setUint8(0, 0x10);
-      v.setUint32(1, buttonMask >>> 0);
-      v.setInt32(5, pendingMove[0]);
-      v.setInt32(9, pendingMove[1]);
-      dgWriter.write(new Uint8Array(buf)).catch(() => {});
+      if (dgWriter) {
+        // 13-byte fixed-format mouse-move datagram.
+        // [type=0x10][buttons:u32 BE][x:i32 BE][y:i32 BE]
+        const buf = new ArrayBuffer(13);
+        const v = new DataView(buf);
+        v.setUint8(0, 0x10);
+        v.setUint32(1, buttonMask >>> 0);
+        v.setInt32(5, pendingMove[0]);
+        v.setInt32(9, pendingMove[1]);
+        dgWriter.write(new Uint8Array(buf)).catch(() => {});
+      } else {
+        send({type: "mouse", buttons: buttonMask, x: pendingMove[0], y: pendingMove[1]});
+      }
       pendingMove = null;
     }
     requestAnimationFrame(flushMove);
@@ -936,7 +963,12 @@ async function main() {
   // Runs in parallel with the stream reader. NEVER blocks — drops
   // audio packets that arrive before the decoder is ready.
   (async () => {
-    const dgReader = wt.datagrams.readable.getReader();
+    const dgIn = wt.datagrams;
+    if (!dgIn || !dgIn.readable) {
+      srvLog("info", "no datagram reader (Safari) — audio-over-datagram disabled");
+      return;
+    }
+    const dgReader = dgIn.readable.getReader();
     let audioDropped = 0;
     while (true) {
       const { value: buf, done } = await dgReader.read();
@@ -982,6 +1014,15 @@ async function main() {
     if (fbuf.length < 14) return;
     const tag = fbuf[0];
     const seq = (fbuf[2] * 0x1000000) + (fbuf[3] << 16) + (fbuf[4] << 8) + fbuf[5];
+    if (window.__lat && (tag === 0 || tag === 1)) {
+      const hi = ((fbuf[6] * 0x1000000) + (fbuf[7] << 16) + (fbuf[8] << 8) + fbuf[9]) >>> 0;
+      const lo = ((fbuf[10] * 0x1000000) + (fbuf[11] << 16) + (fbuf[12] << 8) + fbuf[13]) >>> 0;
+      const tsMs = (hi * 4294967296 + lo) / 1000;   // ts_us → ms
+      const drift = performance.now() - tsMs;
+      if (window.__lat.base === null) window.__lat.base = drift;
+      window.__lat.cur = drift - window.__lat.base;  // added latency vs first frame
+      window.__lat.n++;
+    }
     const payload = fbuf.subarray(14);
     if (tag === 3) {               // config
       try { applyConfig(JSON.parse(new TextDecoder().decode(payload))); }
@@ -1001,28 +1042,54 @@ async function main() {
 
   if (singleStream) {
     // SINGLE-STREAM mode: the server sends every envelope length-prefixed
-    // ([u32 len][envelope]) on ONE long-lived uni stream. It's ordered, so we
+    // ([u32 len][envelope]) on a long-lived uni stream. It's ordered, so we
     // feed the decoder directly — no reorder buffer, 1 stream credit (Safari).
+    // The server RESETs that stream and opens a fresh one to discard a stale
+    // backlog (bounds latency), so we loop: when the current stream ends or is
+    // reset, drop its partial buffer and pick up the next incoming stream (a
+    // keyframe resyncs the decoder). Only a WT session close ends the loop.
     srvLog("info", "video transport: single-stream");
-    const { value: stream } = await reader.read();
-    if (stream) {
+    while (true) {
+      const { value: stream, done: outerDone } = await reader.read();
+      if (outerDone) break;              // session closed
+      if (!stream) continue;
       const r = stream.getReader();
-      let buf = new Uint8Array(0);
-      while (true) {
-        const { value, done } = await r.read();
-        if (done) break;
-        bytesReceived += value.byteLength;
-        const nb = new Uint8Array(buf.length + value.byteLength);
-        nb.set(buf); nb.set(value, buf.length); buf = nb;
-        let off = 0;
-        while (buf.length - off >= 4) {
-          const len = (buf[off] * 0x1000000) + (buf[off + 1] << 16) +
-                      (buf[off + 2] << 8) + buf[off + 3];
-          if (buf.length - off - 4 < len) break;   // wait for the rest
-          handleEnvelope(buf.subarray(off + 4, off + 4 + len), true);
-          off += 4 + len;
+      // Amortized-O(n) accumulator: a growable buffer with a read pointer,
+      // compacted with copyWithin. The old code re-copied the ENTIRE pending
+      // buffer on every QUIC chunk — O(n^2), and a 4K keyframe split over ~700
+      // chunks meant hundreds of MB of copying per frame, so the read loop
+      // couldn't keep up with the source and latency grew without bound. Each
+      // envelope payload is consumed synchronously (EncodedVideoChunk /
+      // JSON.parse copy their data), so reusing the backing buffer is safe.
+      let buf = new Uint8Array(1 << 16);
+      let len = 0, rp = 0;
+      try {
+        while (true) {
+          const { value, done } = await r.read();
+          if (done) break;
+          bytesReceived += value.byteLength;
+          if (len + value.byteLength > buf.length) {
+            if (rp > 0) { buf.copyWithin(0, rp, len); len -= rp; rp = 0; }
+            if (len + value.byteLength > buf.length) {
+              let cap = buf.length;
+              while (cap < len + value.byteLength) cap *= 2;
+              const nb = new Uint8Array(cap); nb.set(buf.subarray(0, len)); buf = nb;
+            }
+          }
+          buf.set(value, len); len += value.byteLength;
+          while (len - rp >= 4) {
+            const l = (buf[rp] * 0x1000000) + (buf[rp + 1] << 16) +
+                      (buf[rp + 2] << 8) + buf[rp + 3];
+            if (len - rp - 4 < l) break;   // wait for the rest
+            handleEnvelope(buf.subarray(rp + 4, rp + 4 + l), true);
+            rp += 4 + l;
+          }
+          if (rp > (1 << 20)) { buf.copyWithin(0, rp, len); len -= rp; rp = 0; }
         }
-        if (off > 0) buf = buf.subarray(off);
+      } catch (e) {
+        // Server RESET this stream to shed a stale backlog — expected. Discard
+        // the partial buffer and fall through to read the fresh stream.
+        srvLog("info", "single-stream reset — resyncing on next stream");
       }
     }
     setStatus("WT closed", "err");
