@@ -1253,9 +1253,11 @@ class Session:
 
         Apple's daemon depends on the audio section being present in the 0x1c
         (without it the encoder-canvas reply degenerates and no burst
-        arrives), so we always send a valid audio offer; `cfg.audio=False`
-        only skips local decode + playback."""
-        video_offer, audio_offer = create_offers()
+        arrives), so we always send a valid audio offer. When `cfg.audio` is
+        False we additionally gate the server's audio transmitter off via the
+        audio-description field4 (see offers._build_mediablob) so no audio
+        flows on the wire — not just skipping local decode + playback."""
+        video_offer, audio_offer = create_offers(audio_enabled=cfg.audio)
         # Stash for mid-session 0x1c re-offers (dynamic resolution).
         self._video_offer = video_offer
         self._audio_offer = audio_offer
@@ -2886,7 +2888,7 @@ class Session:
             vo = getattr(self, '_video_offer', None)
             ao = getattr(self, '_audio_offer', None)
             if vo is None or ao is None:
-                vo, ao = create_offers()
+                vo, ao = create_offers(audio_enabled=self._config.audio)
             msg_1c = build_0x1c(
                 ao, vo, neg.keys,
                 alt_session=self._config.alt_session,

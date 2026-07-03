@@ -179,9 +179,21 @@ _REMOTE_ENDPOINT_INFO = _build_remote_endpoint_info()
 
 # ── offer construction ───────────────────────────────────────────────
 
-def _build_mediablob(mode: int, session_id: int, timestamp: int) -> bytes:
+# Audio-description field4 gate values (see the mode-8 branch below for the
+# full RE note). Apple's default 24191 selects the single system-audio tier;
+# a sub-floor value makes the server send no audio, which is how --no-audio
+# turns audio off on the wire.
+_AUDIO_F4_ON = 24191
+_AUDIO_F4_OFF = 1000
+
+
+def _build_mediablob(
+    mode: int, session_id: int, timestamp: int, *, audio_enabled: bool = True,
+) -> bytes:
     """Build the MediaBlob protobuf. mode 7 = video, mode 8 = audio. Output
-    matches Apple's createOffer modulo the dynamic fields."""
+    matches Apple's createOffer modulo the dynamic fields. `audio_enabled`
+    only affects mode 8: when False, the audio-stream gate (field4) is set
+    below the server's tier floor so no audio is transmitted."""
     if mode == 7:
         res_entry = _field_varint(1, 1) + _field_varint(2, 1) + _field_varint(3, 50115) + _field_varint(4, 0)
         res_entry_alt = _field_varint(1, 1) + _field_varint(2, 2) + _field_varint(3, 50115) + _field_varint(4, 0)
@@ -243,9 +255,25 @@ def _build_mediablob(mode: int, session_id: int, timestamp: int) -> bytes:
         )
         desc_field = _field_bytes(5, desc)
     elif mode == 8:
+        # field4 is the viewer's requested audio bitrate — Apple's
+        # `preferredMediaBitRate` (reversed from AVConference). The host parses
+        # it into the negotiated AVCAudioStreamConfig and feeds it to
+        # `VCAudioTierPicker tierForAudioBitrate:`, which selects an AAC-ELD
+        # tier. For screen-share system audio there is effectively ONE tier
+        # (~21 kbps), so any value above its floor gives a flat 21 kbps (Apple's
+        # own client sends 24191); this is NOT a proportional bitrate. But a
+        # value BELOW the tier floor makes the picker find "no corresponding
+        # tier" and the host sends no audio (~0.4 kbps residual). A live sweep
+        # put the floor at ~5 kbps (<=4000 = off, >=6000 = on). This is the only
+        # negotiated audio knob: the audio section is mandatory (omitting it
+        # degenerates negotiation) and screen-share audio has no direction/enable
+        # field, so honoring --no-audio means requesting a sub-floor bitrate.
+        # ISS_AUDIO_F4 overrides for testing.
+        _default_f4 = _AUDIO_F4_ON if audio_enabled else _AUDIO_F4_OFF
+        _af4 = int(_os.environ.get("ISS_AUDIO_F4", str(_default_f4)))
         desc = (
             _field_varint(1, session_id) + _field_varint(2, 0)
-            + _field_varint(3, 0) + _field_varint(4, 24191)
+            + _field_varint(3, 0) + _field_varint(4, _af4)
             + _field_varint(5, 0) + _field_varint(6, 0)
         )
         desc_field = _field_bytes(3, desc)
@@ -263,14 +291,17 @@ def _build_mediablob(mode: int, session_id: int, timestamp: int) -> bytes:
     )
 
 
-def create_offers() -> tuple[bytes, bytes]:
+def create_offers(*, audio_enabled: bool = True) -> tuple[bytes, bytes]:
     """Generate fresh (video, audio) offer plists. Each call produces a new
-    session_id, timestamp, and CallID UUID."""
+    session_id, timestamp, and CallID UUID. `audio_enabled=False` builds an
+    audio offer that negotiates the stream (the daemon requires the section)
+    but gates the server's audio transmitter off — see `_build_mediablob`."""
 
     def _plist(mode: int) -> bytes:
         session_id = secrets.randbits(32)
         timestamp = time.time_ns()
-        blob = _build_mediablob(mode, session_id, timestamp)
+        blob = _build_mediablob(
+            mode, session_id, timestamp, audio_enabled=audio_enabled)
         plist = {
             "avcMediaStreamOptionRemoteEndpointInfo": _REMOTE_ENDPOINT_INFO,
             "avcMediaStreamNegotiatorMode": mode,

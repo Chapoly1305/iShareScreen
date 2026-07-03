@@ -436,7 +436,7 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
   <div class="card"><h3 title="Inbound and outbound packet activity.">Network in</h3>
    <div class="kv" data-tip="Inbound video packet rate / bitrate. Drops to near zero on a static screen — that is NORMAL, not a stall. Sustained 0 while the screen is actively changing = a real stall: try Force IDR, then Reconnect.">
      <span>Video</span><b id="n_vid">—</b></div>
-   <div class="kv" data-tip="Inbound system-audio stream (AAC-ELD-SBR) from the host. macOS screen-share always sends this — ~100 pps / ~21 kbps even in silence (no silence suppression / DTX), so a constant idle rate here is NORMAL, not a leak. It cannot be turned off client-side; --no-audio only stops local playback.">
+   <div class="kv" data-tip="Inbound system-audio stream (AAC-ELD-SBR) from the host. With audio enabled, macOS screen-share sends this continuously — ~100 pps / ~21 kbps even in silence (no silence suppression / DTX), so a constant idle rate here is NORMAL, not a leak. --no-audio turns it off at the SOURCE (the offer gates the host's audio transmitter below its tier floor): the rate drops to ~0.4 kbps (2 pps residual), not just muting local playback.">
      <span>Audio</span><b id="n_audio">—</b></div>
    <div class="kv" data-tip="Inbound RTCP feedback (sender reports) from the host — a few pps, muxed on the audio socket. Near-zero is fine.">
      <span>RTCP</span><b id="n_rtcp">—</b></div>
