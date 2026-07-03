@@ -1162,9 +1162,14 @@ async function main() {
   while (true) {
     const { value: stream, done } = await reader.read();
     if (done) break;
-    // Read each stream fully, SERIALLY (await): the shared decoder must be fed
-    // in the server's forward order.
-    await (async (s) => {
+    // Read each stream in its OWN task — do NOT await it here. If we awaited,
+    // a single stalled stream (opened but slow/never-FIN'd, which Safari does
+    // during a host stall) would block the outer loop from pulling ANY later
+    // stream — including the resume keyframe — so the stream would never
+    // recover (Chrome delivered FINs promptly and hid this; Safari didn't).
+    // Concurrent reads are safe because drainReorder() restores the server's
+    // forward order by sequence number regardless of completion order.
+    (async (s) => {
       const chunks = [];
       let total = 0;
       const r = s.getReader();
@@ -1180,7 +1185,9 @@ async function main() {
       let off = 0;
       for (const c of chunks) { fbuf.set(c, off); off += c.byteLength; }
       handleEnvelope(fbuf, false);
-    })(stream);
+    })(stream).catch(() => {});  // a per-stream reset/abort is harmless — the
+    // stream is now unawaited, so swallow it here (drainReorder covers the gap)
+    // rather than leak an unhandled rejection.
   }
   setStatus("WT closed", "err");
 }
