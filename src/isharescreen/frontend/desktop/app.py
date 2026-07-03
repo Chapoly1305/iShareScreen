@@ -509,12 +509,17 @@ def run(
         # it, or sub-tick motion from a high-res wheel is thrown away and the
         # scroll can never build past 1 tick. `scroll_event` reads dy<0 as up.
         _wheel_accum[0] += -dy * _WHEEL_MULT * accel
-        ticks = int(_wheel_accum[0])      # truncate toward zero
-        _wheel_accum[0] -= ticks          # keep the remainder for next event
+        # Cap the pending magnitude so a single violent flick doesn't leave a
+        # long tail of catch-up events, then emit at most 50 ticks this event
+        # and CARRY the rest (including any clamp overflow) — subtracting only
+        # what we emit, so fast scrolls aren't silently truncated.
+        _wheel_accum[0] = max(-200.0, min(200.0, _wheel_accum[0]))
+        ticks = int(_wheel_accum[0])      # whole ticks pending (toward zero)
         if ticks == 0:
-            return                        # nothing whole yet — let it build up
-        ticks = max(-50, min(50, ticks))
-        session.input.scroll_event(cursor[0], cursor[1], 0, ticks)
+            return                        # sub-tick: keep the fraction, let it build
+        emit = max(-50, min(50, ticks))
+        _wheel_accum[0] -= emit           # carry remainder + clamp overflow
+        session.input.scroll_event(cursor[0], cursor[1], 0, emit)
 
     # Ctrl→Cmd remap: rewrite local Ctrl into the Mac's Cmd modifier
     # so Ctrl+C / Ctrl+V "feel right". Off by default now — the OS

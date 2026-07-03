@@ -23,7 +23,6 @@ import asyncio
 import json
 import logging
 import os
-import random
 import socket
 import threading
 import time
@@ -34,7 +33,7 @@ from typing import Optional
 from aiohttp import web
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.asyncio.server import serve as quic_serve
-from aioquic.h3.connection import H3_ALPN, H3Connection
+from aioquic.h3.connection import H3_ALPN, H3Connection, SettingsError
 from aioquic.h3.events import (
     DatagramReceived,
     DataReceived,
@@ -57,16 +56,6 @@ log = logging.getLogger(__name__)
 # Diagnostic flag: dump each browser's/our HTTP/3 SETTINGS on connect (reveals
 # which WebTransport draft the client speaks). Off by default (not spammy).
 _DEBUG_SETTINGS = os.environ.get("ISS_WT_DEBUG_SETTINGS", "0") == "1"
-# Diagnostic: log WebTransport stream-credit (peer-granted uni-stream limit) and
-# incoming CONNECT-stream capsules. Reveals whether a browser (Safari) replenishes
-# uni-stream credit as per-frame streams close, or caps at its initial grant.
-_DEBUG_CREDIT = os.environ.get("ISS_WT_DEBUG_CREDIT", "0") == "1"
-# Diagnostic: simulate a lossy/high-latency link (e.g. Wi-Fi to a remote viewer)
-# to reproduce the reliable-stream head-of-line-blocking latency accumulation
-# that a lossless localhost hides. ISS_WT_SIM_LOSS = fraction of outbound QUIC
-# packets to drop; ISS_WT_SIM_DELAY_MS = one-way delay added to each packet.
-_SIM_LOSS = float(os.environ.get("ISS_WT_SIM_LOSS", "0") or "0")
-_SIM_DELAY = float(os.environ.get("ISS_WT_SIM_DELAY_MS", "0") or "0") / 1000.0
 
 # --- HTTP/3 SETTINGS codepoints for WebTransport ----------------------
 # aioquic 1.3 only knows the draft-02 ENABLE_WEBTRANSPORT (0x2b603742) and the
@@ -113,19 +102,27 @@ class _WebTransportH3(H3Connection):
         if _DEBUG_SETTINGS:
             log.info("browser H3 SETTINGS: %s",
                      {hex(k): v for k, v in settings.items()})
-        # Record the datagram format the peer offered. We deliberately do NOT
-        # call super()._validate_settings(): aioquic raises when only the RFC
-        # datagram codepoint is present (it predates RFC 9297), which is exactly
-        # what Safari sends. Be lenient — if neither datagram codepoint is
-        # present we simply leave datagrams disabled rather than tearing down a
-        # session that could still carry video over streams.
+        # Record the datagram format the peer offered (gates send_datagram so we
+        # never blast audio at a peer that can't receive it).
         if settings.get(_H3_DATAGRAM_RFC) == 1:
             self.datagram_setting = _H3_DATAGRAM_RFC
         elif settings.get(_H3_DATAGRAM_DRAFT04) == 1:
             self.datagram_setting = _H3_DATAGRAM_DRAFT04
         else:
+            self.datagram_setting = None
             log.warning("peer negotiated no HTTP-datagram support; "
                         "audio-over-datagram disabled for this session")
+        # Run aioquic's real validation (the 0/1-value checks run first, so
+        # malformed settings are still rejected) but tolerate ONLY its datagram/
+        # WebTransport strictness: it predates the standardized WebTransport +
+        # RFC 9297 drafts Safari speaks and raises SettingsError on Safari's
+        # otherwise-valid SETTINGS. Video still flows over streams; audio is
+        # already gated above, so leniency here is safe.
+        try:
+            super()._validate_settings(settings)
+        except SettingsError as e:
+            log.debug("tolerating H3 SETTINGS strictness for standardized-draft "
+                      "peer: %s", e)
 
 _STATIC_DIR = Path(__file__).parent / "static"
 
@@ -133,13 +130,14 @@ _STATIC_DIR = Path(__file__).parent / "static"
 # frames over ONE long-lived unidirectional stream (length-prefixed) instead
 # of a fresh stream per frame. Set ISS_WT_VIDEO_SINGLE_STREAM=1 to enable.
 _VIDEO_SINGLE_STREAM = os.environ.get("ISS_WT_VIDEO_SINGLE_STREAM", "0") == "1"
-# Single-stream reset-on-backlog threshold: when the one video stream's unacked
-# backlog exceeds this, the stream is RESET (stale frames discarded) and resynced
-# from a keyframe, bounding end-to-end latency. Roughly this many bytes of video
-# is the worst-case added latency before a reset fires (~100ms at 20 Mbit/s for
-# 256 KB). Lower = tighter latency but more frequent keyframe resyncs; tune via
-# ISS_WT_SINGLE_STREAM_HIGH_WATER. The per-frame transport bounds latency for
-# free via QUIC's stream-count limit; the single stream needs this explicit.
+# Single-stream drop-when-behind threshold: when the one video stream's unacked
+# backlog exceeds this, DELTA frames stop being written (and a keyframe is
+# requested) until the stream drains, bounding end-to-end latency. Roughly this
+# many bytes of video is the worst-case added latency before dropping kicks in
+# (~100ms at 20 Mbit/s for 256 KB). Lower = tighter latency but more frequent
+# keyframe resyncs; tune via ISS_WT_SINGLE_STREAM_HIGH_WATER. The per-frame
+# transport bounds latency for free via QUIC's stream-count limit; the single
+# stream needs this explicit.
 _SINGLE_STREAM_HIGH_WATER = int(
     os.environ.get("ISS_WT_SINGLE_STREAM_HIGH_WATER", str(256 * 1024)))
 # Profiling: log iss-side forward gaps (>80ms between AUs) to localize stutter.
@@ -159,8 +157,7 @@ class _ViewerSession:
         "needs_keyframe", "input_stream_id", "input_buffer",
         "input_callback", "dgrams_sent", "last_seen_t",
         "video_stream_id", "frames_dropped", "video_discontinuity",
-        "capsule_decoder", "use_single_stream", "streams_opened",
-        "request_keyframe",
+        "capsule_decoder", "use_single_stream", "request_keyframe",
     )
 
     def __init__(
@@ -209,7 +206,6 @@ class _ViewerSession:
         # Per-viewer transport: single long-lived uni stream (Safari, to stay
         # under its WT uni-stream credit) vs one stream per frame (default).
         self.use_single_stream = use_single_stream
-        self.streams_opened = 0
         # Callback to ask the source for a fresh keyframe (FIR) — used by the
         # single-stream reset-on-backlog path to resync after discarding a
         # stale backlog. None in contexts without a bridge (e.g. tests).
@@ -237,14 +233,6 @@ class _ViewerSession:
             return
         try:
             quic = self.h3._quic
-            if _DEBUG_CREDIT:
-                self.streams_opened += 1
-                blocked = len(getattr(quic, "_streams_blocked_uni", []))
-                if self.streams_opened in (1, 50, 90, 95, 100, 105, 110, 150, 200) \
-                        or self.streams_opened % 250 == 0 or blocked:
-                    log.info("WT credit viewer %d: opened=%d peer_max_uni=%s "
-                             "blocked=%d", self.session_id, self.streams_opened,
-                             getattr(quic, "_remote_max_streams_uni", "?"), blocked)
             new_id = self.h3.create_webtransport_stream(
                 session_id=self.session_id, is_unidirectional=True,
             )
@@ -262,67 +250,32 @@ class _ViewerSession:
             log.debug("frame send failed (viewer %d): %s", self.session_id, e)
 
     def _send_frame_single(self, payload: bytes) -> None:
-        """Single-stream path: length-prefix each envelope onto one long-lived
-        unidirectional stream (Safari-friendly — one stream credit, no per-frame
-        churn). Used for viewers whose WebTransport stack limits server-opened
-        streams (Safari).
+        """Single-stream path: length-prefix each envelope onto ONE long-lived
+        unidirectional stream. Used only for viewers whose WebTransport stack
+        can't sustain the per-frame default (Safari, which grants ~100 uni-stream
+        credits total and replenishes them slowly, so a stream-per-frame runs it
+        out of credit in a second or two).
 
-        Reset-on-backlog (bounds latency): a reliable ordered stream cannot drop
-        stale data — if the consumer lags the producer, frames queue in the QUIC
-        send buffer under flow-control backpressure and latency grows without
-        bound (the MoQ/WebTransport-known failure mode of a single reliable
-        stream). So when the unacked backlog exceeds the high-water mark, we
-        RESET_STREAM to DISCARD the buffered stale frames (that backlog IS the
-        latency), open a fresh stream, and request a keyframe (FIR) to resync —
-        rather than let the stale frames drain. Deltas are dropped until that
-        resync keyframe lands (a delta would reference frames the client lost).
-        Keyframes and config/cursor always pass."""
+        Drop-when-behind (bounds latency): a reliable ordered stream can't drop
+        stale data, so if the consumer lags the producer, frames pile into the
+        QUIC send buffer under flow-control backpressure and latency grows without
+        bound (the known failure mode of a single reliable stream). We keep the
+        buffer bounded by NOT feeding it: once the unacked backlog crosses the
+        high-water mark we stop writing DELTA frames and ask the source for a
+        fresh keyframe, so the decoder resyncs quickly instead of waiting for a
+        periodic intra-refresh. Keyframes and config/cursor always pass; a
+        keyframe ends the drop window.
+
+        We deliberately do NOT RESET_STREAM to shed the backlog: each reset would
+        consume one of Safari's finite cumulative uni-stream credits, so a lossy
+        link that reset a few times a second would exhaust credit and freeze the
+        session permanently — trading bounded stutter for a dead stream. One
+        stream, opened once, held for the whole session."""
         try:
             quic = self.h3._quic
             t = payload[0] if payload else -1
 
-            # While resyncing after a reset, drop deltas until the keyframe.
-            if t == _TYPE_VIDEO_DELTA and self.video_discontinuity:
-                return
-
-            # Backlog check on deltas: reset the stream if it has accumulated a
-            # stale backlog (= accumulated latency).
-            if t == _TYPE_VIDEO_DELTA and self.video_stream_id is not None:
-                stream = quic._streams.get(self.video_stream_id)
-                if stream is not None:
-                    backlog = stream.sender._buffer_stop - stream.sender._buffer_start
-                    if backlog > _SINGLE_STREAM_HIGH_WATER:
-                        # NOTE: each reset consumes one more stream from the
-                        # session's CUMULATIVE uni-stream credit (Safari grants
-                        # ~100 and is slow to replenish). Resets should be rare
-                        # (real backlog spikes) so this lasts a long session; a
-                        # pathologically congested link that resets many times a
-                        # second could eventually exhaust credit and stall. If
-                        # that shows up, raise the high-water (fewer resets) or
-                        # add WT_MAX_STREAMS capsule accounting.
-                        try:
-                            quic.reset_stream(self.video_stream_id, 0)
-                        except Exception:  # noqa: BLE001
-                            pass
-                        self.video_stream_id = None       # reopen fresh below
-                        self.video_discontinuity = True    # drop deltas till keyframe
-                        self.frames_dropped += 1
-                        if self.request_keyframe is not None:
-                            self.request_keyframe()
-                        self.transmit()
-                        if self.frames_dropped in (1, 10, 100) or \
-                                self.frames_dropped % 500 == 0:
-                            log.info("single-stream: reset %dKB stale backlog "
-                                     "(viewer %d, reset #%d) — resyncing via keyframe",
-                                     backlog // 1024, self.session_id,
-                                     self.frames_dropped)
-                        return
-
-            # A keyframe is the clean resync point — resume normal delivery.
-            if t == _TYPE_VIDEO_KEY:
-                self.video_discontinuity = False
-
-            # Lazy-open the (possibly post-reset fresh) stream.
+            # Lazy-open the one persistent stream (never reset — see docstring).
             if self.video_stream_id is None:
                 self.video_stream_id = self.h3.create_webtransport_stream(
                     session_id=self.session_id, is_unidirectional=True,
@@ -330,6 +283,31 @@ class _ViewerSession:
                 fresh = quic._streams.get(self.video_stream_id)
                 if fresh is not None:
                     fresh.receiver.is_finished = True
+
+            # Deltas are droppable; keyframes/config/cursor are not.
+            if t == _TYPE_VIDEO_DELTA:
+                if self.video_discontinuity:
+                    return                      # waiting for the resync keyframe
+                stream = quic._streams.get(self.video_stream_id)
+                backlog = 0
+                if stream is not None:
+                    backlog = stream.sender._buffer_stop - stream.sender._buffer_start
+                if backlog > _SINGLE_STREAM_HIGH_WATER:
+                    # Stop feeding the stream (bounds the backlog) and resync
+                    # from a keyframe rather than resetting the stream.
+                    self.video_discontinuity = True
+                    self.frames_dropped += 1
+                    if self.request_keyframe is not None:
+                        self.request_keyframe()
+                    if self.frames_dropped in (1, 10, 100) or \
+                            self.frames_dropped % 500 == 0:
+                        log.info("single-stream: backlog %dKB over high-water "
+                                 "(viewer %d, drop #%d) — dropping deltas, "
+                                 "requesting keyframe", backlog // 1024,
+                                 self.session_id, self.frames_dropped)
+                    return
+            elif t == _TYPE_VIDEO_KEY:
+                self.video_discontinuity = False   # clean resync point
 
             framed = len(payload).to_bytes(4, "big") + payload
             quic.send_stream_data(
@@ -344,6 +322,12 @@ class _ViewerSession:
         Used for audio packets — one UDP datagram per Opus frame, no
         per-frame stream-creation cost (which choked QUIC's stream
         credit at ~160 streams/sec)."""
+        # Skip when the peer negotiated no HTTP-datagram support (Safari's
+        # standardized-draft stack exposes no datagram writer and disables its
+        # datagram reader): send_datagram would either raise per packet — an
+        # audio-rate log flood — or drop silently into a channel nothing reads.
+        if getattr(self.h3, "datagram_setting", None) is None:
+            return
         try:
             self.h3.send_datagram(stream_id=self.session_id, data=payload)
             self.transmit()
@@ -391,26 +375,6 @@ class _BridgeProtocol(QuicConnectionProtocol):
         self._h3: Optional[H3Connection] = None
         # session_id (= CONNECT stream_id) → _ViewerSession
         self._viewers: dict[int, _ViewerSession] = {}
-
-    def connection_made(self, transport) -> None:  # type: ignore[override]
-        if _SIM_LOSS > 0 or _SIM_DELAY > 0:
-            _orig = transport.sendto
-            _loop = asyncio.get_event_loop()
-
-            def _lossy(data, addr=None):
-                if _SIM_LOSS > 0 and random.random() < _SIM_LOSS:
-                    return None
-                if _SIM_DELAY > 0:
-                    # jitter ±50% so packets can reorder, like a real link
-                    d = _SIM_DELAY * (0.5 + random.random())
-                    _loop.call_later(d, _orig, data, addr)
-                    return None
-                return _orig(data, addr)
-
-            transport.sendto = _lossy  # type: ignore[assignment]
-            log.warning("ISS_WT_SIM: loss=%.3f delay=%.0fms — degrading outbound "
-                        "QUIC (test only)", _SIM_LOSS, _SIM_DELAY * 1000)
-        super().connection_made(transport)
 
     def quic_event_received(self, event: QuicEvent) -> None:
         if isinstance(event, ProtocolNegotiated):
@@ -484,17 +448,19 @@ class _BridgeProtocol(QuicConnectionProtocol):
             if stream_ended:
                 viewer.capsule_decoder.final()
             for capsule in viewer.capsule_decoder:
-                if _DEBUG_CREDIT:
-                    log.info("WT capsule from viewer %d: type=0x%x len=%d",
-                             viewer.session_id, capsule.type, len(capsule.data))
                 if capsule.type == CapsuleType.CLOSE_WEBTRANSPORT_SESSION:
                     log.info("WT viewer %d sent CLOSE_WEBTRANSPORT_SESSION",
                              viewer.session_id)
                     self._close_viewer(viewer)
                     return
         except Exception as e:  # noqa: BLE001
-            log.debug("capsule decode failed (viewer %d): %s",
-                      viewer.session_id, e)
+            # A malformed / oversized capsule (or a decoder left half-consumed)
+            # is a protocol error on the session stream — don't keep feeding a
+            # wedged decoder; tear the viewer down.
+            log.warning("capsule decode error (viewer %d): %s — closing viewer",
+                        viewer.session_id, e)
+            self._close_viewer(viewer)
+            return
         if stream_ended:
             # Peer half-closed the CONNECT stream without a close capsule; the
             # session is over either way.

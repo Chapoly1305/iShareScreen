@@ -1042,12 +1042,13 @@ async function main() {
 
   if (singleStream) {
     // SINGLE-STREAM mode: the server sends every envelope length-prefixed
-    // ([u32 len][envelope]) on a long-lived uni stream. It's ordered, so we
+    // ([u32 len][envelope]) on ONE long-lived uni stream. It's ordered, so we
     // feed the decoder directly — no reorder buffer, 1 stream credit (Safari).
-    // The server RESETs that stream and opens a fresh one to discard a stale
-    // backlog (bounds latency), so we loop: when the current stream ends or is
-    // reset, drop its partial buffer and pick up the next incoming stream (a
-    // keyframe resyncs the decoder). Only a WT session close ends the loop.
+    // The server bounds latency by dropping deltas when its send buffer backs
+    // up (then a keyframe resyncs the decoder), NOT by resetting the stream, so
+    // normally there's a single stream for the whole session. We still loop over
+    // reader.read() defensively: if a stream ever ends we drop its partial
+    // buffer and pick up the next one. Only a WT session close ends the loop.
     srvLog("info", "video transport: single-stream");
     while (true) {
       const { value: stream, done: outerDone } = await reader.read();

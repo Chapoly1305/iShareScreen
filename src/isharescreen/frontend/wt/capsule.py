@@ -17,6 +17,14 @@ from typing import Iterator, Optional
 
 from aioquic.buffer import UINT_VAR_MAX_SIZE, Buffer, BufferReadError
 
+# Upper bound on a single capsule's declared payload length. The capsules we
+# care about on the CONNECT stream (CLOSE_WEBTRANSPORT_SESSION and the flow-
+# control ones we skip) are at most a few bytes; a QUIC varint can encode up to
+# 2**62, so without a cap a peer could advertise a gigantic length and make the
+# decoder buffer bytes toward it forever (memory-exhaustion DoS). Anything over
+# this is treated as a protocol error.
+_MAX_CAPSULE_LEN = 1 << 20  # 1 MiB — orders of magnitude over any real capsule
+
 
 class CapsuleType(IntEnum):
     # RFC 9297 §5.4 — an HTTP Datagram carried on the stream itself.
@@ -59,7 +67,11 @@ class H3CapsuleDecoder:
         self._final: bool = False
 
     def append(self, data: bytes) -> None:
-        assert not self._final
+        # Guard, not assert: `python -O` strips asserts, and this is driven by
+        # peer stream events whose ordering we don't fully control. Late data
+        # after final() is simply ignored — the session is already over.
+        if self._final:
+            return
         if len(data) == 0:
             return
         if self._buffer:
@@ -79,6 +91,10 @@ class H3CapsuleDecoder:
                     self._type = self._buffer.pull_uint_var()
                 if self._length is None:
                     self._length = self._buffer.pull_uint_var()
+                    if self._length > _MAX_CAPSULE_LEN:
+                        raise ValueError(
+                            f"capsule length {self._length} exceeds cap "
+                            f"{_MAX_CAPSULE_LEN}")
                 if self._buffer.capacity - self._buffer.tell() < self._length:
                     if self._final:
                         raise ValueError("insufficient capsule buffer")
