@@ -296,10 +296,12 @@ async function main() {
     (/safari/i.test(ua) && !/chrome|chromium|crios|edg|fxios|android|opr/i.test(ua));
   let safariTrusted = false;
   let singleStream = false;
+  let dynamicRes = false;
   try {
     const cfg = await (await fetch("/wt-config")).json();
     safariTrusted = !!cfg.safariTrusted;
     singleStream = !!cfg.videoSingleStream;
+    dynamicRes = !!cfg.dynamic;
   } catch (e) { /* older server without /wt-config — assume not trusted */ }
   // Safari grants only ~100 WebTransport uni-stream credits and we don't send
   // capsules to replenish them, so the one-stream-per-frame default would stall
@@ -549,6 +551,12 @@ async function main() {
     intrinsic.h = cfg.canvas_h;
     firstFrame = false;
     fitCanvasToStage(cfg.canvas_w, cfg.canvas_h);
+    // A config means the host session is up and streaming (and, after a resize,
+    // that the re-encode we requested has landed). Clear the in-flight guard and
+    // re-check the window size — this both drives the initial Auto match and
+    // lets a resize converge on the window's final size one step at a time.
+    __resizeInFlight = false;
+    reportSize();
     resetDecoder();
     srvLog("info", `config: ${numTiles} tiles ${cfg.canvas_w}x${cfg.canvas_h} `
            + `tile_h=${tileH} codec=${cfg.codec} (single shared decoder)`);
@@ -603,6 +611,55 @@ async function main() {
   async function send(obj) {
     try { await inputWriter.write(enc.encode(JSON.stringify(obj) + "\n")); }
     catch (e) { /* writer closed during teardown */ }
+  }
+
+  // Dynamic resolution ("Auto" in the connect form): report the stage's pixel
+  // size so iss re-encodes the host display to match the window, instead of
+  // streaming its full (e.g. 4K) canvas — the same mechanism the desktop
+  // frontend uses on native-window resize. We report the CSS-pixel size (1×):
+  // it tracks the window and keeps the stream light/smooth; the server clamps
+  // it to the host's 3840×2160 ceiling. A fixed --advertise leaves dynamicRes
+  // false, so we never override the user's explicit resolution choice.
+  let __lastReportedWH = "";
+  let __resizeInFlight = false, __resizeInFlightT = 0;
+  function reportSize() {
+    if (!dynamicRes) return;
+    // Serialize: keep only ONE host re-encode in flight at a time (cleared when
+    // its config lands — see applyConfig — or after a timeout if it never does).
+    // This is what stops a click-drag resize from stacking re-encodes and
+    // thrashing the decoder: we converge on the window's final size in a couple
+    // of steps instead of re-encoding on every intermediate size.
+    if (__resizeInFlight) {
+      if (performance.now() - __resizeInFlightT < 4000) return;  // still settling
+      // Timed out with no config back (a lost re-advertise) — retry the current
+      // size (the periodic tick below re-invokes us). Clear the dedup so the
+      // same size is re-sent rather than swallowed.
+      __resizeInFlight = false; __lastReportedWH = "";
+    }
+    // Report req = physical_px / 2; the host renders req × hidpi_scale(2) = the
+    // window's PHYSICAL pixels (crisp 1:1, NOT over-rendered) at any display
+    // density — Retina (dpr=2) → req = CSS px, non-Retina (dpr=1) → req = CSS/2.
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(320, Math.round(stage.clientWidth * dpr / 2)) & ~1;
+    const h = Math.max(240, Math.round(stage.clientHeight * dpr / 2)) & ~1;
+    const key = w + "x" + h;
+    if (!w || !h || key === __lastReportedWH) return;
+    __lastReportedWH = key;
+    __resizeInFlight = true; __resizeInFlightT = performance.now();
+    send({ type: "resize", w, h });
+  }
+  let __resizeTimer = null;
+  function reportSizeDebounced() {
+    if (__resizeTimer) clearTimeout(__resizeTimer);
+    __resizeTimer = setTimeout(reportSize, 600);  // fire once the drag settles
+  }
+  if (dynamicRes) {
+    // Subsequent window resizes; the initial report is driven by applyConfig
+    // (fires once the session is actually streaming — see the note there).
+    window.addEventListener("resize", reportSizeDebounced);
+    // Slow safety tick: retries the current size if a re-advertise was lost
+    // (the in-flight guard times out at 4s); a no-op via dedup when stable.
+    setInterval(reportSize, 2500);
   }
 
   // Mouse moves go via WebTransport DATAGRAMS — drops are harmless

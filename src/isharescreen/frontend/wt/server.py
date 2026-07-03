@@ -727,7 +727,11 @@ class WebTransportBridge:
             support) and validates via the system trust store instead."""
             return web.json_response(
                 {"safariTrusted": self._safari_trusted,
-                 "videoSingleStream": _VIDEO_SINGLE_STREAM}, headers=nocache,
+                 "videoSingleStream": _VIDEO_SINGLE_STREAM,
+                 # In dynamic ("Auto") mode the page reports its window size so
+                 # the host re-encodes to match; a fixed --advertise is left
+                 # untouched (respect the user's explicit resolution choice).
+                 "dynamic": bool(self._config.dynamic_resolution)}, headers=nocache,
             )
 
         async def audio_worklet(_req: web.Request) -> web.Response:
@@ -875,6 +879,11 @@ class WebTransportBridge:
             self._config_sent = False
             self._last_config_env = None
             self._au_seq = 0
+            # Reset dynamic-resolution dedup state so a reconnect at the SAME
+            # window size still re-advertises (the new session starts at the
+            # host's default canvas, not the previous re-advertised size).
+            self._last_resize_wh = None
+            self._last_config_wh = None
             session.set_video_au_callback(self._on_video_au)
             # Cursor (RFB enc 1104): forward pixmaps so the browser paints the
             # host cursor shape as the canvas CSS cursor — and, crucially, the
@@ -1020,9 +1029,15 @@ class WebTransportBridge:
                 pps = next(iter(all_pps.values()), b"")
                 au_bytes = (b"\x00\x00\x00\x01" + sps
                             + b"\x00\x00\x00\x01" + pps + au_bytes)
-        if not self._config_sent:
-            cw, ch = session.canvas_dims
+        cw, ch = session.canvas_dims
+        # (Re)send config on the first frame, and again when the canvas size
+        # changes mid-session (dynamic resolution) — but only on a keyframe, so
+        # the browser re-inits its decoder at the new size on a clean IDR that
+        # already carries the new SPS (a delta at the new size would fail).
+        if (not self._config_sent
+                or (is_key and (cw, ch) != getattr(self, "_last_config_wh", None))):
             nt = max(1, session.num_tiles)
+            self._last_config_wh = (cw, ch)
             cfg = json.dumps({
                 "num_tiles": nt, "canvas_w": cw, "canvas_h": ch,
                 "tile_h": ch // nt, "codec": self._codec_string(session),
@@ -1321,8 +1336,36 @@ class WebTransportBridge:
                 self._session.input.key_event(
                     bool(msg.get("down")), int(msg["keysym"]),
                 )
+            elif kind == "resize":
+                self._handle_resize(int(msg["w"]), int(msg["h"]))
         except Exception as e:
             log.debug("input dispatch error: %s", e)
+
+    def _handle_resize(self, w: int, h: int) -> None:
+        """The browser reported a new viewport size — re-advertise the host
+        display to match, so the stream is encoded at the window's resolution
+        instead of the host's full canvas (dynamic-resolution parity with the
+        desktop frontend; this is what makes the connect form's "Auto" actually
+        track the browser window). Clamp to sane bounds and de-dup: the client
+        debounces so it only sends the settled size once per resize gesture, so
+        no server-side throttle is needed beyond ignoring an unchanged size."""
+        if not self._config.dynamic_resolution:
+            return  # fixed --advertise: respect the user's explicit resolution
+        w = max(640, min(3840, w & ~1))
+        h = max(480, min(2160, h & ~1))
+        if (w, h) == getattr(self, "_last_resize_wh", None):
+            return
+        self._last_resize_wh = (w, h)
+        if self._session is not None:
+            try:
+                # hidpi_scale=2: the host makes the backing canvas w*scale, so a
+                # 1500-CSS-px window → 3000×1540 backing = the window's physical
+                # pixels on a Retina browser (crisp 1:1, and ~3× lighter than the
+                # full 4K canvas). A 1× request wasn't honored by the host.
+                self._session.send_dynamic_resolution(w, h, hidpi_scale=2)
+                log.info("browser resize → re-advertising host display %dx%d", w, h)
+            except Exception as e:
+                log.debug("send_dynamic_resolution failed: %s", e)
 
 
 # ── wire envelope ────────────────────────────────────────────────────
