@@ -385,7 +385,17 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
  a.new { color:#9aa0a6; text-decoration:none; font-size:13px; } a.new:hover { color:#e8e8ea; }
  .btn { background:#2b2d31; color:#e8e8ea; border:1px solid #3a3d42; border-radius:8px; padding:5px 11px; font-size:13px; cursor:pointer; }
  .btn:hover { background:#34373c; border-color:#4f8cff; }
- .kv span, .card h3, .loghdr span { cursor:help; }
+ .kv span, .card h3, .loghdr span, [data-tip] { cursor:help; }
+ /* Styled hover tooltip (native title is delayed + unstyled + width-capped, and
+    long troubleshooting text renders badly there). Shows instantly on the whole
+    row; .card/.cards have no overflow so it isn't clipped. */
+ [data-tip] { position:relative; }
+ [data-tip]:hover::after {
+   content:attr(data-tip); position:absolute; left:0; top:calc(100% + 5px); z-index:30;
+   width:max-content; max-width:270px; background:#0f1113; color:#dfe1e4;
+   border:1px solid #3a3d42; border-radius:8px; padding:8px 10px;
+   font-size:12px; line-height:1.45; font-weight:400; white-space:normal; text-align:left;
+   box-shadow:0 8px 22px rgba(0,0,0,.6); pointer-events:none; }
  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:12px; padding:14px 16px 4px; }
  .card { background:#1e1f22; border:1px solid #2c2e33; border-radius:12px; padding:12px 14px; }
  .card h3 { margin:0 0 8px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:#9aa0a6; }
@@ -407,34 +417,51 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
  .btn.primary { background:#4f8cff; color:#fff; border-color:#4f8cff; } .btn.primary:hover { background:#5f97ff; }
 </style></head><body>
  <div class="top"><span class="dot idle" id="dot"></span><b>iShareScreen</b>
-  <span class="meta" id="host"></span><span class="grow"></span>
-  <span class="meta" id="uptime"></span><span class="meta" id="decoder"></span>
+  <span class="meta" id="host" title="The Mac you're connected to, the frontend in use, and the iss process ID."></span><span class="grow"></span>
+  <span class="meta" id="uptime" title="How long this session has been connected."></span><span class="meta" id="decoder" title="Active decoder + hardware path (also shown in the Stream card)."></span>
   <button class="btn" onclick="act('fir')" title="Request a fresh keyframe (IDR) on every tile. Use when a tile is frozen, gray, or showing stale / garbled content.">Force IDR</button>
   <button class="btn" onclick="act('reconnect')" title="Drop and re-establish the session with the same settings. Use after a stall the stream can't recover from on its own.">Reconnect</button>
   <a id="videobtn" class="btn primary" style="display:none;text-decoration:none" target="_blank" rel="noopener" title="Open the live video stream in a new tab — in this same browser.">▶ Open video</a>
   <a class="new" href="/new">+ new connection</a></div>
  <div class="cards">
   <div class="card"><h3 title="What's being streamed and how it's decoded.">Stream</h3>
-   <div class="kv"><span title="Session state: connecting → running → ended.">Status</span><b id="s_status">—</b></div>
-   <div class="kv"><span title="Host's encoded canvas size and tile count. The screen is split into tiles that decode independently.">Canvas</span><b id="s_canvas">—</b></div>
-   <div class="kv"><span title="Independently-encoded HEVC tiles — packet loss in one only corrupts that region, not the whole frame.">Tiles</span><b id="s_tiles">—</b></div>
-   <div class="kv"><span title="Active decoder + hardware path. 'software' means CPU decode: higher latency and CPU use, lower fps.">Decoder</span><b id="s_dec">—</b></div></div>
+   <div class="kv" data-tip="Session lifecycle: connecting → running → ended. Stuck on 'connecting' → check the host address / username / password, or a firewall blocking TCP 5900. 'ended' unexpectedly → see the log below.">
+     <span>Status</span><b id="s_status">—</b></div>
+   <div class="kv" data-tip="Host's encoded canvas size and tile count (WIDTH×HEIGHT · N tiles). The screen is split into independently-decoded tiles, so packet loss in one only corrupts that region. On the desktop frontend, resize the window to renegotiate this (dynamic resolution).">
+     <span>Canvas</span><b id="s_canvas">—</b></div>
+   <div class="kv" data-tip="Number of independently-encoded tiles (usually 4). Loss in one tile only corrupts its region, not the whole frame — a single stuck/gray tile is recoverable with Force IDR.">
+     <span>Tiles</span><b id="s_tiles">—</b></div>
+   <div class="kv" data-tip="Active decoder + hardware path. videotoolbox (Mac) / d3d11va / qsv / nvdec = GPU, low latency. 'software' = CPU decode: higher latency + CPU, lower fps — usually means the codec (e.g. HEVC 4:4:4) has no HW decoder on this machine; try --codec avc. 'n/a' on browser sessions (the browser decodes via WebCodecs).">
+     <span>Decoder</span><b id="s_dec">—</b></div></div>
   <div class="card"><h3 title="Inbound and outbound packet activity.">Network in</h3>
-   <div class="kv"><span title="Inbound video packet rate / bitrate. Falls to near zero on a static screen — that's normal, not a stall.">Video</span><b id="n_vid">—</b></div>
-   <div class="kv"><span title="Inbound system-audio stream (AAC-ELD-SBR) from the host. macOS screen-share always sends this — ~100 pps / ~21 kbps even in silence (no silence suppression), so a constant idle rate here is normal, not a leak.">Audio</span><b id="n_audio">—</b></div>
-   <div class="kv"><span title="Inbound RTCP feedback (sender reports) from the host — a few pps. Muxed on the audio socket.">RTCP</span><b id="n_rtcp">—</b></div>
-   <div class="kv"><span title="RFB control packets: cursor, clipboard, and input acknowledgements.">TCP</span><b id="n_tcp">—</b></div>
-   <div class="kv"><span title="Packets iss sends back (NACKs / RTCP / input). Staying at 0 can mean a one-way path or a firewall blocking the return.">Uplink</span><b id="n_tx">—</b></div></div>
+   <div class="kv" data-tip="Inbound video packet rate / bitrate. Drops to near zero on a static screen — that is NORMAL, not a stall. Sustained 0 while the screen is actively changing = a real stall: try Force IDR, then Reconnect.">
+     <span>Video</span><b id="n_vid">—</b></div>
+   <div class="kv" data-tip="Inbound system-audio stream (AAC-ELD-SBR) from the host. macOS screen-share always sends this — ~100 pps / ~21 kbps even in silence (no silence suppression / DTX), so a constant idle rate here is NORMAL, not a leak. It cannot be turned off client-side; --no-audio only stops local playback.">
+     <span>Audio</span><b id="n_audio">—</b></div>
+   <div class="kv" data-tip="Inbound RTCP feedback (sender reports) from the host — a few pps, muxed on the audio socket. Near-zero is fine.">
+     <span>RTCP</span><b id="n_rtcp">—</b></div>
+   <div class="kv" data-tip="RFB control packets over TCP: cursor shape, clipboard sync, and input acknowledgements. Low and bursty.">
+     <span>TCP</span><b id="n_tcp">—</b></div>
+   <div class="kv" data-tip="Packets iss sends back (NACKs / RTCP / input). Staying at 0 usually means a one-way network path or a firewall blocking the return — input and loss-recovery won't work. Check that outbound UDP to the host isn't blocked.">
+     <span>Uplink</span><b id="n_tx">—</b></div></div>
   <div class="card"><h3 title="Packet loss and stream-health signals.">Loss &amp; health</h3>
-   <div class="kv"><span title="RTP packets detected as lost (gaps in sequence numbers). Climbing steadily on an active screen indicates a lossy link.">Loss total</span><b id="h_loss">—</b></div>
-   <div class="kv"><span title="Lost packets on SSRCs not mapped to a tile. Non-zero during gray-outs means the host is publishing extra SSRC groups iss isn't tracking.">Unmapped</span><b id="h_unmap">—</b></div>
-   <div class="kv"><span title="Time since the host last sent a frame. Large while idle is normal; large while the screen is changing means a stall.">Last publish</span><b id="h_pub">—</b></div>
-   <div class="kv"><span title="Number of RTP SSRC groups (quality tiers) the host is streaming.">SSRC groups</span><b id="h_ssrc">—</b></div></div>
+   <div class="kv" data-tip="RTP packets detected lost (sequence-number gaps). A few is fine; climbing steadily on an active screen = a lossy link (Wi-Fi interference, congestion). If it's paired with UDP-queue drops, raise the OS receive buffer (net.core.rmem_max on Linux).">
+     <span>Loss total</span><b id="h_loss">—</b></div>
+   <div class="kv" data-tip="Lost packets on SSRCs not mapped to a tile. Non-zero during a gray-out means the host is publishing extra SSRC groups iss isn't tracking yet — usually self-heals within a second or two.">
+     <span>Unmapped</span><b id="h_unmap">—</b></div>
+   <div class="kv" data-tip="Time since the host last delivered a frame. Large while the screen is idle is NORMAL. Large while the screen is actively changing = a stall — Force IDR, or Reconnect if it persists. (An idle remote whose display has slept also looks like this — move the mouse.)">
+     <span>Last publish</span><b id="h_pub">—</b></div>
+   <div class="kv" data-tip="Number of RTP SSRC groups (quality tiers) the host is streaming — typically 1–3. Rapid churn here during gray-outs means the host is re-grouping streams mid-session.">
+     <span>SSRC groups</span><b id="h_ssrc">—</b></div></div>
   <div class="card"><h3 title="Internal buffers — growth here means iss can't keep up.">Queues</h3>
-   <div class="kv"><span title="Video receive-queue depth / capacity, with drop count. Drops mean iss can't drain UDP fast enough — raise the OS receive buffer (rmem).">UDP video</span><b id="q_vid">—</b></div>
-   <div class="kv"><span title="Control-channel receive-queue depth / capacity and drops.">UDP ctrl</span><b id="q_ctrl">—</b></div>
-   <div class="kv"><span title="Frames waiting to be decoded. Growing = the decoder can't keep up (common with software decode).">Decode q</span><b id="q_dec">—</b></div>
-   <div class="kv"><span title="Time from a complete frame arriving to it being decoded. High values point to a decode bottleneck.">Decode lat</span><b id="q_lat">—</b></div></div>
+   <div class="kv" data-tip="Video receive-queue depth / capacity + drop count. Depth should sit near 0; sustained drops mean iss can't drain UDP fast enough — raise the OS receive buffer (net.core.rmem_max on Linux, to ~33 MB).">
+     <span>UDP video</span><b id="q_vid">—</b></div>
+   <div class="kv" data-tip="Audio/RTCP receive-queue depth / capacity + drops. Same remedy as UDP video if it drops.">
+     <span>UDP ctrl</span><b id="q_ctrl">—</b></div>
+   <div class="kv" data-tip="Frames waiting to be decoded. Growing = the decoder can't keep up (common with software decode — switch to a HW decoder or lower the resolution). 'n/a' on browser sessions.">
+     <span>Decode q</span><b id="q_dec">—</b></div>
+   <div class="kv" data-tip="Time from a complete frame arriving to it being decoded. Sub-millisecond on a GPU decoder; high or growing = a decode bottleneck (software decode, or an overloaded GPU).">
+     <span>Decode lat</span><b id="q_lat">—</b></div></div>
  </div>
  <div class="tiles"><div class="tilegrid" id="tiles"></div></div>
  <div class="logwrap"><div class="loghdr">Log <span class="meta">— drag to select &amp; copy</span></div><pre id="log"></pre></div>
@@ -468,23 +495,19 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
    if(h.canvas) set('s_canvas', h.canvas.w+'×'+h.canvas.h + (h.canvas.tiles?'  ·  '+h.canvas.tiles+' tiles':''));
    if(h.decoder){ set('decoder', h.decoder); set('s_dec', h.decoder); } });
  es.addEventListener('snapshot', e => { const d=JSON.parse(e.data), rx=d.rx||{}, uq=d.udp_q||{};
-   // Browser (pass-through) sessions have no local decoder — the browser decodes
-   // via WebCodecs — so the decode-side rows have no data. Show 'n/a' rather than
-   // a blank that reads as broken.
-   const noLocal = !d.decoder || d.decoder.indexOf('no local') >= 0;
-   const na = 'n/a (browser decodes)';
+   const pub = d.last_publish_age_s;
    set('uptime', upt(d.uptime_s));
-   set('decoder', noLocal ? na : d.decoder); set('s_dec', noLocal ? na : d.decoder);
-   set('s_tiles', noLocal ? 'n/a' : (d.tiles||[]).length);
+   set('decoder', d.decoder); set('s_dec', d.decoder);
+   set('s_tiles', (d.tiles||[]).length);
    set('n_vid', `${rx.video_pps||0} pps · ${rx.video_mbps||0} Mbps`);
    set('n_audio', `${rx.audio_pps||0} pps · ${rx.audio_kbps||0} kbps`);
    set('n_rtcp', `${rx.rtcp_pps||0} pps · ${rx.rtcp_kbps||0} kbps`);
    set('n_tcp', `${rx.tcp_pps||0} pps`); set('n_tx', `${(d.tx||{}).pps||0} pps`);
    set('h_loss', d.loss_total); set('h_unmap', d.loss_unmapped);
-   set('h_pub', d.last_publish_age_s!=null?d.last_publish_age_s+'s ago':'—'); set('h_ssrc', d.ssrc_groups);
+   set('h_pub', (pub!=null && pub>=0) ? pub+'s ago' : '—'); set('h_ssrc', d.ssrc_groups);
    set('q_vid', qf(uq.video)); set('q_ctrl', qf(uq.ctrl));
-   set('q_dec', noLocal ? 'n/a' : qf(d.decode_q));
-   set('q_lat', noLocal ? 'n/a' : (d.decode_latency_ms!=null?d.decode_latency_ms+' ms':'—'));
+   set('q_dec', qf(d.decode_q));
+   set('q_lat', d.decode_latency_ms!=null?d.decode_latency_ms+' ms':'—');
    tiles(d.tiles); });
  const logEl=$('log');
  es.addEventListener('log', e => { const line=JSON.parse(e.data);
