@@ -412,6 +412,15 @@ class Session:
         self._rx_pkts_tcp = 0
         self._rx_bytes_video = 0
         self._rx_bytes_ctrl = 0
+        # The "ctrl" UDP socket is rtcp-muxed: it carries the host's audio RTP
+        # stream AND the (tiny) RTCP feedback. Count them separately (classified
+        # in _ctrl_drain_loop) so the diagnostics can label the ~100pps/21kbps of
+        # idle system audio as AUDIO (what it is) rather than "control", and
+        # surface real RTCP on its own. These sum to the _rx_*_ctrl totals.
+        self._rx_pkts_audio = 0
+        self._rx_bytes_audio = 0
+        self._rx_pkts_rtcp = 0
+        self._rx_bytes_rtcp = 0
         self._tx_pkts = 0
         self._cursor_msgs_processed = 0
         self._cursor_last_t: float = 0.0
@@ -419,6 +428,9 @@ class Session:
         # Snapshot baselines for delta computation in _log_profile_snapshot.
         self._last_rx_pkts: tuple[int, int, int] = (0, 0, 0)
         self._last_rx_bytes: tuple[int, int] = (0, 0)
+        # Baselines for the audio/RTCP split rates (pkts, bytes) each.
+        self._last_audio: tuple[int, int] = (0, 0)
+        self._last_rtcp: tuple[int, int] = (0, 0)
         self._last_tx_pkts: int = 0
         self._last_profile_nalu: list[dict[int, int]] = []
         # Separate interval clock for the pass-through (browser) snapshot path.
@@ -2444,6 +2456,19 @@ class Session:
                 return
             self._rx_pkts_ctrl += 1
             self._rx_bytes_ctrl += len(pkt)
+            # Split the rtcp-muxed socket for diagnostics: RFC 5761 — a v2 packet
+            # whose (marker-cleared) 2nd byte is 64..95 is RTCP (packet types
+            # 200-207 map there); everything else is the host's audio RTP (PT
+            # 101 = AAC-ELD-SBR). Counted here, pre-queue and alongside the ctrl
+            # total, so audio+rtcp always sums to ctrl even if the process queue
+            # later drops packets under load.
+            if (len(pkt) >= 2 and (pkt[0] & 0xC0) == 0x80
+                    and 64 <= (pkt[1] & 0x7F) <= 95):
+                self._rx_pkts_rtcp += 1
+                self._rx_bytes_rtcp += len(pkt)
+            else:
+                self._rx_pkts_audio += 1
+                self._rx_bytes_audio += len(pkt)
             try:
                 q.put_nowait(pkt)
             except queue.Full:
@@ -3102,6 +3127,27 @@ class Session:
                 log.debug("tx loop tick error: %s", e)
             self._stop_evt.wait(_TX_INTERVAL_S)
 
+    def _audio_rtcp_rates(self, elapsed: float) -> dict:
+        """Split the rtcp-muxed 'ctrl' socket into its real components: the
+        host's system-audio RTP stream (~100 pps of AAC-ELD-SBR, present even in
+        silence) vs the small RTCP feedback. Advances the rate baselines each
+        call (call once per snapshot tick, like the other rx counters)."""
+        ap, ab = self._rx_pkts_audio, self._rx_bytes_audio
+        rp, rb = self._rx_pkts_rtcp, self._rx_bytes_rtcp
+        lap, lab = self._last_audio
+        lrp, lrb = self._last_rtcp
+        self._last_audio = (ap, ab)
+        self._last_rtcp = (rp, rb)
+        if elapsed <= 0:
+            return {"audio_pps": 0.0, "audio_kbps": 0.0,
+                    "rtcp_pps": 0.0, "rtcp_kbps": 0.0}
+        return {
+            "audio_pps": round((ap - lap) / elapsed, 1),
+            "audio_kbps": round((ab - lab) * 8 / elapsed / 1_000, 1),
+            "rtcp_pps": round((rp - lrp) / elapsed, 1),
+            "rtcp_kbps": round((rb - lrb) * 8 / elapsed / 1_000, 1),
+        }
+
     def _publish_passthrough_snapshot(self) -> None:
         """Pass-through (browser) frontend: there's no local decoder, so the
         decode-centric snapshot below never runs and the TUI's panels go blank.
@@ -3123,6 +3169,7 @@ class Session:
         self._last_rx_pkts = (rx_v, rx_c, rx_t)
         self._last_rx_bytes = (bv, bc)
         self._last_tx_pkts = tx
+        ar = self._audio_rtcp_rates(elapsed)   # seeds baselines even on tick 1
         # First tick (or no interval): baselines are now seeded; publish from
         # the next call so the per-second rates are meaningful, not a spike.
         if last_t <= 0 or elapsed <= 0:
@@ -3148,6 +3195,7 @@ class Session:
                    "video_mbps": round((bv - last_bv) * 8 / elapsed / 1_000_000, 2),
                    "ctrl_pps": round((rx_c - last_rx_c) / elapsed, 1),
                    "ctrl_kbps": round((bc - last_bc) * 8 / elapsed / 1_000, 1),
+                   **ar,
                    "tcp_pps": round((rx_t - last_rx_t) / elapsed, 2)},
             "tx": {"pps": round((tx - last_tx) / elapsed, 2)},
         })
@@ -3217,6 +3265,7 @@ class Session:
         self._last_rx_pkts = (rx_v, rx_c, rx_t)
         self._last_rx_bytes = (bv, bc)
         self._last_tx_pkts = tx
+        ar = self._audio_rtcp_rates(elapsed)
         cursor_age = (
             time.monotonic() - self._cursor_last_t
             if self._cursor_last_t > 0 else -1.0
@@ -3332,6 +3381,7 @@ class Session:
                 },
                 "rx": {"video_pps": rx_v_pps, "video_mbps": rx_v_mbps,
                        "ctrl_pps":  rx_c_pps, "ctrl_kbps":  rx_c_kbps,
+                       **ar,
                        "tcp_pps":   rx_t_pps},
                 "tx": {"pps": tx_pps},
                 "cursor": {"age_ms": cursor_age_ms,

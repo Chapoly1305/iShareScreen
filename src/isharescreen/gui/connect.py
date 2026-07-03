@@ -421,7 +421,8 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
    <div class="kv"><span title="Active decoder + hardware path. 'software' means CPU decode: higher latency and CPU use, lower fps.">Decoder</span><b id="s_dec">—</b></div></div>
   <div class="card"><h3 title="Inbound and outbound packet activity.">Network in</h3>
    <div class="kv"><span title="Inbound video packet rate / bitrate. Falls to near zero on a static screen — that's normal, not a stall.">Video</span><b id="n_vid">—</b></div>
-   <div class="kv"><span title="Inbound control-channel (RTCP) rate — rate-control and NACK feedback from the host.">Control</span><b id="n_ctrl">—</b></div>
+   <div class="kv"><span title="Inbound system-audio stream (AAC-ELD-SBR) from the host. macOS screen-share always sends this — ~100 pps / ~21 kbps even in silence (no silence suppression), so a constant idle rate here is normal, not a leak.">Audio</span><b id="n_audio">—</b></div>
+   <div class="kv"><span title="Inbound RTCP feedback (sender reports) from the host — a few pps. Muxed on the audio socket.">RTCP</span><b id="n_rtcp">—</b></div>
    <div class="kv"><span title="RFB control packets: cursor, clipboard, and input acknowledgements.">TCP</span><b id="n_tcp">—</b></div>
    <div class="kv"><span title="Packets iss sends back (NACKs / RTCP / input). Staying at 0 can mean a one-way path or a firewall blocking the return.">Uplink</span><b id="n_tx">—</b></div></div>
   <div class="card"><h3 title="Packet loss and stream-health signals.">Loss &amp; health</h3>
@@ -467,15 +468,23 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
    if(h.canvas) set('s_canvas', h.canvas.w+'×'+h.canvas.h + (h.canvas.tiles?'  ·  '+h.canvas.tiles+' tiles':''));
    if(h.decoder){ set('decoder', h.decoder); set('s_dec', h.decoder); } });
  es.addEventListener('snapshot', e => { const d=JSON.parse(e.data), rx=d.rx||{}, uq=d.udp_q||{};
-   set('uptime', upt(d.uptime_s)); set('decoder', d.decoder); set('s_dec', d.decoder);
-   set('s_tiles', (d.tiles||[]).length);
+   // Browser (pass-through) sessions have no local decoder — the browser decodes
+   // via WebCodecs — so the decode-side rows have no data. Show 'n/a' rather than
+   // a blank that reads as broken.
+   const noLocal = !d.decoder || d.decoder.indexOf('no local') >= 0;
+   const na = 'n/a (browser decodes)';
+   set('uptime', upt(d.uptime_s));
+   set('decoder', noLocal ? na : d.decoder); set('s_dec', noLocal ? na : d.decoder);
+   set('s_tiles', noLocal ? 'n/a' : (d.tiles||[]).length);
    set('n_vid', `${rx.video_pps||0} pps · ${rx.video_mbps||0} Mbps`);
-   set('n_ctrl', `${rx.ctrl_pps||0} pps · ${rx.ctrl_kbps||0} kbps`);
+   set('n_audio', `${rx.audio_pps||0} pps · ${rx.audio_kbps||0} kbps`);
+   set('n_rtcp', `${rx.rtcp_pps||0} pps · ${rx.rtcp_kbps||0} kbps`);
    set('n_tcp', `${rx.tcp_pps||0} pps`); set('n_tx', `${(d.tx||{}).pps||0} pps`);
    set('h_loss', d.loss_total); set('h_unmap', d.loss_unmapped);
    set('h_pub', d.last_publish_age_s!=null?d.last_publish_age_s+'s ago':'—'); set('h_ssrc', d.ssrc_groups);
-   set('q_vid', qf(uq.video)); set('q_ctrl', qf(uq.ctrl)); set('q_dec', qf(d.decode_q));
-   set('q_lat', d.decode_latency_ms!=null?d.decode_latency_ms+' ms':'—');
+   set('q_vid', qf(uq.video)); set('q_ctrl', qf(uq.ctrl));
+   set('q_dec', noLocal ? 'n/a' : qf(d.decode_q));
+   set('q_lat', noLocal ? 'n/a' : (d.decode_latency_ms!=null?d.decode_latency_ms+' ms':'—'));
    tiles(d.tiles); });
  const logEl=$('log');
  es.addEventListener('log', e => { const line=JSON.parse(e.data);

@@ -187,12 +187,12 @@ class RatesPanel(Container):
 
     def apply(self, rx: dict[str, Any], tx: dict[str, Any]) -> None:
         video_mbps = rx.get("video_mbps", 0.0)
-        ctrl_kbps = rx.get("ctrl_kbps", 0.0)
         video_pps = rx.get("video_pps", 0.0)
         tx_pps = tx.get("pps", 0.0)
         lines = [
             f"video  rx  [b]{video_pps:6.0f}[/] pps  [b]{video_mbps:5.1f}[/] Mbps",
-            f"ctrl   rx  [b]{rx.get('ctrl_pps', 0.0):6.0f}[/] pps  [b]{ctrl_kbps:5.1f}[/] kbps",
+            f"audio  rx  [b]{rx.get('audio_pps', 0.0):6.0f}[/] pps  [b]{rx.get('audio_kbps', 0.0):5.1f}[/] kbps",
+            f"rtcp   rx  [b]{rx.get('rtcp_pps', 0.0):6.0f}[/] pps  [b]{rx.get('rtcp_kbps', 0.0):5.1f}[/] kbps",
             f"        tx  [b]{tx_pps:6.2f}[/] pps",
         ]
         self.query_one("#rates-text", Static).update("\n".join(lines))
