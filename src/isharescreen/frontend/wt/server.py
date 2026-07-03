@@ -1245,7 +1245,21 @@ class WebTransportBridge:
             # Partial-tile concealment that leaves whole-tile std looking healthy
             # is caught by the grey-fraction check. Rate-limited to ≥3 s.
             now = time.monotonic()
-            stuck = verdict in ("MOSTLY_GREY", "FROZEN/GREY")
+            # A gray/frozen CANVAS and gray/frozen CONTENT are identical pixels,
+            # so the pixel verdict alone can never be trusted to FIR — a gray
+            # desktop would loop forever. Concealment gray only happens for a
+            # REASON: a broken reference chain, which comes from packet loss, or a
+            # real browser decode error. So require a reliable signal — the
+            # source->iss loss counter grew recently, or the browser flagged a
+            # decode error — before treating the verdict as recoverable. On a
+            # clean stream (no loss, no error) gray is just content: never FIR.
+            cur_loss = getattr(self._session, "_lost_pkts", 0) if self._session else 0
+            if cur_loss > getattr(self, "_last_seen_loss", cur_loss):
+                self._last_browser_loss_t = now
+            self._last_seen_loss = cur_loss
+            recent_loss = (now - getattr(self, "_last_browser_loss_t", 0.0)) < 5.0
+            reliable = recent_loss or bool(msg.get("decoder_errored"))
+            stuck = reliable and verdict in ("MOSTLY_GREY", "FROZEN/GREY")
             if stuck:
                 self._stuck_streak = getattr(self, "_stuck_streak", 0) + 1
             else:
@@ -1264,8 +1278,8 @@ class WebTransportBridge:
             ):
                 self._last_browser_fir_t = now
                 log.warning(
-                    "browser reports %s for %ds — forcing IDR on all tiles",
-                    verdict, self._stuck_streak,
+                    "browser reports %s for %ds with recent packet loss — "
+                    "forcing IDR on all tiles", verdict, self._stuck_streak,
                 )
                 try:
                     self._session.request_fir()
