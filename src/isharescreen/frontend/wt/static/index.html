@@ -303,14 +303,15 @@ async function main() {
     singleStream = !!cfg.videoSingleStream;
     dynamicRes = !!cfg.dynamic;
   } catch (e) { /* older server without /wt-config — assume not trusted */ }
-  // Safari grants only ~100 WebTransport uni-stream credits and we don't send
-  // capsules to replenish them, so the one-stream-per-frame default would stall
-  // after a second or two. Force the single-long-lived-stream transport for
-  // Safari (Chrome/Edge/Firefox keep the per-frame path). The server picks the
-  // matching send path per-viewer from the ?transport query below.
-  if (isSafari) singleStream = true;
-  // Explicit override for testing/tuning: ?transport=single|perframe wins over
-  // the auto choice above (server reads the same choice from the CONNECT path).
+  // Safari uses the same per-frame transport as Chrome/Edge/Firefox. (An earlier
+  // assumption forced Safari onto a single long-lived stream believing its
+  // ~100-uni-stream WebTransport credit exhausted on a stream-per-frame; measured
+  // otherwise — Safari replenishes that credit generously at the QUIC level
+  // (100 → 7000+ under load, never blocked), so it doesn't need the workaround.
+  // Per-frame also avoids single-stream's head-of-line blocking under loss and
+  // its rougher behaviour through a mid-session re-encode on resize.)
+  // Explicit override for testing/tuning: ?transport=single|perframe wins (the
+  // server reads the same choice from the CONNECT path below).
   const tsp = new URLSearchParams(location.search).get("transport");
   if (tsp === "single") singleStream = true;
   else if (tsp === "perframe" || tsp === "per-frame") singleStream = false;
