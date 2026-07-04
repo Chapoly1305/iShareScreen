@@ -828,6 +828,14 @@ class WebTransportBridge:
                 # _on_video_au) follows for this viewer to start decoding.
                 if self._last_config_env is not None:
                     self._broadcast_frame(self._last_config_env)
+                # Replay the most-recent cached keyframe so the joiner can paint
+                # right away. On an idle host (where the FIR below goes
+                # unanswered) this is the ONLY way it gets a decodable frame;
+                # on an active host the fresh IDR re-syncs immediately after.
+                # Existing viewers drop it (older seq than what they've seen),
+                # so a broadcast only reaches the fresh joiner.
+                for kf_env in list(getattr(self, "_last_keyframe_env", {}).values()):
+                    self._broadcast_frame(kf_env)
                 if _FORCE_KEYFRAME_ON_JOIN:
                     try:
                         self._session.request_fir(None)
@@ -878,6 +886,10 @@ class WebTransportBridge:
             # reassembled per-tile AUs in _on_video_au.
             self._config_sent = False
             self._last_config_env = None
+            # Most-recent keyframe envelope per tile — replayed to a late-joining
+            # viewer so it can paint immediately even when the host is idle and
+            # won't answer a FIR with a fresh IDR (see add_viewer).
+            self._last_keyframe_env = {}
             self._au_seq = 0
             # Reset dynamic-resolution dedup state so a reconnect at the SAME
             # window size still re-advertises (the new session starts at the
@@ -1055,8 +1067,12 @@ class WebTransportBridge:
         # RTP ts here ran at ~90kHz, which read as µs looked like 0.9s/s of fake
         # "latency growth").
         send_us = int(time.monotonic() * 1_000_000) & 0xFFFFFFFFFFFFFFFF
-        self._broadcast_frame(
-            _frame_envelope(au_bytes, is_key, send_us, tile_idx, seq))
+        env = _frame_envelope(au_bytes, is_key, send_us, tile_idx, seq)
+        if is_key:
+            # Cache the latest keyframe (SPS/PPS already prepended above) to
+            # bootstrap late joiners on an idle host — see add_viewer.
+            self._last_keyframe_env[tile_idx] = env
+        self._broadcast_frame(env)
 
     def _gate_pump_loop(self) -> None:
         """Drain get_frame() for every tile so the quality gate + FIR recovery
@@ -1157,6 +1173,13 @@ class WebTransportBridge:
                         self._kf_req_fir_t = now
                 except Exception:
                     pass
+                # Also replay the cached keyframe. The browser just reset its
+                # decoder (nextSeq=-1) so it accepts this even though the seq is
+                # older than what it had seen — letting it repaint immediately
+                # instead of waiting on the FIR, which an IDLE host won't answer.
+                # On an active host the fresh IDR follows and supersedes it.
+                for kf_env in list(getattr(self, "_last_keyframe_env", {}).values()):
+                    self._broadcast_frame(kf_env)
             return
         if kind == "stats":
             # Track whether any viewer is actively listening to audio
