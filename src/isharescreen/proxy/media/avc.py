@@ -39,6 +39,102 @@ from .quality_gate import FrameQualityGate
 
 log = logging.getLogger(__name__)
 
+
+def _patch_avc_sps_dpb(sps: bytes) -> bytes:
+    """Raise the SPS DPB ceiling so libav can hold Apple's full reference set.
+
+    Apple's H.264 stream declares ``max_num_ref_frames = 8`` and ``level 5.2``
+    (whose DPB caps at 8 frames at share resolutions), but its encoder actually
+    references up to 9 pictures — 7 short-term + 2 long-term (LTRP). Strict
+    libav enforces the declared 8, discards the 9th, and later frames then
+    reference that now-"missing" picture, producing a smear until the next
+    keyframe ("reference picture missing" / "number of reference frames (7+2)
+    exceeds max (8)"). This is H.264-only: the HEVC path sizes its DPB
+    differently and we ack its LTRP. Rewrite the SPS to level 6.0 +
+    ``max_num_ref_frames = 16`` so libav's DPB holds everything Apple sends.
+
+    Bit-exact surgery on the SPS RBSP; any parse surprise (e.g. an unexpected
+    scaling matrix) returns the SPS untouched. Disable with ISS_AVC_SPS_PATCH=0.
+    """
+    if os.environ.get("ISS_AVC_SPS_PATCH") == "0":
+        return sps
+    try:
+        if len(sps) < 4 or (sps[0] & 0x1f) != 7:
+            return sps
+        bits = [(byte >> i) & 1 for byte in sps[1:] for i in range(7, -1, -1)]
+        pos = 0
+
+        def u(n):
+            nonlocal pos
+            v = 0
+            for _ in range(n):
+                v = (v << 1) | bits[pos]
+                pos += 1
+            return v
+
+        def ue():
+            nonlocal pos
+            start = pos
+            z = 0
+            while bits[pos] == 0:
+                z += 1
+                pos += 1
+            pos += 1
+            val = (1 << z) - 1
+            if z:
+                val += u(z)
+            return start, pos, val
+
+        profile = u(8)
+        u(8)                      # constraint flags
+        level_start = pos
+        u(8)                      # level_idc
+        ue()                      # seq_parameter_set_id
+        if profile in (100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135):
+            _, _, cfi = ue()      # chroma_format_idc
+            if cfi == 3:
+                u(1)              # separate_colour_plane_flag
+            ue()                  # bit_depth_luma_minus8
+            ue()                  # bit_depth_chroma_minus8
+            u(1)                  # qpprime_y_zero_transform_bypass_flag
+            if u(1):              # seq_scaling_matrix_present_flag
+                return sps        # scaling lists present — don't attempt surgery
+        ue()                      # log2_max_frame_num_minus4
+        _, _, poc = ue()          # pic_order_cnt_type
+        if poc == 0:
+            ue()                  # log2_max_pic_order_cnt_lsb_minus4
+        elif poc == 1:
+            u(1)
+            ue()
+            ue()
+            n = ue()[2]
+            for _ in range(n):
+                ue()
+        ms, me, mnrf = ue()       # max_num_ref_frames
+
+        new_bits = bits
+        if mnrf < 16:
+            code = 16 + 1         # Exp-Golomb encode ue(16)
+            nz = code.bit_length() - 1
+            enc = [0] * nz + [(code >> (nz - j)) & 1 for j in range(nz + 1)]
+            new_bits = bits[:ms] + enc + bits[me:]
+        for i in range(8):        # level_idc → 6.0 (60) so the level doesn't cap the DPB
+            new_bits[level_start + i] = (60 >> (7 - i)) & 1
+
+        out = bytearray([sps[0]])
+        for i in range(0, len(new_bits), 8):
+            chunk = new_bits[i:i + 8]
+            byte = 0
+            for b in chunk:
+                byte = (byte << 1) | b
+            if len(chunk) < 8:
+                byte <<= (8 - len(chunk))
+            out.append(byte)
+        return bytes(out)
+    except Exception as e:
+        log.debug("SPS DPB patch skipped: %s", e)
+        return sps
+
 # Hardware decoders to try per platform for H.264. Unlike Apple's HEVC RExt
 # 4:4:4 (which DXVA2/D3D11VA/VAAPI cannot decode, so the "HW" context silently
 # falls back to software), H.264 4:2:0 is the universally hardware-decodable
@@ -158,7 +254,7 @@ class AvcDecoder:
         self._pps = next(iter(all_pps.values())) if all_pps else b""
 
     def _build_extradata(self) -> bytes:
-        return _NAL_START_CODE + self._sps + _NAL_START_CODE + self._pps
+        return _NAL_START_CODE + _patch_avc_sps_dpb(self._sps) + _NAL_START_CODE + self._pps
 
     def _ensure_codec_locked(self) -> Optional[av.codec.context.CodecContext]:
         """Build the shared context if needed (HW accel first, SW fallback).
