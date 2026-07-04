@@ -728,6 +728,16 @@ class Session:
             gate.mark_decode_error(tile_idx)
             self._send_fir_for_tile(tile_idx)
 
+    def note_browser_healthy(self) -> None:
+        """Browser-frontend heartbeat: called ONLY when the browser's own
+        WebCodecs decoder reports it is actively decoding a good picture (the
+        "ok" verdict). Records the time so `_drain_pending_fir` suppresses the
+        session-side libav gate's false-positive FIRs while the authoritative
+        (browser) decoder confirms the stream is fine. Deliberately NOT called
+        for gray/frozen verdicts — those may be a silent d3d11va wedge that
+        needs the gate's FIR to recover."""
+        self._browser_healthy_t = time.monotonic()
+
     def send_dynamic_resolution(
         self, width: int, height: int, hidpi_scale: int = 2,
     ) -> None:
@@ -3459,6 +3469,18 @@ class Session:
             quiet_for = time.monotonic() - self._last_video_pkt_t
             if quiet_for >= 1.5:
                 return
+        # Browser-frontend suppression: the browser's own WebCodecs decoder is
+        # the authoritative picture, and it reports when it's actively decoding a
+        # GOOD frame ("ok" verdict → note_browser_healthy). While that's fresh,
+        # the session-side libav gate's flags are stale false positives (on
+        # d3d11va the gate can't self-confirm recovery, so it would re-fire FIR —
+        # and the "recovering via FIR" log — forever on a healthy stream). Skip.
+        # This keys ONLY off a confirmed-good picture, never off "no error"
+        # signals — a silent d3d11va wedge grays with no error/loss, and the
+        # browser stops reporting "ok" for it, so this window lapses (~1.5s) and
+        # FIRs resume to recover it.
+        if time.monotonic() - getattr(self, "_browser_healthy_t", 0.0) < 1.5:
+            return
         sent: list[int] = []
         for ti in self._decoder.consume_fir_request():
             if self._send_fir_for_tile(ti, log_per_tile=False):

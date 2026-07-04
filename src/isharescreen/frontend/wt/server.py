@@ -1213,6 +1213,14 @@ class WebTransportBridge:
                 verdict = "NO_FRAMES"
             elif msg.get("decoder_queue", 0) > 10:
                 verdict = "DECODE_LAG"
+            # The browser's own decoder is the authoritative picture. When it's
+            # actively decoding a GOOD frame ("ok"), tell the session so it
+            # suppresses the session-side libav gate's false-positive FIRs (the
+            # "recovering via FIR" spam on a healthy stream). Keyed STRICTLY on
+            # "ok" — never on gray/frozen, which may be a silent d3d11va wedge
+            # that genuinely needs the gate's FIR to recover.
+            if verdict == "ok" and self._session is not None:
+                self._session.note_browser_healthy()
             # Throttle the routine "ok" heartbeat to once per 30s — a per-second
             # stats line is log spam. Anything NOT "ok" (a real problem) logs
             # immediately so issues stay visible.
