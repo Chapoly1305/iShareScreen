@@ -58,10 +58,14 @@ _RESIZE_MIN_INTERVAL_S = 2.5    # floor between consecutive resize requests
 _MIN_ADVERTISE_W = 640
 
 # Scroll-wheel: base amplification applied to EVERY scroll (on top of the
-# speed-based curve below), so a normal deliberate scroll isn't glacial. The
-# host gets `ticks` wheel press/release pairs; 1 tick per notch feels far too
-# slow, so scale each notch up (3× tuned to feel like native scroll).
-_WHEEL_MULT = 3.0
+# speed-based curve below). Each `tick` becomes one wheel press/release pair,
+# and the macOS host maps each press to a scroll of exactly **1 pixel**
+# (kCGScrollEventUnitPixel, delta=1 — the server fixes ±1 px per press). So
+# ticks/notch == pixels/notch: a real wheel notch should move ~1+ line
+# (~10-16 px), hence ~12 ticks/notch. The old 3× scrolled only ~3 px/notch,
+# which reads as "the tick didn't register" on a slow scroll (few px) while a
+# fast flick accumulates enough px to feel like it works.
+_WHEEL_MULT = 12.0
 _MIN_ADVERTISE_H = 480
 _MAX_ADVERTISE_W = 1920  # server backing 3840 / mode-table ratio 2
 _MAX_ADVERTISE_H = 1080

@@ -748,7 +748,16 @@ async function main() {
     else if (dt < 100) mult = 3.5;
     else if (dt < 200) mult = 2.0;
     else if (dt < 350) mult = 1.4;
-    wheelAccum += (e.deltaY * mult) / 25;
+    // Each `tick` becomes one wheel press/release pair, and the macOS host
+    // maps each press to a scroll of exactly 1 PIXEL (the server fixes ±1 px
+    // per press). So ticks == pixels scrolled on the host. Normalise deltaMode
+    // to a pixel-equivalent, then divide to land ~12 ticks (px) per wheel notch
+    // (~1 line) — enough to be clearly perceptible. The old /25 gave ~4 px/notch,
+    // so a slow scroll moved too few pixels to notice ("tick didn't register").
+    let pxDelta = e.deltaY;
+    if (e.deltaMode === 1) pxDelta *= 16;        // DOM_DELTA_LINE → ~px
+    else if (e.deltaMode === 2) pxDelta *= 400;  // DOM_DELTA_PAGE → ~px
+    wheelAccum += (pxDelta * mult) / 8;
     let ticks = Math.trunc(wheelAccum);
     // Minimum 1 tick per event so slow / tiny-delta inputs always
     // register. Without this, sub-1-tick accumulator values from a
