@@ -46,6 +46,7 @@ from aioquic.quic.events import ProtocolNegotiated, QuicEvent
 
 from ...proxy.session import Session, SessionConfig
 from ...proxy.media.avc_nalu import au_is_keyframe, au_has_sps
+from ...proxy.media.avc import _patch_avc_sps_dpb
 from .audio import OpusEncoder
 from .capsule import CapsuleType, H3Capsule, H3CapsuleDecoder
 from .cert import write_cert, trust_cert_in_keychain, is_cert_trusted
@@ -56,6 +57,19 @@ log = logging.getLogger(__name__)
 # Diagnostic flag: dump each browser's/our HTTP/3 SETTINGS on connect (reveals
 # which WebTransport draft the client speaks). Off by default (not spammy).
 _DEBUG_SETTINGS = os.environ.get("ISS_WT_DEBUG_SETTINGS", "0") == "1"
+
+# Apple's H.264 SPS declares max_num_ref_frames=8 / level 5.2, but under motion
+# + packet loss its encoder references past 8 pictures (short-term + long-term
+# refs) for loss robustness. A *strict* WebCodecs decoder — verified on Chrome
+# for Windows (d3d11va) — honors the declared 8, can't hold the extra
+# references, and the decoder freezes to a stale/black frame until the next
+# keyframe. Chrome-on-macOS uses VideoToolbox, which ignores the limit and
+# decodes fine — which is why this only bites on Windows. iss already patches
+# the SPS DPB ceiling (→16, level 6.0) for its *own* libav decoder
+# (media/avc.py) but forwarded Apple's ORIGINAL SPS to the browser. Patch the
+# forwarded SPS too so the browser's decoder sizes its DPB to hold Apple's full
+# reference set. ISS_BROWSER_SPS_PATCH=0 restores the old (raw) behavior for A/B.
+_BROWSER_SPS_PATCH = os.environ.get("ISS_BROWSER_SPS_PATCH", "1") != "0"
 
 # --- HTTP/3 SETTINGS codepoints for WebTransport ----------------------
 # aioquic 1.3 only knows the draft-02 ENABLE_WEBTRANSPORT (0x2b603742) and the
@@ -1002,6 +1016,8 @@ class WebTransportBridge:
         """WebCodecs codec id 'avc1.PPCCLL' from the SPS (profile/constraint/
         level bytes). Falls back to High@5.0 if the SPS isn't available yet."""
         sps, _ = session.video_params()
+        if sps and _BROWSER_SPS_PATCH:
+            sps = _patch_avc_sps_dpb(sps)
         if len(sps) >= 4:
             return "avc1." + sps[1:4].hex()
         return "avc1.640032"
@@ -1038,6 +1054,8 @@ class WebTransportBridge:
             # 'Decoding error' on every keyframe.
             sps, all_pps = session.video_params()
             if sps:
+                if _BROWSER_SPS_PATCH:
+                    sps = _patch_avc_sps_dpb(sps)
                 pps = next(iter(all_pps.values()), b"")
                 au_bytes = (b"\x00\x00\x00\x01" + sps
                             + b"\x00\x00\x00\x01" + pps + au_bytes)
