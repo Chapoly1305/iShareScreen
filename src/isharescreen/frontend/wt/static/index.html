@@ -400,7 +400,7 @@ async function main() {
   setStatus("opening WebTransport…");
   const useHashes = !(isSafari && safariTrusted);
   srvLog("info", `WT connect: ${wtUrl} ${useHashes ? "hash=" + certHash : "(keychain trust)"}`);
-  const wt = useHashes
+  const mkWt = () => useHashes
     ? new WebTransport(wtUrl, {
         serverCertificateHashes: [{
           algorithm: "sha-256",
@@ -408,19 +408,42 @@ async function main() {
         }],
       })
     : new WebTransport(wtUrl);
-  // Diagnostic: the session-close reason carries the real cause when
-  // wt.ready rejects with a generic WebTransportError (e.g. a SETTINGS
-  // mismatch shows up as the close code/reason, not in .message).
-  wt.closed
-    .then((info) => srvLog("info", `WT closed: ${JSON.stringify(info)}`))
-    .catch((e) => srvLog("error",
-      `WT closed-err: name=${e.name} msg=${e.message} source=${e.source} streamErrorCode=${e.streamErrorCode}`));
-  try { await wt.ready; }
-  catch (e) {
-    const msg = `WT failed: name=${e.name} msg=${e.message || e} source=${e.source} streamErrorCode=${e.streamErrorCode}`;
-    srvLog("error", msg);
-    setStatus(msg, "err");
-    return;
+  // The WebTransport handshake can fail transiently — most visibly when a
+  // window is closed and reopened, where the browser may reject the first
+  // reconnect attempt (a fresh session over a QUIC path the previous one just
+  // vacated) with a generic WebTransportError before it settles. The server
+  // reconnect path itself is clean (verified: aioquic + real Chrome loopback
+  // both reconnect indefinitely), so a single failure is not fatal — retry a
+  // few times with backoff instead of dropping the user on a dead error page.
+  // A genuinely-down iss exhausts the retries and then shows the error.
+  const RETRIES = 5;
+  let wt = null;
+  for (let attempt = 1; attempt <= RETRIES; attempt++) {
+    wt = mkWt();
+    // Diagnostic: the session-close reason carries the real cause when
+    // wt.ready rejects with a generic WebTransportError (e.g. a SETTINGS
+    // mismatch shows up as the close code/reason, not in .message).
+    wt.closed
+      .then((info) => srvLog("info", `WT closed: ${JSON.stringify(info)}`))
+      .catch((e) => srvLog("error",
+        `WT closed-err: name=${e.name} msg=${e.message} source=${e.source} streamErrorCode=${e.streamErrorCode}`));
+    try {
+      await wt.ready;
+      break;  // connected
+    } catch (e) {
+      const msg = `WT failed: name=${e.name} msg=${e.message || e} source=${e.source} streamErrorCode=${e.streamErrorCode}`;
+      srvLog("error", `${msg} (attempt ${attempt}/${RETRIES})`);
+      try { wt.close(); } catch (_) {}
+      wt = null;
+      if (attempt === RETRIES) {
+        setStatus(`${msg} — giving up after ${RETRIES} attempts`, "err");
+        return;
+      }
+      // Backoff: 300ms, 600ms, 1.2s, 2.4s — let the browser/QUIC path settle.
+      const backoff = 300 * Math.pow(2, attempt - 1);
+      setStatus(`reconnecting (attempt ${attempt + 1}/${RETRIES})…`);
+      await new Promise((r) => setTimeout(r, backoff));
+    }
   }
   srvLog("info", "WT ready");
   setStatus("connected", "ok");
