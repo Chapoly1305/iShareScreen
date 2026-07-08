@@ -119,6 +119,9 @@
     <option value="800x600">800 × 600 (SVGA)</option>
     <option value="640x480">640 × 480 (VGA)</option>
   </select>
+  <select id="disp" title="This Mac has multiple monitors — open one per window" style="display:none">
+    <option value="">🖥 Displays…</option>
+  </select>
   <button id="unmute" title="Toggle audio">🔇</button>
   <button id="fs-btn" title="Fullscreen (auto-hides this bar)">⛶</button>
 </div>
@@ -230,6 +233,46 @@ function hexToBytes(hex) {
 // encoded pixel maps to exactly 1/devicePixelRatio CSS pixels.
 const NOFIT = new URLSearchParams(location.search).get("nofit") === "1";
 
+// `?display=N` shows only host monitor N (its rect within the combined canvas,
+// from the 0x451 layout). Open one window per monitor for 1:1 mapping. Unset =
+// show the whole combined canvas (all monitors). `cropRect` is that monitor's
+// rect in canvas (backing) pixels, filled in from the config's display_rects.
+const DISPLAY_IDX = (() => {
+  const v = new URLSearchParams(location.search).get("display");
+  if (v == null || v === "") return null;
+  const n = parseInt(v, 10);
+  // Unparseable / negative → show the whole canvas (null), not silently monitor 0.
+  return Number.isInteger(n) && n >= 0 ? n : null;
+})();
+let cropRect = null;
+
+// Displays picker: on the combined window (no ?display) of a multi-monitor
+// host, list the monitors and open each in its own window (?display=N). Each is
+// a separate viewer, so N windows can be live at once — fullscreen each on a
+// local monitor for 1:1 host↔client mapping. Hidden on single-monitor hosts and
+// on per-monitor windows.
+const dispSel = document.getElementById("disp");
+function setupDisplayPicker(rects) {
+  if (DISPLAY_IDX != null || !rects || rects.length < 2) {
+    dispSel.style.display = "none";
+    return;
+  }
+  dispSel.innerHTML = '<option value="">🖥 Displays…</option>'
+    + rects.map((r, i) =>
+        `<option value="${i}">Monitor ${i + 1} (${r.w}×${r.h}) → new window</option>`).join("")
+    + '<option value="all">Open all monitors</option>';
+  dispSel.style.display = "";
+  dispSel.onchange = () => {
+    const v = dispSel.value;
+    if (v === "all") {
+      for (let i = 0; i < rects.length; i++) window.open(`?display=${i}`, `_disp${i}`);
+    } else if (v !== "") {
+      window.open(`?display=${v}`, `_disp${v}`);
+    }
+    dispSel.value = "";  // reset so the same monitor can be re-picked
+  };
+}
+
 function fitCanvasToStage(intrinsicW, intrinsicH) {
   if (NOFIT) {
     // Size in CSS pixels = intrinsic / devicePixelRatio so the
@@ -241,6 +284,22 @@ function fitCanvasToStage(intrinsicW, intrinsicH) {
   }
   const sw = stage.clientWidth;
   const sh = stage.clientHeight;
+  if (cropRect && intrinsicW > 0 && intrinsicH > 0) {
+    // Crop to one host monitor: scale so the monitor's rect aspect-fits the
+    // stage, size the (full) canvas at that scale, and translate it so the
+    // rect's centre lands at the flex-centred stage centre. The stage's
+    // `overflow:hidden` clips everything outside the rect. Input needs no
+    // change — the canvas element still spans the full canvas, so the
+    // pointer-fraction mapping stays correct for the visible sub-region.
+    const scale = Math.min(sw / cropRect.w, sh / cropRect.h);
+    canvas.style.width = (intrinsicW * scale) + "px";
+    canvas.style.height = (intrinsicH * scale) + "px";
+    const tx = (intrinsicW / 2 - (cropRect.x + cropRect.w / 2)) * scale;
+    const ty = (intrinsicH / 2 - (cropRect.y + cropRect.h / 2)) * scale;
+    canvas.style.transform = `translate(${tx}px, ${ty}px)`;
+    return;
+  }
+  canvas.style.transform = "";
   const src = intrinsicW / intrinsicH;
   const dst = sw / sh;
   let w, h;
@@ -303,6 +362,10 @@ async function main() {
     singleStream = !!cfg.videoSingleStream;
     dynamicRes = !!cfg.dynamic;
   } catch (e) { /* older server without /wt-config — assume not trusted */ }
+  // In per-monitor crop mode we must keep the full combined canvas (all host
+  // displays) so their rects stay valid; a dynamic re-encode to the window
+  // would collapse it to one window-sized view. Force non-dynamic.
+  if (DISPLAY_IDX != null) dynamicRes = false;
   // Safari uses the same per-frame transport as Chrome/Edge/Firefox. (An earlier
   // assumption forced Safari onto a single long-lived stream believing its
   // ~100-uni-stream WebTransport credit exhausted on a stream-per-frame; measured
@@ -551,6 +614,17 @@ async function main() {
     intrinsic.w = cfg.canvas_w;
     intrinsic.h = cfg.canvas_h;
     firstFrame = false;
+    // Resolve ?display=N to its host-monitor rect within the combined canvas.
+    // Out-of-range or a host with no layout yet → show the whole canvas.
+    const dr = cfg.display_rects || [];
+    cropRect = (DISPLAY_IDX != null && DISPLAY_IDX >= 0 && DISPLAY_IDX < dr.length)
+      ? dr[DISPLAY_IDX] : null;
+    setupDisplayPicker(dr);
+    if (DISPLAY_IDX != null) {
+      srvLog("info", cropRect
+        ? `display ${DISPLAY_IDX}: crop ${cropRect.w}x${cropRect.h} @${cropRect.x},${cropRect.y}`
+        : `display ${DISPLAY_IDX} not in layout (${dr.length} display(s)); showing full canvas`);
+    }
     fitCanvasToStage(cfg.canvas_w, cfg.canvas_h);
     // A config means the host session is up and streaming (and, after a resize,
     // that the re-encode we requested has landed). Clear the in-flight guard and
@@ -661,6 +735,12 @@ async function main() {
     // Slow safety tick: retries the current size if a re-advertise was lost
     // (the in-flight guard times out at 4s); a no-op via dedup when stable.
     setInterval(reportSize, 2500);
+  } else {
+    // Fixed canvas (explicit --advertise, or per-monitor crop): re-fit/re-crop
+    // to the stage on window resize — no host re-encode, just CSS re-layout.
+    window.addEventListener("resize", () => {
+      if (intrinsic.w > 0) fitCanvasToStage(intrinsic.w, intrinsic.h);
+    });
   }
 
   // Mouse moves go via WebTransport DATAGRAMS — drops are harmless

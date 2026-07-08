@@ -1060,17 +1060,30 @@ class WebTransportBridge:
                 au_bytes = (b"\x00\x00\x00\x01" + sps
                             + b"\x00\x00\x00\x01" + pps + au_bytes)
         cw, ch = session.canvas_dims
+        # Per-host-display rects within the combined canvas (0x451 layout). Lets
+        # a viewer crop to a single host monitor (?display=N) so a multi-monitor
+        # host isn't shown as one squished/black canvas, and drives the Displays
+        # picker. The layout can arrive/change AFTER the first keyframe (the
+        # 0x451 is async on the control channel), so re-send config when it
+        # changes even if the canvas size didn't.
+        drects = [
+            {"id": r.display_id, "x": r.x, "y": r.y, "w": r.w, "h": r.h}
+            for r in session.display_rects
+        ]
         # (Re)send config on the first frame, and again when the canvas size
         # changes mid-session (dynamic resolution) — but only on a keyframe, so
         # the browser re-inits its decoder at the new size on a clean IDR that
         # already carries the new SPS (a delta at the new size would fail).
         if (not self._config_sent
-                or (is_key and (cw, ch) != getattr(self, "_last_config_wh", None))):
+                or (is_key and (cw, ch) != getattr(self, "_last_config_wh", None))
+                or (is_key and drects != getattr(self, "_last_config_drects", None))):
             nt = max(1, session.num_tiles)
             self._last_config_wh = (cw, ch)
+            self._last_config_drects = drects
             cfg = json.dumps({
                 "num_tiles": nt, "canvas_w": cw, "canvas_h": ch,
                 "tile_h": ch // nt, "codec": self._codec_string(session),
+                "display_rects": drects,
             }).encode()
             self._last_config_env = _config_envelope(cfg)
             self._config_sent = True

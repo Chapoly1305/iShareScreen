@@ -13,9 +13,64 @@ from __future__ import annotations
 import socket
 import struct
 import time
+from dataclasses import dataclass
+from typing import Optional
 
 
 PROTOCOL_VERSION = b"RFB 003.889\n"
+
+
+@dataclass(frozen=True)
+class DisplayRect:
+    """One physical display's rectangle within the combined backing (pixel)
+    canvas, from the AppleDisplayLayout (enc 0x451) message. `x/y/w/h` are in
+    BACKING pixels — the coordinates iss crops the decoded canvas by, one
+    window per display, for host↔client monitor mapping."""
+    display_id: int
+    x: int
+    y: int
+    w: int
+    h: int
+
+
+def parse_apple_display_layout(
+    payload: bytes,
+) -> Optional[tuple[int, int, list[DisplayRect]]]:
+    """Parse an AppleDisplayLayout (enc 0x451) rect payload → (backing_w,
+    backing_h, [DisplayRect...]). Returns None if it can't be parsed.
+
+    Wire format (reverse-engineered from screensharingd ViewerMessages +
+    live capture against 1/2/3-display hosts):
+        header 20B:  ver u16 | scaled_w/h u16 | backing_w/h u16 |
+                     0xffffffff u32 | field u32 | display_count u16
+        per display 56B:  hscale f64 | vscale f64 | display_id u32 |
+                     virtual(point) rect y0,x0,y1,x1 (4×u16) |
+                     pixel(backing)  rect y0,x0,y1,x1 (4×u16) |
+                     trailing 20B (gamma/flags, ignored)
+    Rects are (y0,x0,y1,x1); we return them as (x, y, w, h)."""
+    if len(payload) < 20:
+        return None
+    try:
+        _ver = struct.unpack(">H", payload[0:2])[0]
+        _sw, _sh, bw, bh = struct.unpack(">HHHH", payload[2:10])
+        count = struct.unpack(">H", payload[18:20])[0]
+    except struct.error:
+        return None
+    ENTRY = 56
+    rects: list[DisplayRect] = []
+    off = 20
+    for _ in range(count):
+        if off + ENTRY > len(payload):
+            break
+        did = struct.unpack(">I", payload[off + 16:off + 20])[0]
+        py0, px0, py1, px1 = struct.unpack(">HHHH", payload[off + 28:off + 36])
+        # Guard against degenerate/overflowing rects.
+        if px1 > px0 and py1 > py0:
+            rects.append(DisplayRect(did, px0, py0, px1 - px0, py1 - py0))
+        off += ENTRY
+    if not rects:
+        return None
+    return bw, bh, rects
 
 
 # ── message types ─────────────────────────────────────────────────────

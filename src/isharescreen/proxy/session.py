@@ -57,7 +57,7 @@ from .protocol.negotiation import (
     connect_and_negotiate,
 )
 from .protocol.offers import extract_offer_ssrc, create_offers
-from .protocol.rfb import warmup_tcp
+from .protocol.rfb import warmup_tcp, parse_apple_display_layout, DisplayRect
 from .protocol.rtcp import (
     build_empty_sr,
     build_fir,
@@ -330,6 +330,9 @@ class Session:
         self._runtime_canvas_h: int = 0
         self._runtime_scaled_w: int = 0
         self._runtime_scaled_h: int = 0
+        # Per-display rects within the combined backing canvas (0x451 layout);
+        # see the property `display_rects`. Also reset in `_teardown`.
+        self._display_rects: list[DisplayRect] = []
         self._needs_post_layout_fir: bool = False
         self._needs_param_harvest: bool = False
         # Cross-RTP-group accumulators for the post-resize param harvest.
@@ -792,6 +795,15 @@ class Session:
             return (rw, rh)
         n = self._negotiation
         return (n.canvas_width, n.canvas_height) if n else (0, 0)
+
+    @property
+    def display_rects(self) -> list[DisplayRect]:
+        """Per-physical-display rectangles within the combined backing canvas
+        (from AppleDisplayLayout / 0x451). One entry per host monitor, in
+        backing pixels. Empty until the first layout arrives; a single-monitor
+        host reports one full-canvas rect. The frontend crops the combined
+        decoded stream by these to present one window per host monitor."""
+        return list(self._display_rects)
 
     @property
     def scaled_dims(self) -> tuple[int, int]:
@@ -1533,6 +1545,12 @@ class Session:
         self._runtime_canvas_h = 0
         self._runtime_scaled_w = 0
         self._runtime_scaled_h = 0
+        # Per-display rectangles within the combined backing canvas, parsed
+        # from the AppleDisplayLayout (0x451) message. Empty until the first
+        # layout arrives; a single-display host reports one full-canvas rect.
+        # Lets the frontend crop the one combined stream into per-monitor
+        # windows for host↔client multi-monitor mapping.
+        self._display_rects: list[DisplayRect] = []
         self._needs_post_layout_fir = False
         self._needs_param_harvest = False
         self._harvest_vps = None
@@ -2751,6 +2769,26 @@ class Session:
                 # the RX thread (mirrors the 1010/1011 branch).
                 if offset + 2 + prefix_len > len(msg):
                     return
+                # Parse the per-display geometry carried in the layout payload
+                # (each physical display's rect within the combined backing
+                # canvas). The frontend uses these to crop the one combined
+                # stream into per-monitor windows. A single-display host
+                # reports one full-canvas rect.
+                layout = parse_apple_display_layout(
+                    bytes(msg[offset + 2:offset + 2 + prefix_len])
+                )
+                if layout is not None:
+                    _bw, _bh, rects = layout
+                    if rects != self._display_rects:
+                        self._display_rects = rects
+                        log.info(
+                            "AppleDisplayLayout: %d display(s): %s",
+                            len(rects),
+                            ", ".join(
+                                f"#{r.display_id}@{r.x},{r.y} {r.w}x{r.h}"
+                                for r in rects
+                            ),
+                        )
                 needs_post_layout_arm = False
                 # The four u16 geometry fields span offset+4..offset+12, i.e.
                 # they end 10 bytes into the payload (which starts at offset+2),
