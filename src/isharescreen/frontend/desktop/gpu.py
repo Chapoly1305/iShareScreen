@@ -49,9 +49,15 @@ struct VsOut {
 // written into the top-left of the full-size U/V textures; chroma_scale makes
 // the shader sample just that sub-region and the bilinear sampler upsamples
 // chroma to luma resolution — no CPU 4:2:0→4:4:4 upsample needed.
+// uv_offset shifts the sampling origin so we can show an arbitrary sub-rect of
+// the canvas (not just the top-left content crop): used to present ONE host
+// monitor out of a combined multi-display canvas (--display N). Default (0,0)
+// samples from the top-left, i.e. the whole content — unchanged behavior.
 struct Uniforms {
     uv_scale: vec2<f32>,
+    uv_offset: vec2<f32>,
     chroma_scale: vec2<f32>,
+    chroma_offset: vec2<f32>,
 };
 @group(0) @binding(4) var<uniform> U: Uniforms;
 
@@ -82,8 +88,8 @@ fn vs(@builtin(vertex_index) i: u32) -> VsOut {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    let luv = in.uv * U.uv_scale;
-    let cuv = in.uv * U.chroma_scale;
+    let luv = in.uv * U.uv_scale + U.uv_offset;
+    let cuv = in.uv * U.chroma_scale + U.chroma_offset;
     let y  = textureSample(y_tex, samp, luv).r;
     let cb = textureSample(u_tex, samp, cuv).r - 0.5;
     let cr = textureSample(v_tex, samp, cuv).r - 0.5;
@@ -107,7 +113,13 @@ struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
 };
-struct Uniforms { uv_scale: vec2<f32>, };
+// Shares the same uniform buffer as the planar pipeline; reads only the first
+// two vec2s (uv_scale, uv_offset). Biplanar luma+chroma sample at the same uv,
+// so no separate chroma_scale/offset is needed here.
+struct Uniforms {
+    uv_scale: vec2<f32>,
+    uv_offset: vec2<f32>,
+};
 @group(0) @binding(3) var<uniform> U: Uniforms;
 
 @vertex
@@ -134,7 +146,7 @@ fn vs(@builtin(vertex_index) i: u32) -> VsOut {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    let uv = in.uv * U.uv_scale;
+    let uv = in.uv * U.uv_scale + U.uv_offset;
     let y  = textureSample(y_tex, samp, uv).r;
     let c  = textureSample(uv_tex, samp, uv);
     let cb = c.r - 0.5;
@@ -269,24 +281,32 @@ class Renderer:
             mag_filter=wgpu.FilterMode.linear,
             min_filter=wgpu.FilterMode.linear,
         )
-        # 16-byte uniform: vec2 uv_scale (+8 bytes std140 tail padding).
-        # Updated per-draw with the content/canvas ratio. Shared by the
-        # planar and biplanar pipelines.
+        # 32-byte uniform, 4× vec2: uv_scale, uv_offset, chroma_scale,
+        # chroma_offset. Updated per-draw. Shared by the planar (reads all four)
+        # and biplanar (reads uv_scale + uv_offset) pipelines — the shared
+        # layout is why offset follows scale rather than trailing the chroma
+        # pair. Default = full-content crop from the origin (offsets 0).
         self._uniform_buf = device.create_buffer(
-            size=16,
+            size=32,
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
         )
         device.queue.write_buffer(
             self._uniform_buf, 0,
-            np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32).tobytes(),
+            np.array([1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0],
+                     dtype=np.float32).tobytes(),
         )
+        # Optional display crop: a sub-rect of the canvas (in canvas texels) to
+        # present instead of the full content — used to show ONE host monitor
+        # from a combined multi-display canvas (--display N). None = full
+        # content (default). (x, y, w, h).
+        self._src_rect: "tuple[int, int, int, int] | None" = None
         tex_entry = {
             "visibility": wgpu.ShaderStage.FRAGMENT,
             "texture": {"sample_type": wgpu.TextureSampleType.float, "view_dimension": "2d"},
         }
         uniform_entry = {"visibility": wgpu.ShaderStage.FRAGMENT,
                          "buffer": {"type": wgpu.BufferBindingType.uniform}}
-        uniform_resource = {"buffer": self._uniform_buf, "offset": 0, "size": 16}
+        uniform_resource = {"buffer": self._uniform_buf, "offset": 0, "size": 32}
         # Captured for the lazy nv24 (biplanar) pipeline build — see
         # _ensure_biplanar. It's deferred until the first nv24 tile so platforms
         # that only ever hit the planar yuv444p path (every non-Mac build, where
@@ -535,6 +555,25 @@ class Renderer:
         ch = self._content_h or self._h
         return (min(cw, self._w), min(ch, self._h))
 
+    def set_source_rect(self, rect: "tuple[int, int, int, int] | None") -> None:
+        """Present only `rect` (x, y, w, h, in canvas texels) of the canvas,
+        scaled to fill the window — used to show ONE host monitor from a
+        combined multi-display canvas. None restores the full-content view.
+        The crop is clamped to the decoded content in draw()."""
+        self._src_rect = rect
+
+    def source_rect(self) -> "tuple[int, int, int, int]":
+        """The effective presented sub-rect (x, y, w, h) in canvas texels —
+        the display crop if set, else the full decoded content. Input mapping
+        uses this to translate window coords back to canvas coords."""
+        cw, ch = self.content_dims()
+        if self._src_rect is None:
+            return (0, 0, cw, ch)
+        rx, ry, rw, rh = self._src_rect
+        rx = max(0, min(rx, cw)); ry = max(0, min(ry, ch))
+        rw = max(1, min(rw, cw - rx)); rh = max(1, min(rh, ch - ry))
+        return (rx, ry, rw, rh)
+
     def set_cursor_image(self, img) -> None:
         """Upload a new cursor pixmap (`_CursorImage`: RGBA8888 + hotspot) as
         the overlay texture. `img is None` clears the overlay. MUST be called
@@ -622,23 +661,28 @@ class Renderer:
         Apple's viewer. `uv_scale` separately crops sampling to the content
         sub-rect, so black texture padding (host fell back to a frame
         smaller than the advertised canvas) is never sampled."""
-        cw, ch = self.content_dims()
-        # uv_scale crops texture sampling to the decoded content sub-rect
-        # (top-left of the textures); padding outside content_dims is never
-        # sampled. Per-axis: the real frame can be smaller than the canvas
-        # on either axis independently.
+        # The presented sub-rect (crop) in canvas texels: the full decoded
+        # content by default, or one host monitor when a display crop is set.
+        rx, ry, cw, ch = self.source_rect()
+        # uv_scale maps the viewport's [0,1] onto the crop's width/height in the
+        # texture; uv_offset shifts sampling to the crop's origin. Together they
+        # sample exactly the crop sub-rect (never the black padding outside the
+        # decoded content). Default crop = (0,0,content) → offset 0, unchanged.
         ux = cw / self._w if self._w else 1.0
         uy = ch / self._h if self._h else 1.0
+        ox = rx / self._w if self._w else 0.0
+        oy = ry / self._h if self._h else 0.0
         self._dbg_uv = (round(ux, 3), round(uy, 3))
-        # chroma_scale = uv_scale shrunk by the chroma subsample ratio
-        # (== uv_scale for 4:4:4, half for 4:2:0). The half-res chroma is
-        # written into the top-left of the full-size U/V textures, so the
-        # shader samples just that sub-region and the bilinear sampler
-        # upsamples it to luma resolution — no CPU 4:2:0→4:4:4 upsample.
+        # chroma_scale/offset = the luma values shrunk by the chroma subsample
+        # ratio (== luma for 4:4:4, half for 4:2:0). The half-res chroma is
+        # written into the top-left of the full-size U/V textures, so scaling
+        # both the span and the offset by the ratio lands sampling on the same
+        # region of content — the bilinear sampler upsamples to luma res.
         crx, cry = self._chroma_ratio
         self._device.queue.write_buffer(
             self._uniform_buf, 0,
-            np.array([ux, uy, ux * crx, uy * cry], dtype=np.float32).tobytes(),
+            np.array([ux, uy, ox, oy, ux * crx, uy * cry, ox * crx, oy * cry],
+                     dtype=np.float32).tobytes(),
         )
         # Fill the whole window (the pre-rework baseline behavior). The window
         # is aspect-locked to the content (see app.py), so a free resize fills
@@ -691,8 +735,10 @@ class Renderer:
             # axis so it stays square (never stretched). `_cursor_scale` is a
             # calibration / ISS_CURSOR_SCALE multiplier (default 1.0).
             d = min(sclx, scly) * self._cursor_scale
-            px = cx * sclx
-            py = cy * scly
+            # cx,cy are full-canvas texels; the presented crop starts at (rx,ry),
+            # so shift into crop-local space before scaling to the window.
+            px = (cx - rx) * sclx
+            py = (cy - ry) * scly
             sw = self._cur_w * d
             sh = self._cur_h * d
             sx = px - self._cur_hx * d

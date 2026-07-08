@@ -189,15 +189,36 @@ def run(
     *,
     title: str = "iShareScreen",
     auto_quit_secs: int = 0,
+    display: int = -1,
+    display_all: bool = False,
     **_unused: object,
 ) -> int:
     """Open the window streaming `config`. Blocks until close (or
-    `auto_quit_secs` elapses; 0 = forever)."""
+    `auto_quit_secs` elapses; 0 = forever).
+
+    `display` >= 0 crops the combined multi-display canvas to that host
+    monitor (0-based index into the host's display layout), presenting it
+    alone in the window; -1 (default) shows the whole canvas.
+
+    `display_all` opens ONE window per host monitor (the primary shows
+    monitor 0, extra windows cover the rest), all fed by the single decode —
+    the native analog of the browser's per-monitor windows. The user drags
+    each window onto a local monitor and maximizes it."""
     log.info("opening desktop frontend → %s", config.host)
+    if display_all and display < 0:
+        display = 0  # the primary window shows monitor 0; secondaries the rest
     # Dynamic resolution: with no fixed --advertise, size the host's
     # virtual display to the local monitor before connecting; if dynamic
     # tracking is on, the render loop re-advertises on window resize.
     dynamic = config.dynamic_resolution
+    if display >= 0 and dynamic:
+        # A display crop shows ONE monitor of the combined canvas. Dynamic mode
+        # re-advertises the *whole* canvas to the window size on every resize,
+        # which would distort the other monitors and shift the crop — so pin the
+        # canvas when cropping to a single monitor.
+        log.info("--display %d set: disabling dynamic resolution (single-monitor "
+                 "crop needs a fixed canvas)", display)
+        dynamic = False
     if config.advertise is None:
         aw, ah = _auto_advertise_dims()
         rw, rh, scale = _resolve_hidpi_request(
@@ -427,6 +448,41 @@ def run(
     # would freeze its last in-window sprite at the edge (a ghost cursor). The
     # draw callback suppresses the overlay while the pointer is outside.
     _pointer_in_window = {"v": True}
+    # In multi-window mode the shared renderer's crop changes per-window each
+    # frame, so the primary can't read it for input. This pins the primary's
+    # own crop (set when secondaries are spawned); None = use renderer state
+    # (single-window / --display N path, unchanged).
+    _view_crop: list = [None]
+
+    # Registry of every multi-window view (primary + secondaries) as
+    # {"win": glfw_window, "crop": (x, y, w, h)}. Empty in single-window mode.
+    # Used so a button-drag can cross from one window into another: the OS gives
+    # the press-origin window mouse capture and keeps sending it cursor events
+    # (with coords running PAST its own edge) even while the pointer is over
+    # another iss window. We turn the reported coord into a global screen point
+    # and re-map it through whichever view's window actually contains it, so the
+    # host cursor follows continuously across the monitor boundary instead of
+    # pinning at the origin monitor's edge.
+    _mw_views: list = []
+
+    def _global_to_host(gx: float, gy: float) -> Optional[tuple[int, int]]:
+        """Map a GLOBAL screen point to a host-canvas coord via whichever view's
+        window contains it. None if the point is over no iss window (a gap)."""
+        for v in _mw_views:
+            try:
+                px, py = glfw.get_window_pos(v["win"])
+                sw, sh = glfw.get_window_size(v["win"])
+            except Exception:
+                continue
+            if sw > 0 and sh > 0 and px <= gx < px + sw and py <= gy < py + sh:
+                rx, ry, rw, rh = v["crop"]
+                u = min(1.0, max(0.0, (gx - px) / sw))
+                vv = min(1.0, max(0.0, (gy - py) / sh))
+                sx = rx + min(rw - 1, int(u * rw))
+                sy = ry + min(rh - 1, int(vv * rh))
+                return (max(0, min(canvas_w - 1, sx)),
+                        max(0, min(canvas_h - 1, sy)))
+        return None
 
     def to_canvas(wx: float, wy: float) -> Optional[tuple[int, int]]:
         """Map glfw cursor (in glfw window coords) → canvas coords for
@@ -450,27 +506,45 @@ def run(
         win_w, win_h = glfw.get_window_size(glfw_window)
         if win_w == 0 or win_h == 0:
             return None
-        cw, ch = renderer.content_dims()  # real frame size, canvas texels
-        if cw <= 0 or ch <= 0 or canvas_w <= 0 or canvas_h <= 0:
+        # The presented sub-rect (in canvas texels): the full decoded content by
+        # default, or one host monitor when --display crops the canvas. Mapping
+        # against this (not the full content) is what keeps the OS pointer and
+        # the host cursor aligned when a crop is active. In multi-window mode the
+        # primary pins its own crop (the shared renderer state churns per-window).
+        if _view_crop[0] is not None:
+            rx, ry, rw, rh = _view_crop[0]
+        else:
+            rx, ry, rw, rh = renderer.source_rect()
+        if rw <= 0 or rh <= 0 or canvas_w <= 0 or canvas_h <= 0:
             return None
-        # Mirror draw()'s fill: the content is stretched to fill the whole
-        # window per-axis (no bars), so the window->content map is a plain
-        # per-axis fraction. Keeping this in lockstep with draw() is what keeps
-        # the host cursor aligned with the OS pointer — a uniform/letterbox
-        # map here against a stretched draw makes the cursor drift, visible as
-        # a jump when the overlay hands off to the OS cursor at the edge.
-        u = wx / win_w if win_w else 0.0
-        v = wy / win_h if win_h else 0.0
-        u = min(1.0, max(0.0, u))
-        v = min(1.0, max(0.0, v))
-        sx = min(cw - 1, int(u * cw))
-        sy = min(ch - 1, int(v * ch))
+        # Mirror draw()'s fill: the crop is stretched to fill the whole window
+        # per-axis (no bars), so the window->crop map is a plain per-axis
+        # fraction, then translated by the crop origin into full-canvas coords.
+        # Keeping this in lockstep with draw() is what keeps the host cursor
+        # aligned with the OS pointer.
+        u = min(1.0, max(0.0, wx / win_w if win_w else 0.0))
+        v = min(1.0, max(0.0, wy / win_h if win_h else 0.0))
+        sx = rx + min(rw - 1, int(u * rw))
+        sy = ry + min(rh - 1, int(v * rh))
         return (max(0, min(canvas_w - 1, sx)),
                 max(0, min(canvas_h - 1, sy)))
 
     def on_cursor_pos(_w, x, y):
         nonlocal cursor
-        cursor = to_canvas(x, y)
+        # Only a button-held DRAG needs the global remap (the OS keeps sending
+        # drag events to the press-origin window even past its edge). A free
+        # move is already delivered to whichever window the pointer is over, so
+        # mapping through this window's own crop is correct — and avoids picking
+        # the wrong window when they overlap (e.g. stacked at spawn).
+        if _mw_views and button_mask:
+            try:
+                px, py = glfw.get_window_pos(glfw_window)
+                g = _global_to_host(px + x, py + y)
+            except Exception:
+                g = None
+            cursor = g if g is not None else to_canvas(x, y)
+        else:
+            cursor = to_canvas(x, y)
         if cursor is not None:
             session.input.pointer_event(button_mask, cursor[0], cursor[1])
 
@@ -623,6 +697,152 @@ def run(
     else:
         kbd_grab = None
 
+    # ── secondary windows (multi-monitor: one window per host monitor) ──────
+    # Each secondary shows a FIXED crop of the SAME decoded canvas — no extra
+    # decode or connection (the browser frontend fans out one session to N
+    # windows the same way). The primary window above owns the cursor cache and
+    # keyboard grab; secondaries are functional viewers (video crop + mouse +
+    # keys), each mapping its own input through its own crop. The main loop sets
+    # the shared renderer's crop before each window draws. Spawned once the host
+    # layout (0x451) lands, in the loop below.
+    import types as _types
+
+    def _spawn_secondary(crop, title_s):
+        rx0, ry0, rw0, rh0 = crop
+        base = min(rw0, 1280) or 1280
+        win_w2 = max(1, base)
+        win_h2 = max(1, int(base * rh0 / rw0)) if rw0 else base
+        w2 = RenderCanvas(title=title_s, size=(win_w2, win_h2), max_fps=120)
+        gw2 = w2._window
+        try:
+            glfw.set_window_aspect_ratio(gw2, rw0, rh0)
+        except Exception:
+            pass
+        ctx2 = w2.get_context("wgpu")
+        ctx2.configure(device=device, format=surface_format, alpha_mode="opaque")
+        st = _types.SimpleNamespace(
+            window=w2, glfw_window=gw2, crop=crop, cursor=None, last_drawn=None,
+            button_mask=0, in_win={"v": True}, wheel_accum=[0.0], wheel_last=[0.0],
+            device_lost=False,
+        )
+
+        def to_canvas2(wx, wy):
+            ww, wh = glfw.get_window_size(gw2)
+            if ww == 0 or wh == 0:
+                return None
+            u = min(1.0, max(0.0, wx / ww))
+            v = min(1.0, max(0.0, wy / wh))
+            sx = rx0 + min(rw0 - 1, int(u * rw0))
+            sy = ry0 + min(rh0 - 1, int(v * rh0))
+            return (max(0, min(canvas_w - 1, sx)), max(0, min(canvas_h - 1, sy)))
+
+        def on_pos2(_w, x, y):
+            # Only a button-held drag needs the global remap (to cross into
+            # another window without pinning at the edge); a free move is
+            # correctly delivered here already, so use this window's own crop.
+            if _mw_views and st.button_mask:
+                try:
+                    px, py = glfw.get_window_pos(gw2)
+                    g = _global_to_host(px + x, py + y)
+                except Exception:
+                    g = None
+                st.cursor = g if g is not None else to_canvas2(x, y)
+            else:
+                st.cursor = to_canvas2(x, y)
+            if st.cursor is not None:
+                session.input.pointer_event(st.button_mask, st.cursor[0], st.cursor[1])
+
+        def on_btn2(_w, button, action, _mods):
+            bit = glfw_button_to_rfb_bit(button)
+            if bit == 0:
+                return
+            if action == glfw.PRESS:
+                st.button_mask |= bit
+            elif action == glfw.RELEASE:
+                st.button_mask &= ~bit
+            if st.cursor is not None:
+                session.input.pointer_event(st.button_mask, st.cursor[0], st.cursor[1])
+
+        def on_scroll2(_w, _x, dy):
+            if st.cursor is None or dy == 0:
+                return
+            now = time.monotonic() * 1000.0
+            dt = now - st.wheel_last[0]
+            st.wheel_last[0] = now
+            accel = (10.0 if dt < 25 else 6.0 if dt < 50 else 3.5 if dt < 100
+                     else 2.0 if dt < 200 else 1.4 if dt < 350 else 1.0)
+            st.wheel_accum[0] += -dy * _WHEEL_MULT * accel
+            st.wheel_accum[0] = max(-200.0, min(200.0, st.wheel_accum[0]))
+            ticks = int(st.wheel_accum[0])
+            if ticks == 0:
+                return
+            emit = max(-50, min(50, ticks))
+            st.wheel_accum[0] -= emit
+            session.input.scroll_event(st.cursor[0], st.cursor[1], 0, emit)
+
+        def on_enter2(_w, entered):
+            st.in_win["v"] = bool(entered)
+
+        def on_key2(_w, key, _sc, action, mods):
+            if action not in (glfw.PRESS, glfw.RELEASE, glfw.REPEAT):
+                return
+            if ctrl_as_cmd:
+                if key == glfw.KEY_LEFT_CONTROL:
+                    session.input.key_event(action != glfw.RELEASE, _KEYSYM_SUPER_L)
+                    return
+                if key == glfw.KEY_RIGHT_CONTROL:
+                    session.input.key_event(action != glfw.RELEASE, _KEYSYM_SUPER_R)
+                    return
+            keysym = GLFW_KEY_TO_X11.get(key, 0)
+            if keysym == 0:
+                held = mods & (glfw.MOD_CONTROL | glfw.MOD_SUPER | glfw.MOD_ALT)
+                if held and glfw.KEY_A <= key <= glfw.KEY_Z:
+                    keysym = ord("a") + (key - glfw.KEY_A)
+                elif held and glfw.KEY_0 <= key <= glfw.KEY_9:
+                    keysym = ord("0") + (key - glfw.KEY_0)
+                elif held and key == glfw.KEY_SPACE:
+                    keysym = ord(" ")
+                else:
+                    return
+            session.input.key_event(action != glfw.RELEASE, keysym)
+
+        def on_char2(_w, codepoint):
+            session.input.key_event(True, codepoint)
+            session.input.key_event(False, codepoint)
+
+        glfw.set_cursor_pos_callback(gw2, on_pos2)
+        glfw.set_mouse_button_callback(gw2, on_btn2)
+        glfw.set_scroll_callback(gw2, on_scroll2)
+        glfw.set_cursor_enter_callback(gw2, on_enter2)
+        glfw.set_key_callback(gw2, on_key2)
+        glfw.set_char_callback(gw2, on_char2)
+
+        def draw2():
+            try:
+                target = ctx2.get_current_texture()
+                renderer.set_source_rect(st.crop)
+                if _canvas_cursor:
+                    renderer.set_cursor_pos(st.cursor if st.in_win["v"] else None)
+                    try:
+                        lw, _lh = glfw.get_window_size(gw2)
+                        renderer.set_cursor_scale(_cursor_render_scale(target.width, lw))
+                    except Exception:
+                        pass
+                renderer.draw(target.create_view(), target.width, target.height)
+            except Exception as e:
+                m = str(e)
+                if "device is lost" in m.lower() or "Validation Error" in m:
+                    st.device_lost = True
+                    return
+                raise
+
+        st.draw = draw2
+        w2.request_draw(draw2)
+        return st
+
+    secondaries: list = []
+    _secondaries_spawned = [not display_all]  # latched once layout lands
+
     # ── render loop ────────────────────────────────────────────────────
     first_seen: list[bool] = [False] * num_tiles
     slot_h_resolved = False
@@ -642,10 +862,19 @@ def run(
     _device_lost: dict[str, bool] = {"v": False}
     _locked_aspect: list = [0.0]  # last content aspect the window was locked to
     _geom_last: list = [()]  # last logged render-geom tuple (re-log only on change)
+    _crop_applied: list = [display < 0]  # --display crop latched once layout lands
 
     def draw_callback():
         try:
             target = surface_ctx.get_current_texture()
+            # Multi-window: re-assert THIS window's crop before drawing. The
+            # shared renderer's source-rect is left at the last secondary's crop
+            # after each loop iteration, so a repaint the loop didn't trigger
+            # (an OS expose/resize firing this callback directly) would otherwise
+            # render another monitor's region. No-op in single-window mode
+            # (_view_crop[0] is None).
+            if _view_crop[0] is not None:
+                renderer.set_source_rect(_view_crop[0])
             # Lock the window to the *content* aspect (authoritative once the
             # first tile lands; the advertised aspect set at window creation is
             # only a guess and is wrong when the host falls back to a different
@@ -659,7 +888,30 @@ def run(
             # (the renderer already letterboxes any transient mismatch). The
             # lock is only useful for FIXED-resolution sessions where the host
             # may fall back to a different-aspect canvas.
-            _ccw, _cch = renderer.content_dims()
+            # Apply the --display crop once the host's per-monitor layout lands
+            # (AppleDisplayLayout / 0x451 arrives async, after connect). Retried
+            # each frame until it lands, then latched.
+            if not _crop_applied[0]:
+                _rects = session.display_rects
+                if len(_rects) > display:
+                    _r = _rects[display]
+                    renderer.set_source_rect((_r.x, _r.y, _r.w, _r.h))
+                    _crop_applied[0] = True
+                    _locked_aspect[0] = 0.0  # force the aspect-lock below to re-fit
+                    log.info(
+                        "--display %d: cropping to host monitor #%d @%d,%d %dx%d",
+                        display, _r.display_id, _r.x, _r.y, _r.w, _r.h)
+                elif _rects:
+                    log.warning(
+                        "--display %d out of range (host has %d monitor(s)) — "
+                        "showing the full canvas", display, len(_rects))
+                    _crop_applied[0] = True
+            # Lock the window to the PRESENTED aspect — the crop when --display
+            # is active, else the full decoded content. source_rect() returns
+            # the content rect when no crop is set, so this is unchanged for the
+            # default path.
+            _sr = renderer.source_rect()
+            _ccw, _cch = _sr[2], _sr[3]
             if (not dynamic) and _ccw > 0 and _cch > 0:
                 _asp = _ccw / _cch
                 if abs(_asp - _locked_aspect[0]) > 0.01:
@@ -1029,6 +1281,47 @@ def run(
         if (new_cw, new_ch) != (canvas_w, canvas_h) and new_cw and new_ch:
             _apply_new_canvas()
 
+        # Multi-window: once the host's per-monitor layout (0x451) lands, open
+        # one window per monitor (primary already covers monitor 0). A single-
+        # monitor host reports one rect → no secondaries, primary shows it.
+        if not _secondaries_spawned[0]:
+            _rects = session.display_rects
+            if _rects:
+                _view_crop[0] = (_rects[0].x, _rects[0].y, _rects[0].w, _rects[0].h)
+                _mw_views.append({"win": glfw_window, "crop": _view_crop[0]})
+                if len(_rects) > 1:
+                    try:
+                        glfw.set_window_title(glfw_window, f"{title} — monitor 1")
+                    except Exception:
+                        pass
+                for _i in range(1, len(_rects)):
+                    _r = _rects[_i]
+                    _sv = _spawn_secondary(
+                        (_r.x, _r.y, _r.w, _r.h), f"{title} — monitor {_i + 1}")
+                    secondaries.append(_sv)
+                    _mw_views.append({"win": _sv.glfw_window, "crop": _sv.crop})
+                _secondaries_spawned[0] = True
+                log.info("multi-window: opened %d window(s) for %d host monitor(s)",
+                         1 + len(secondaries), len(_rects))
+
+        # Reap secondaries the user closed (independently of the primary).
+        if secondaries:
+            _alive = []
+            for sv in secondaries:
+                if (sv.device_lost or sv.window.get_closed()
+                        or glfw.window_should_close(sv.glfw_window)):
+                    # Drop its _mw_views entry FIRST — else _global_to_host would
+                    # call glfw on the destroyed window handle (native crash).
+                    _mw_views[:] = [v for v in _mw_views
+                                    if v["win"] is not sv.glfw_window]
+                    try:
+                        sv.window.close()
+                    except Exception:
+                        pass
+                else:
+                    _alive.append(sv)
+            secondaries[:] = _alive
+
         session.wait_for_fresh_tile(timeout=_FRESH_TILE_WAIT_S)
 
         # Drain fresh decoded frames + upload.
@@ -1052,12 +1345,30 @@ def run(
         # static screen (no fresh tile) would never repaint, freezing the
         # last-drawn cursor (e.g. an I-beam stuck after login).
         cursor_moved = _canvas_cursor and cursor != _last_drawn_cursor
-        if (any_fresh or cursor_moved or _cursor_dirty["v"]) and any(first_seen):
-            window.force_draw()
+        _sec_moved = _canvas_cursor and any(
+            sv.cursor != sv.last_drawn for sv in secondaries)
+        if ((any_fresh or cursor_moved or _sec_moved or _cursor_dirty["v"])
+                and any(first_seen)):
+            if display_all:
+                # Draw each window with its own crop. Every draw callback
+                # (primary draw_callback and each secondary draw2) self-asserts
+                # its own crop on the shared renderer before drawing, so order
+                # here doesn't matter.
+                window.force_draw()
+                for sv in secondaries:
+                    sv.window.force_draw()
+                    sv.last_drawn = sv.cursor
+            else:
+                window.force_draw()
             _last_drawn_cursor = cursor
             _cursor_dirty["v"] = False
 
     log.info("desktop frontend closing")
+    for sv in secondaries:
+        try:
+            sv.window.close()
+        except Exception:
+            pass
     if kbd_grab is not None:
         kbd_grab.disable()
     if audio_sink is not None:

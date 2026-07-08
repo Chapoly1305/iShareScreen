@@ -127,6 +127,16 @@ def _make_parser() -> argparse.ArgumentParser:
         help="advertise HDR-capable viewer to the host",
     )
     g.add_argument(
+        "--display", metavar="N|all", default=None,
+        help=(
+            "when the host has multiple monitors it streams them as one "
+            "combined canvas. 'N' (0-based) shows only that monitor cropped to "
+            "fill the window; 'all' opens one window per monitor (drag each "
+            "onto a local screen and maximize). Omit to show the whole stacked "
+            "canvas. Desktop frontend only."
+        ),
+    )
+    g.add_argument(
         "--hidpi", choices=("auto", "on", "off"), default="auto",
         help=(
             "HiDPI (Retina) rendering of the host display. 'on' = Retina 2x, "
@@ -428,7 +438,21 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
             if resolve_codec("auto") == "avc":
                 os.environ["ISS_VIDEO_CODEC"] = "avc"
         from isharescreen.frontend.desktop.app import run as run_desktop
-        return run_desktop(config, auto_quit_secs=args.auto_quit_secs)
+        # --display N|all: 'all' = one window per host monitor; N = crop to
+        # monitor N; omitted/invalid = whole canvas.
+        display_all = False
+        display_idx = -1
+        if args.display is not None:
+            if str(args.display).strip().lower() == "all":
+                display_all = True
+            else:
+                try:
+                    display_idx = int(args.display)
+                except ValueError:
+                    log.warning("--display %r not understood (want N or 'all') "
+                                "— showing the whole canvas", args.display)
+        return run_desktop(config, auto_quit_secs=args.auto_quit_secs,
+                           display=display_idx, display_all=display_all)
     # browser (default): H.264 pass-through needs the AVC codec path. The
     # Session reads ISS_VIDEO_CODEC at construction, so force it unless the
     # user explicitly chose a codec.
