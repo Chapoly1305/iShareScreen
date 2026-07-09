@@ -803,7 +803,48 @@ class Session:
         backing pixels. Empty until the first layout arrives; a single-monitor
         host reports one full-canvas rect. The frontend crops the combined
         decoded stream by these to present one window per host monitor."""
+        fake = os.environ.get("ISS_FAKE_DISPLAY_RECTS")
+        if fake:
+            faked = self._fake_display_rects(fake)
+            if faked:
+                return faked
         return list(self._display_rects)
+
+    def _fake_display_rects(self, spec: str) -> list[DisplayRect]:
+        """Test hook: fabricate a multi-monitor layout so the per-monitor
+        window path can be exercised on a single-monitor host (real virtual
+        displays are blocked by macOS's spawnProxy gate). `spec` is either
+        an integer N ("2" → split the canvas into N side-by-side monitors,
+        "2v" → N stacked) or explicit "x,y,w,h;x,y,w,h;…" in backing pixels.
+        Returns [] until the canvas size is known so the real (empty) layout
+        is used during connect."""
+        cw, ch = self.canvas_dims
+        spec = spec.strip()
+        try:
+            if ";" in spec or (spec.count(",") >= 3):
+                rects = []
+                for i, part in enumerate(spec.split(";")):
+                    x, y, w, h = (int(v) for v in part.split(","))
+                    rects.append(DisplayRect(display_id=i + 1, x=x, y=y, w=w, h=h))
+                return rects
+            vertical = spec.endswith("v")
+            n = int(spec[:-1] if vertical else spec)
+            span = ch if vertical else cw
+            if n < 1 or not cw or not ch or n > span:
+                return []  # n > span would make 0-px strips
+            rects = []
+            for i in range(n):
+                if vertical:
+                    y0 = ch * i // n
+                    y1 = ch * (i + 1) // n
+                    rects.append(DisplayRect(display_id=i + 1, x=0, y=y0, w=cw, h=y1 - y0))
+                else:
+                    x0 = cw * i // n
+                    x1 = cw * (i + 1) // n
+                    rects.append(DisplayRect(display_id=i + 1, x=x0, y=0, w=x1 - x0, h=ch))
+            return rects
+        except (ValueError, ZeroDivisionError):
+            return []
 
     @property
     def scaled_dims(self) -> tuple[int, int]:
