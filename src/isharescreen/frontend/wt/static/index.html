@@ -86,6 +86,17 @@
     font: inherit;
   }
   #fs-btn:hover { background: rgba(20,120,220,.85); }
+  /* Prominent one-click "open a window per host monitor" — the primary path on
+     a multi-monitor host, so it's accent-coloured rather than a subtle control. */
+  #openall {
+    flex: 0 0 auto;
+    background: rgba(20,120,220,.9); color: #fff;
+    border: 1px solid rgba(90,170,255,.6);
+    border-radius: 4px; cursor: pointer;
+    height: 26px; padding: 0 10px;
+    font: inherit; font-weight: 600; white-space: nowrap;
+  }
+  #openall:hover { background: rgba(40,140,240,1); }
 </style>
 </head>
 <body>
@@ -119,6 +130,7 @@
     <option value="800x600">800 × 600 (SVGA)</option>
     <option value="640x480">640 × 480 (VGA)</option>
   </select>
+  <button id="openall" title="This Mac has multiple monitors — open one viewer window per monitor" style="display:none"></button>
   <select id="disp" title="This Mac has multiple monitors — open one per window" style="display:none">
     <option value="">🖥 Displays…</option>
   </select>
@@ -252,11 +264,39 @@ let cropRect = null;
 // local monitor for 1:1 host↔client mapping. Hidden on single-monitor hosts and
 // on per-monitor windows.
 const dispSel = document.getElementById("disp");
+const openAllBtn = document.getElementById("openall");
+
+// Build a viewer URL for host monitor `idx`, PRESERVING every existing query
+// param (hash/transport/decode/lat/…). Dropping ?hash= would break the new
+// tab's WebTransport cert trust, so we can't just write `?display=N`.
+function displayUrl(idx) {
+  const p = new URLSearchParams(location.search);
+  p.set("display", String(idx));
+  return "?" + p.toString();
+}
+
+// Open one viewer window per host monitor. Monitors 1..N-1 open as new windows;
+// THIS tab repurposes itself into monitor 0, so we end up with exactly N viewers
+// and no redundant full-canvas stream (which would double the host's encoder
+// load). MUST be called from a user gesture — the monitor count only arrives
+// after connect (async 0x451 layout), long after the connect click's activation
+// has lapsed, and browsers block window.open() that isn't gesture-driven.
+function openAllDisplays(rects) {
+  for (let i = 1; i < rects.length; i++) window.open(displayUrl(i), `_disp${i}`);
+  location.search = displayUrl(0);  // navigate self last, after the popups fire
+}
+
 function setupDisplayPicker(rects) {
   if (DISPLAY_IDX != null || !rects || rects.length < 2) {
     dispSel.style.display = "none";
+    openAllBtn.style.display = "none";
     return;
   }
+  // Prominent one-click "open all" is the primary path for a multi-monitor host.
+  openAllBtn.textContent = `🖥 Open all ${rects.length} displays`;
+  openAllBtn.style.display = "";
+  openAllBtn.onclick = () => openAllDisplays(rects);
+  // The dropdown keeps the finer picks (open just one monitor in its own window).
   dispSel.innerHTML = '<option value="">🖥 Displays…</option>'
     + rects.map((r, i) =>
         `<option value="${i}">Monitor ${i + 1} (${r.w}×${r.h}) → new window</option>`).join("")
@@ -265,9 +305,9 @@ function setupDisplayPicker(rects) {
   dispSel.onchange = () => {
     const v = dispSel.value;
     if (v === "all") {
-      for (let i = 0; i < rects.length; i++) window.open(`?display=${i}`, `_disp${i}`);
+      openAllDisplays(rects);
     } else if (v !== "") {
-      window.open(`?display=${v}`, `_disp${v}`);
+      window.open(displayUrl(parseInt(v, 10)), `_disp${v}`);
     }
     dispSel.value = "";  // reset so the same monitor can be re-picked
   };
