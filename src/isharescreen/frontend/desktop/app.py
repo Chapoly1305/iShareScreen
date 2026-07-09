@@ -200,13 +200,22 @@ def run(
     monitor (0-based index into the host's display layout), presenting it
     alone in the window; -1 (default) shows the whole canvas.
 
-    `display_all` opens ONE window per host monitor (the primary shows
-    monitor 0, extra windows cover the rest), all fed by the single decode —
-    the native analog of the browser's per-monitor windows. The user drags
-    each window onto a local monitor and maximizes it."""
+    `display_all` (the CLI default) auto-opens ONE window per host monitor
+    once the layout lands — but ONLY if the host actually has more than one
+    (the primary shows monitor 1, extra windows cover the rest), all fed by
+    the single decode. This is the native analog of the browser's per-monitor
+    windows; the user drags each window onto a local monitor and maximizes it.
+    A single-monitor host stays one window with dynamic resolution intact, so
+    the common case is unchanged. `display_all=False` (--display combined)
+    keeps the whole stacked canvas in one window."""
     log.info("opening desktop frontend → %s", config.host)
-    if display_all and display < 0:
-        display = 0  # the primary window shows monitor 0; secondaries the rest
+    # In display_all/auto mode we deliberately DON'T force `display` to a monitor
+    # index here. Doing so would disable dynamic resolution (below) for every
+    # host — including single-monitor hosts, where we can't yet know the count
+    # (it arrives post-connect via the 0x451 layout). Instead we keep dynamic on
+    # and only switch to per-monitor windows — disabling dynamic then — once the
+    # layout lands AND reports more than one monitor (see the spawn block in the
+    # render loop). The primary's crop is driven by `_view_crop`, not `display`.
     # Dynamic resolution: with no fixed --advertise, size the host's
     # virtual display to the local monitor before connecting; if dynamic
     # tracking is on, the render loop re-advertises on window resize.
@@ -219,6 +228,9 @@ def run(
         log.info("--display %d set: disabling dynamic resolution (single-monitor "
                  "crop needs a fixed canvas)", display)
         dynamic = False
+    # Runtime-mutable view of `dynamic`: auto multi-window mode flips this to
+    # False once it discovers a multi-monitor host and spawns per-monitor windows.
+    _dynamic = [dynamic]
     if config.advertise is None:
         aw, ah = _auto_advertise_dims()
         rw, rh, scale = _resolve_hidpi_request(
@@ -912,7 +924,7 @@ def run(
             # default path.
             _sr = renderer.source_rect()
             _ccw, _cch = _sr[2], _sr[3]
-            if (not dynamic) and _ccw > 0 and _cch > 0:
+            if (not _dynamic[0]) and _ccw > 0 and _cch > 0:
                 _asp = _ccw / _cch
                 if abs(_asp - _locked_aspect[0]) > 0.01:
                     _locked_aspect[0] = _asp
@@ -1270,7 +1282,7 @@ def run(
         if _device_lost["v"]:
             break
 
-        if dynamic:
+        if _dynamic[0]:
             _poll_resize()
         if not session.is_connected:
             log.error("connection lost — closing viewer")
@@ -1287,22 +1299,34 @@ def run(
         if not _secondaries_spawned[0]:
             _rects = session.display_rects
             if _rects:
-                _view_crop[0] = (_rects[0].x, _rects[0].y, _rects[0].w, _rects[0].h)
-                _mw_views.append({"win": glfw_window, "crop": _view_crop[0]})
                 if len(_rects) > 1:
+                    # Multi-monitor host: switch to one window per monitor. Pin
+                    # the primary to monitor 1 and stop dynamic re-advertising —
+                    # it re-sizes the WHOLE canvas to one window, which would
+                    # distort the other monitors and shift every crop.
+                    _dynamic[0] = False
+                    _view_crop[0] = (_rects[0].x, _rects[0].y, _rects[0].w, _rects[0].h)
+                    _mw_views.append({"win": glfw_window, "crop": _view_crop[0]})
                     try:
                         glfw.set_window_title(glfw_window, f"{title} — monitor 1")
                     except Exception:
                         pass
-                for _i in range(1, len(_rects)):
-                    _r = _rects[_i]
-                    _sv = _spawn_secondary(
-                        (_r.x, _r.y, _r.w, _r.h), f"{title} — monitor {_i + 1}")
-                    secondaries.append(_sv)
-                    _mw_views.append({"win": _sv.glfw_window, "crop": _sv.crop})
+                    for _i in range(1, len(_rects)):
+                        _r = _rects[_i]
+                        _sv = _spawn_secondary(
+                            (_r.x, _r.y, _r.w, _r.h), f"{title} — monitor {_i + 1}")
+                        secondaries.append(_sv)
+                        _mw_views.append({"win": _sv.glfw_window, "crop": _sv.crop})
+                    log.info("multi-window: opened %d window(s) for %d host monitor(s)",
+                             1 + len(secondaries), len(_rects))
+                else:
+                    # Single-monitor host: keep the one window showing the whole
+                    # canvas, with dynamic resolution intact. Don't pin a crop — a
+                    # pinned crop would go stale the moment a dynamic re-advertise
+                    # changes the canvas dimensions.
+                    log.info("single-monitor host — one window, dynamic=%s",
+                             _dynamic[0])
                 _secondaries_spawned[0] = True
-                log.info("multi-window: opened %d window(s) for %d host monitor(s)",
-                         1 + len(secondaries), len(_rects))
 
         # Reap secondaries the user closed (independently of the primary).
         if secondaries:

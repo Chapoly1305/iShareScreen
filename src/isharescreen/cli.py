@@ -127,13 +127,15 @@ def _make_parser() -> argparse.ArgumentParser:
         help="advertise HDR-capable viewer to the host",
     )
     g.add_argument(
-        "--display", metavar="N|all", default=None,
+        "--display", metavar="N|all|combined", default=None,
         help=(
             "when the host has multiple monitors it streams them as one "
-            "combined canvas. 'N' (0-based) shows only that monitor cropped to "
-            "fill the window; 'all' opens one window per monitor (drag each "
-            "onto a local screen and maximize). Omit to show the whole stacked "
-            "canvas. Desktop frontend only."
+            "combined canvas. By default iss auto-opens one window per host "
+            "monitor (drag each onto a local screen and maximize); a "
+            "single-monitor host stays one window. 'N' (0-based) shows only "
+            "that monitor cropped to fill the window; 'combined' shows the "
+            "whole stacked canvas in a single window; 'all' is an explicit "
+            "alias for the per-monitor default. Desktop frontend only."
         ),
     )
     g.add_argument(
@@ -438,19 +440,27 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
             if resolve_codec("auto") == "avc":
                 os.environ["ISS_VIDEO_CODEC"] = "avc"
         from isharescreen.frontend.desktop.app import run as run_desktop
-        # --display N|all: 'all' = one window per host monitor; N = crop to
-        # monitor N; omitted/invalid = whole canvas.
-        display_all = False
+        # --display: default (omitted) auto-opens one window per host monitor if
+        # the host has more than one; a single-monitor host stays one window with
+        # dynamic resolution intact. 'combined' = the old single window showing
+        # the whole stacked multi-monitor canvas. 'N' = crop to host monitor N in
+        # one window. 'all' = explicit alias for the per-monitor default.
+        display_all = True   # auto per-monitor is the default
         display_idx = -1
         if args.display is not None:
-            if str(args.display).strip().lower() == "all":
+            _d = str(args.display).strip().lower()
+            if _d == "all":
                 display_all = True
+            elif _d == "combined":
+                display_all = False           # whole stacked canvas, one window
             else:
                 try:
                     display_idx = int(args.display)
+                    display_all = False        # crop to one monitor, one window
                 except ValueError:
-                    log.warning("--display %r not understood (want N or 'all') "
-                                "— showing the whole canvas", args.display)
+                    log.warning("--display %r not understood (want N, 'all', or "
+                                "'combined') — auto-opening one window per "
+                                "monitor", args.display)
         return run_desktop(config, auto_quit_secs=args.auto_quit_secs,
                            display=display_idx, display_all=display_all)
     # browser (default): H.264 pass-through needs the AVC codec path. The
