@@ -1769,6 +1769,7 @@ class Session:
             "non-existing pps",
             "no frame!",
             "missing reference",
+            "reference picture missing",   # AVC "reference picture missing during reorder"
             "decode_slice_header error",
             "skipping bitstream",
         )
@@ -1915,10 +1916,19 @@ class Session:
             return
         now = time.monotonic()
 
-        # Track sustained "Could not find ref" events. Threshold breach
-        # means real corruption that won't self-heal before the next
-        # natural IDR cycle.
-        if "could not find ref" in msg.lower():
+        # Track sustained reference-missing events. Threshold breach means real
+        # corruption that won't self-heal before the next natural IDR cycle.
+        # "could not find ref" is libav-HEVC's ref-miss signature; the AVC path
+        # emits "reference picture missing" / "Missing reference picture" for the
+        # SAME class of failure — a reference the encoder used got discarded
+        # (Apple over-references past H.264's 16-frame DPB cap, so libav drops
+        # one and a later frame can't find it). Treat them identically so
+        # recovery FIRs promptly, instead of the slow, guarded soft-concealment
+        # path that let the AVC corruption propagate until a manual force-IDR.
+        _ml = msg.lower()
+        if ("could not find ref" in _ml
+                or "reference picture missing" in _ml
+                or "missing reference picture" in _ml):
             self._last_concealment_msg = msg
             # Storm tracking for reconnect escalation: a long gap since the
             # last ref-miss means the prior storm cleared → reset the count.
@@ -1961,7 +1971,7 @@ class Session:
                     self.request_fir(None)
                 else:
                     log.warning(
-                        "DPB break: %d 'Could not find ref' events in %.1fs "
+                        "DPB break: %d reference-missing events in %.1fs "
                         "— FIR for fresh IDR (attempt %d/%d before force-all)",
                         self._DPB_ERR_THRESHOLD, self._DPB_ERR_WINDOW_S,
                         self._dpb_fir_count, self._DPB_FORCEALL_AFTER_FIRS,
