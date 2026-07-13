@@ -384,13 +384,8 @@ _FORM = """<!doctype html><html><head><title>iShareScreen — Connect</title>__H
    <option value="4.0">400% — largest UI</option>
   </select>
   <label>Decoder</label>
-  <select name="decoder">
-   <option value="auto" selected>Auto</option>
-   <option value="vt-hevc444">HEVC — VideoToolbox (Mac)</option>
-   <option value="libav-hevc444">HEVC — Generic HW</option>
-   <option value="qsv-hevc444">HEVC — Intel QSV</option>
-   <option value="libav-hevc444-sw">HEVC — Software</option>
-   <option value="libav-avc420">H.264</option>
+  <select name="decoder" title="Only decoders available on this computer are listed. 'Auto' picks the best one; the rest are for pinning a specific path when debugging.">
+   __DECODER_OPTIONS__
   </select>
   <div class="row"><input type="checkbox" name="audio" id="audio" checked><label for="audio" style="margin:0">Audio</label></div>
   <div class="row"><input type="checkbox" name="curtain" id="curtain" checked><label for="curtain" style="margin:0">Curtain (private virtual display)</label></div>
@@ -558,6 +553,36 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
 </script></body></html>"""
 
 
+# Friendly labels for the registry's decoder specs. The dropdown only lists
+# decoders SUPPORTED ON THIS CLIENT PLATFORM (via the registry), so e.g.
+# VideoToolbox never shows on Windows/Linux and Intel QSV never shows on macOS.
+_DECODER_LABELS = {
+    "vt-hevc444":       "HEVC — VideoToolbox (Mac GPU)",
+    "libav-hevc444":    "HEVC — Generic GPU (d3d11va / vaapi / cuda)",
+    "qsv-hevc444":      "HEVC — Intel Quick Sync",
+    "libav-hevc444-sw": "HEVC — Software (CPU)",
+    "libav-avc420":     "H.264",
+}
+
+
+def _decoder_options_html() -> str:
+    """<option>s for the decoder dropdown, filtered to decoders the registry
+    reports as supported on THIS platform. 'Auto' first + selected."""
+    import html as _h
+    opts = ['<option value="auto" selected>Auto (best available)</option>']
+    try:
+        from isharescreen.proxy.media.registry import all_specs
+        for s in all_specs():
+            if not s.supported_here():
+                continue
+            label = _DECODER_LABELS.get(s.name, f"{s.codec.upper()} — {s.name}")
+            opts.append(f'<option value="{_h.escape(s.name, quote=True)}">'
+                        f'{_h.escape(label)}</option>')
+    except Exception:
+        pass  # registry unavailable → just offer Auto
+    return "\n   ".join(opts)
+
+
 def _form_page() -> bytes:
     host = user = ""
     frontend = "browser"
@@ -576,7 +601,8 @@ def _form_page() -> bytes:
             .replace("__HOST__", _html.escape(host, quote=True))
             .replace("__USER__", _html.escape(user, quote=True))
             .replace("__BROWSER_SEL__", "selected" if frontend == "browser" else "")
-            .replace("__DESKTOP_SEL__", "selected" if frontend == "desktop" else "")).encode()
+            .replace("__DESKTOP_SEL__", "selected" if frontend == "desktop" else "")
+            .replace("__DECODER_OPTIONS__", _decoder_options_html())).encode()
 
 
 def _dash_page() -> bytes:
