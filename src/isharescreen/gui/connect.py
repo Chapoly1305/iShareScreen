@@ -283,7 +283,28 @@ def _launch(values: dict) -> None:
         cmd += ["--hidpi", scale]
     decoder = values.get("decoder", "auto").strip()
     if decoder and decoder != "auto":
-        cmd += ["--decoder", decoder]
+        cmd += ["--decoder", decoder]        # explicit pin — session honours it
+    elif frontend == "desktop" and "ISS_VIDEO_CODEC" not in os.environ:
+        # "Auto" on the desktop frontend: the GUI already probed hardware at
+        # startup, so pin the DECODER here → the session skips its decoder-build
+        # probe (and "hevc444 probe: unavailable" log noise) at stream start.
+        # Only pass --codec for AVC: that matches what the cli already forces on
+        # a non-HEVC box (where the probe noise actually is), and it lets the
+        # session skip resolve_codec too. For HEVC we deliberately do NOT pass
+        # --codec — forcing it would change the media offer from the default
+        # "both"-bank (byte-identical to Apple's) to a single-HEVC bank
+        # (offers.py DANGER note); the session resolves the codec itself
+        # (cheap on a HEVC-capable box). Skipped if the user set ISS_VIDEO_CODEC.
+        try:
+            from isharescreen.proxy.media.registry import resolve_codec, select
+            codec = resolve_codec("auto")
+            spec = select(codec)
+            if spec is not None:
+                cmd += ["--decoder", spec.name]
+                if codec == "avc":
+                    cmd += ["--codec", "avc"]
+        except Exception:
+            pass  # fall back to the session's own auto resolution
     if values.get("curtain") != "on":
         cmd.append("--no-curtain")
     if values.get("audio") != "on":
@@ -565,15 +586,56 @@ _DECODER_LABELS = {
 }
 
 
+# Hardware-probe state. `_warm_decoder_probe` runs the real availability probe
+# ONCE at iss startup (background), so (a) the dropdown lists only decoders that
+# actually work here, not just platform-appropriate ones, and (b) the session
+# doesn't re-probe at stream start (which logged "hevc444 probe: unavailable"
+# noise). Until the probe finishes the dropdown falls back to a platform filter.
+_PROBE_DONE = threading.Event()
+
+
+def _warm_decoder_probe() -> None:
+    """Probe decoder hardware once at startup and cache it (hwcaps caches
+    per-process). Best-effort — failures just leave the platform filter."""
+    try:
+        from isharescreen.proxy.media.registry import all_specs, resolve_codec
+        resolve_codec("auto")                     # warms the codec / HEVC-444 probe
+        for s in all_specs():
+            if s.supported_here():
+                try:
+                    s.available()                 # warms this decoder's probe
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    finally:
+        _PROBE_DONE.set()
+
+
+def _spec_offerable(s, probe_ready: bool) -> bool:
+    """Show a decoder if it's supported on this platform, and — once the startup
+    probe has completed — actually available (real hardware present)."""
+    if not s.supported_here():
+        return False
+    if not probe_ready:
+        return True   # probe still running: fall back to the platform filter
+    try:
+        return bool(s.available())
+    except Exception:
+        return True   # probe error → don't hide it
+
+
 def _decoder_options_html() -> str:
-    """<option>s for the decoder dropdown, filtered to decoders the registry
-    reports as supported on THIS platform. 'Auto' first + selected."""
+    """<option>s for the decoder dropdown, filtered to decoders available on
+    THIS machine (real hardware probe once warm; platform filter before that).
+    'Auto' first + selected."""
     import html as _h
     opts = ['<option value="auto" selected>Auto (best available)</option>']
+    probe_ready = _PROBE_DONE.is_set()
     try:
         from isharescreen.proxy.media.registry import all_specs
         for s in all_specs():
-            if not s.supported_here():
+            if not _spec_offerable(s, probe_ready):
                 continue
             label = _DECODER_LABELS.get(s.name, f"{s.codec.upper()} — {s.name}")
             opts.append(f'<option value="{_h.escape(s.name, quote=True)}">'
@@ -724,6 +786,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
 def main() -> int:
     global _GUI_PORT
+    # Probe decoder hardware once, now, in the background — so the connect form's
+    # dropdown reflects real availability and the session doesn't re-probe at
+    # stream start (the "hevc444 probe: unavailable" log noise).
+    threading.Thread(target=_warm_decoder_probe, daemon=True).start()
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     _GUI_PORT = server.server_address[1]
     url = f"http://127.0.0.1:{_GUI_PORT}/"
