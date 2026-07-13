@@ -1,8 +1,8 @@
-"""Per-user persisted state for the TUI.
+"""Per-user persisted state for the connect form.
 
 Just one file today: `~/.iss/last.json` (or the platform-equivalent),
 holding the most recently submitted connect form (sans password). On
-launch the TUI prefills the connect form from it. Passwords are
+launch the browser connect GUI prefills its form from it. Passwords are
 deliberately NOT persisted — getting that wrong becomes a security
 incident; the convenience win is not worth the risk.
 """
@@ -12,13 +12,35 @@ import json
 import logging
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .connect_screen import ConnectFormValues
-
 
 log = logging.getLogger("iss.tui.storage")
+
+
+@dataclass(slots=True)
+class ConnectFormValues:
+    """A snapshot of the connect form, persisted (sans password) so the next
+    launch can prefill it."""
+    host: str
+    user: str
+    password: str
+    advertise: str
+    audio: bool
+    curtain: bool
+    hdr: bool
+    share_console: bool
+    alt_session: bool
+    # Which viewer to launch: "browser" (WebTransport + WebCodecs in a browser
+    # tab) or "desktop" (native wgpu window).
+    frontend: str = "browser"
+    # Dynamic resolution: re-render the host to match the viewer window on
+    # resize (the "Auto" resolution pick). HiDPI scale: "auto" / "on" / "off".
+    dynamic_resolution: bool = False
+    hidpi: str = "auto"
+    decoder: str = "auto"  # decoder name or "auto"
 
 
 def _state_dir() -> Path:
@@ -104,4 +126,4 @@ def bug_snapshot_path() -> Path:
     return _state_dir() / "snapshots" / f"snapshot-{ts}.json"
 
 
-__all__ = ["load_last", "save_last", "bug_snapshot_path"]
+__all__ = ["ConnectFormValues", "load_last", "save_last", "bug_snapshot_path"]
