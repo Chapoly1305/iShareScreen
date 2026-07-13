@@ -267,6 +267,12 @@ def _launch(values: dict) -> None:
     advertise = values.get("advertise", "").strip()
     if advertise:
         cmd += ["--advertise", advertise]
+    hidpi = values.get("hidpi", "auto").strip()
+    if hidpi in ("on", "off"):        # "auto" is the cli default → omit
+        cmd += ["--hidpi", hidpi]
+    decoder = values.get("decoder", "auto").strip()
+    if decoder and decoder != "auto":
+        cmd += ["--decoder", decoder]
     if values.get("curtain") != "on":
         cmd.append("--no-curtain")
     if values.get("audio") != "on":
@@ -355,6 +361,21 @@ _FORM = """<!doctype html><html><head><title>iShareScreen — Connect</title>__H
    <option value="1280x720">1280 × 720 (HD)</option>
    <option value="1024x768">1024 × 768 (XGA)</option>
    <option value="800x600">800 × 600 (SVGA)</option>
+  </select>
+  <label>HiDPI</label>
+  <select name="hidpi">
+   <option value="auto" selected>Auto — match your display</option>
+   <option value="on">On (2×) — Retina: sharp 4K backing, normal-sized UI</option>
+   <option value="off">Off (1×) — flat: more real-estate, smaller UI</option>
+  </select>
+  <label>Decoder</label>
+  <select name="decoder">
+   <option value="auto" selected>Auto</option>
+   <option value="vt-hevc444">HEVC — VideoToolbox (Mac)</option>
+   <option value="libav-hevc444">HEVC — Generic HW</option>
+   <option value="qsv-hevc444">HEVC — Intel QSV</option>
+   <option value="libav-hevc444-sw">HEVC — Software</option>
+   <option value="libav-avc420">H.264</option>
   </select>
   <div class="row"><input type="checkbox" name="audio" id="audio" checked><label for="audio" style="margin:0">Audio</label></div>
   <div class="row"><input type="checkbox" name="curtain" id="curtain" checked><label for="curtain" style="margin:0">Curtain (private virtual display)</label></div>
