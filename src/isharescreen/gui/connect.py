@@ -264,12 +264,23 @@ def _launch(values: dict) -> None:
         "--frontend", frontend, "--control-socket", sock_path,
         "--log-file", log_path,
     ]
+    # Resolution = the encoded BACKING (bandwidth); Display scale = UI size.
+    # For a fixed resolution we advertise logical points = backing ÷ scale, so
+    # the host encodes exactly the chosen backing while drawing the UI at
+    # `scale`. For "Auto" (track-window) the scale rides --hidpi.
     advertise = values.get("advertise", "").strip()
-    if advertise:
-        cmd += ["--advertise", advertise]
-    hidpi = values.get("hidpi", "auto").strip()
-    if hidpi in ("on", "off"):        # "auto" is the cli default → omit
-        cmd += ["--hidpi", hidpi]
+    scale = values.get("scale", "2.0").strip() or "2.0"
+    if advertise and advertise.lower() != "auto":
+        try:
+            bw, bh = (int(x) for x in advertise.lower().split("x", 1))
+            s = float(scale)
+            lw = max(2, int(round(bw / s / 2)) * 2)   # even logical dims
+            lh = max(2, int(round(bh / s / 2)) * 2)
+            cmd += ["--advertise", f"{lw}x{lh}@{scale}"]
+        except (ValueError, ZeroDivisionError):
+            cmd += ["--advertise", advertise]
+    else:
+        cmd += ["--hidpi", scale]
     decoder = values.get("decoder", "auto").strip()
     if decoder and decoder != "auto":
         cmd += ["--decoder", decoder]
@@ -347,7 +358,7 @@ _FORM = """<!doctype html><html><head><title>iShareScreen — Connect</title>__H
   <label>Frontend</label>
   <select name="frontend"><option value="browser" __BROWSER_SEL__>browser (WebTransport + WebCodecs)</option><option value="desktop" __DESKTOP_SEL__>desktop (native window)</option></select>
   <label>Resolution</label>
-  <select name="advertise">
+  <select name="advertise" title="The encoded pixel resolution = how much bandwidth you use. Higher = sharper + more bandwidth. UI size is set separately by Display scale.">
    <option value="auto" selected>Auto — track window size</option>
    <option value="3840x2160">3840 × 2160 (4K UHD)</option>
    <option value="3440x1440">3440 × 1440 (UWQHD)</option>
@@ -362,11 +373,15 @@ _FORM = """<!doctype html><html><head><title>iShareScreen — Connect</title>__H
    <option value="1024x768">1024 × 768 (XGA)</option>
    <option value="800x600">800 × 600 (SVGA)</option>
   </select>
-  <label>HiDPI</label>
-  <select name="hidpi">
-   <option value="auto" selected>Auto — match your display</option>
-   <option value="on">On (2×) — Retina: sharp 4K backing, normal-sized UI</option>
-   <option value="off">Off (1×) — flat: more real-estate, smaller UI</option>
+  <label>Display scale</label>
+  <select name="scale" title="How large the host UI is drawn — like Windows display scaling (100%–400%). Higher = bigger text/UI. This does NOT change bandwidth; Resolution does.">
+   <option value="1.0">100% — smallest UI, most desktop space</option>
+   <option value="1.5">150%</option>
+   <option value="2.0" selected>200% — Retina (normal UI, crisp)</option>
+   <option value="2.5">250%</option>
+   <option value="3.0">300% — large UI</option>
+   <option value="3.5">350%</option>
+   <option value="4.0">400% — largest UI</option>
   </select>
   <label>Decoder</label>
   <select name="decoder">

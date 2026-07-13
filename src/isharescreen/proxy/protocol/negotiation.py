@@ -77,7 +77,10 @@ class AdvertiseDims:
     """
     width: int = 1920
     height: int = 1080
-    hidpi_scale: int = 2   # 2 = Retina (backing 2× points); 1 = flat (backing == points)
+    # backing:point ratio. 2.0 = Retina (backing 2× points); 1.0 = flat. May be
+    # fractional (e.g. 2.5) — the mode table carries pixel & point dims
+    # independently, so any ratio is expressible on the wire.
+    hidpi_scale: float = 2.0
     width_mm: float = 300.0
     height_mm: float = 168.75  # proportional to 1920×1080
 

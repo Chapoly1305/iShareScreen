@@ -142,7 +142,7 @@ def _display_scale(glfw_window=None) -> int:
 
 def _resolve_hidpi_request(
     mode: str, win_w: int, win_h: int, client_scale: int = 2,
-) -> tuple[int, int, int]:
+) -> tuple[int, int, float]:
     """Map (HiDPI mode, window logical size, client display scale) →
     (req_w, req_h, hidpi_scale).
 
@@ -165,9 +165,16 @@ def _resolve_hidpi_request(
     win_w = max(1, win_w)
     win_h = max(1, win_h)
     if mode == "off":
-        scale = 1
+        scale = 1.0
     elif mode == "on":
-        scale = 2
+        scale = 2.0
+    elif mode not in ("auto", ""):
+        # Numeric custom scale, e.g. "2.5" (from --hidpi 2.5 / the browser
+        # form's Display-scale control). Clamp to the supported 1–4 range.
+        try:
+            scale = min(4.0, max(1.0, float(mode)))
+        except ValueError:
+            scale = 2.0 if client_scale >= 2 else 1.0
     else:  # auto: match the client display scale (Retina client → 2×), like
            # Screen Sharing.app. Do NOT downgrade to 1× on a large window — that
            # packs the host UI into the full pixel resolution at 1× and makes
@@ -175,9 +182,9 @@ def _resolve_hidpi_request(
            # logical-size cap (max_w//scale below) bound the request; the window
            # then shows that Retina desktop scaled to fill. (`--hidpi off` is
            # the opt-in for the 1× high-real-estate desktop.)
-        scale = 2 if client_scale >= 2 else 1
-    max_w = _HOST_MAX_BACKING_W // scale
-    max_h = _HOST_MAX_BACKING_H // scale
+        scale = 2.0 if client_scale >= 2 else 1.0
+    max_w = _HOST_MAX_BACKING_W / scale
+    max_h = _HOST_MAX_BACKING_H / scale
     fit = min(max_w / win_w, max_h / win_h, 1.0)  # shrink-only, keep aspect
     req_w = max(_MIN_ADVERTISE_W, _even(int(win_w * fit)))
     req_h = max(_MIN_ADVERTISE_H, _even(int(win_h * fit)))
@@ -239,7 +246,7 @@ def run(
             config, advertise=AdvertiseDims(
                 width=rw, height=rh, hidpi_scale=scale),
         )
-        log.info("auto-detected initial viewer %dx%d → request %dx%d @%dx "
+        log.info("auto-detected initial viewer %dx%d → request %dx%d @%gx "
                  "(hidpi=%s dynamic=%s)",
                  aw, ah, rw, rh, scale, config.hidpi, dynamic)
     else:
@@ -252,7 +259,7 @@ def run(
         # letterbox-fit into the window regardless of the display's pixel
         # density (the surface-vs-logical ratio handles HiDPI in draw()).
         # '--hidpi on' is the explicit opt-in to a 2× backing.
-        log.info("fixed advertise %dx%d @%dx (rendering the picked resolution)",
+        log.info("fixed advertise %dx%d @%gx (rendering the picked resolution)",
                  config.advertise.width, config.advertise.height,
                  config.advertise.hidpi_scale)
     session = Session(config)
@@ -1252,7 +1259,7 @@ def run(
             cur_adv_w, cur_adv_h = tw, th
             pending_size = None
             last_resize_t = now
-            log.info("resize → requesting %dx%d @%dx (hidpi=%s)",
+            log.info("resize → requesting %dx%d @%gx (hidpi=%s)",
                      nw, nh, scale, config.hidpi)
             try:
                 session.send_dynamic_resolution(nw, nh, hidpi_scale=scale)

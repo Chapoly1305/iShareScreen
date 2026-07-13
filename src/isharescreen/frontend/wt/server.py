@@ -1084,6 +1084,7 @@ class WebTransportBridge:
                 "num_tiles": nt, "canvas_w": cw, "canvas_h": ch,
                 "tile_h": ch // nt, "codec": self._codec_string(session),
                 "display_rects": drects,
+                "hidpi_scale": self._display_scale(),
             }).encode()
             self._last_config_env = _config_envelope(cfg)
             self._config_sent = True
@@ -1403,6 +1404,21 @@ class WebTransportBridge:
         except Exception as e:
             log.debug("input dispatch error: %s", e)
 
+    def _display_scale(self) -> float:
+        """Numeric display scale from --hidpi: auto/on → 2×, off → 1×, or a
+        custom float like 2.5. The browser advertises its window at
+        logical = physical/scale so the host draws the UI at `scale` while the
+        backing stays = the window's physical pixels (WYSIWYG bandwidth)."""
+        h = str(getattr(self._config, "hidpi", "auto") or "auto").strip().lower()
+        if h == "off":
+            return 1.0
+        if h in ("on", "auto"):
+            return 2.0
+        try:
+            return min(4.0, max(1.0, float(h)))
+        except ValueError:
+            return 2.0
+
     def _handle_resize(self, w: int, h: int) -> None:
         """The browser reported a new viewport size — re-advertise the host
         display to match, so the stream is encoded at the window's resolution
@@ -1420,11 +1436,13 @@ class WebTransportBridge:
         self._last_resize_wh = (w, h)
         if self._session is not None:
             try:
-                # hidpi_scale=2: the host makes the backing canvas w*scale, so a
-                # 1500-CSS-px window → 3000×1540 backing = the window's physical
-                # pixels on a Retina browser (crisp 1:1, and ~3× lighter than the
-                # full 4K canvas). A 1× request wasn't honored by the host.
-                self._session.send_dynamic_resolution(w, h, hidpi_scale=2)
+                # The host makes the backing canvas w*scale; the browser already
+                # reported w = physical/scale (see index.html), so backing =
+                # the window's physical pixels (crisp 1:1). `scale` is the user's
+                # Display-scale (--hidpi); it sets the host UI size, and both ends
+                # MUST use the same value or the UI size / bandwidth are wrong.
+                self._session.send_dynamic_resolution(
+                    w, h, hidpi_scale=self._display_scale())
                 log.info("browser resize → re-advertising host display %dx%d", w, h)
             except Exception as e:
                 log.debug("send_dynamic_resolution failed: %s", e)

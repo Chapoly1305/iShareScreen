@@ -48,6 +48,26 @@ log = logging.getLogger("iss.cli")
 
 # ── argparse construction ────────────────────────────────────────────
 
+_HIDPI_MIN, _HIDPI_MAX = 1.0, 4.0
+
+
+def _hidpi_arg(v: str) -> str:
+    """--hidpi accepts auto/on/off OR a numeric display scale (1.0–4.0, e.g.
+    2.5). Returns a normalised string; the frontend/CLI resolve it to a float."""
+    s = str(v).strip().lower()
+    if s in ("auto", "on", "off"):
+        return s
+    try:
+        f = float(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--hidpi must be auto/on/off or a scale like 2.5 (got {v!r})")
+    if not (_HIDPI_MIN <= f <= _HIDPI_MAX):
+        raise argparse.ArgumentTypeError(
+            f"--hidpi scale must be between {_HIDPI_MIN} and {_HIDPI_MAX} (got {f})")
+    return repr(f) if f != int(f) else str(int(f))
+
+
 def _make_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="iss",
@@ -139,13 +159,14 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
     g.add_argument(
-        "--hidpi", choices=("auto", "on", "off"), default="auto",
+        "--hidpi", type=_hidpi_arg, metavar="auto|on|off|SCALE", default="auto",
         help=(
-            "HiDPI (Retina) rendering of the host display. 'on' = Retina 2x, "
-            "full quality (up to ~300 Mbps); 'off' = flat 1x quality (up to "
-            "~60 Mbps); 'auto' (default) = match the local display (2x on a "
-            "Retina client, 1x otherwise; downgrades to 1x when 2x wouldn't fit "
-            "the host backing cap)"
+            "Display scale of the host UI — how large everything is drawn. "
+            "'auto' = match the local display (2x Retina / 1x otherwise); "
+            "'on' = 2x (Retina: normal-size UI on a 4K backing); 'off' = 1x "
+            "(flat, small UI, ~1/4 the bandwidth). Or a number 1.0-4.0 for a "
+            "custom scale (e.g. 2.5 = bigger UI than 2x); higher = larger UI. "
+            "The browser connect form exposes this as 'Display scale' (%)."
         ),
     )
     g.add_argument(
@@ -262,7 +283,7 @@ def _parse_advertise(spec: Optional[str]) -> Optional[AdvertiseDims]:
     try:
         w_str, h_str = geom_part.lower().split("x", 1)
         width, height = int(w_str), int(h_str)
-        hidpi = int(hidpi_part) if hidpi_part else 2
+        hidpi = float(hidpi_part) if hidpi_part else 2.0
     except ValueError as e:
         raise SystemExit(
             f"invalid --advertise value {spec!r}: expected 'WxH' or 'WxH@HIDPI' ({e})"
@@ -344,13 +365,15 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
     # frontend (which calls _display_scale()) re-resolve 'auto' once GLFW can
     # see the display. This avoids the old bug where 1366×768 auto blindly
     # became 2× (2732×1536 backing = 4× the bytes + an oversized window).
-    if cli_advertise is not None:
-        if args.hidpi == "off":
-            scale = 1
+    if cli_advertise is not None and not (args.advertise and "@" in args.advertise):
+        # No explicit @scale in --advertise, so resolve it from --hidpi. (An
+        # explicit WxH@N — including a fractional @2.5 — is honoured as-is.)
+        if args.hidpi == "off" or args.hidpi == "auto":
+            scale = 1.0  # 'auto' seeds 1×; the frontend re-resolves to the display
         elif args.hidpi == "on":
-            scale = 2
-        else:  # auto — frontend re-resolves to the local display scale
-            scale = 1
+            scale = 2.0
+        else:  # numeric --hidpi, e.g. "2.5"
+            scale = float(args.hidpi)
         cli_advertise = dataclasses.replace(cli_advertise, hidpi_scale=scale)
     # Dynamic resolution: explicit --dynamic/--no-dynamic wins; otherwise
     # default it on exactly when no fixed geometry was given (advertise is

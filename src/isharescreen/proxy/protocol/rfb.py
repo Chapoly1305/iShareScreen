@@ -229,7 +229,7 @@ def build_virtual_display(
     *,
     width: int,
     height: int,
-    hidpi_scale: int = 2,
+    hidpi_scale: float = 2.0,
     hdr: bool = False,
     display_name: str = "iShareScreen Virtual Display",
     mode_count: int = 5,
@@ -331,8 +331,11 @@ def build_virtual_display(
         # advertises a 2× (Retina) or 1× (flat) backing per the caller.
         msw = int(base[2] * sx + 0.5)
         msh = int(base[3] * sy + 0.5)
-        mw = msw * hidpi_scale
-        mh = msh * hidpi_scale
+        # Pixel (backing) dims = points × scale. `hidpi_scale` may be fractional
+        # (e.g. 2.5) — the mode table carries pixel and point dims as two
+        # independent resolutions, so any ratio is expressible; round to int px.
+        mw = int(msw * hidpi_scale + 0.5)
+        mh = int(msh * hidpi_scale + 0.5)
         m = 0x9C + 28 * i
         struct.pack_into(">IIII", di, m + 0x00, mw, mh, msw, msh)
         struct.pack_into(">d", di, m + 0x10, 60.0)

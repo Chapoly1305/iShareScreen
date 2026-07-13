@@ -742,7 +742,7 @@ class Session:
         self._browser_healthy_t = time.monotonic()
 
     def send_dynamic_resolution(
-        self, width: int, height: int, hidpi_scale: int = 2,
+        self, width: int, height: int, hidpi_scale: float = 2.0,
     ) -> None:
         """Request a mid-session display resize without reconnecting.
 

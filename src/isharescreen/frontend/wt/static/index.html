@@ -257,6 +257,10 @@ const DISPLAY_IDX = (() => {
   return Number.isInteger(n) && n >= 0 ? n : null;
 })();
 let cropRect = null;
+// Display scale (--hidpi). The window is reported to the host at
+// logical = physical/HIDPI_SCALE, so the host draws the UI at this scale while
+// the backing stays = the window's physical pixels. Set from the server config.
+let HIDPI_SCALE = 2;
 
 // Displays picker: on the combined window (no ?display) of a multi-monitor
 // host, list the monitors and open each in its own window (?display=N). Each is
@@ -679,6 +683,7 @@ async function main() {
     firstFrame = false;
     // Resolve ?display=N to its host-monitor rect within the combined canvas.
     // Out-of-range or a host with no layout yet → show the whole canvas.
+    if (cfg.hidpi_scale > 0) HIDPI_SCALE = cfg.hidpi_scale;
     const dr = cfg.display_rects || [];
     cropRect = (DISPLAY_IDX != null && DISPLAY_IDX >= 0 && DISPLAY_IDX < dr.length)
       ? dr[DISPLAY_IDX] : null;
@@ -774,12 +779,12 @@ async function main() {
       // same size is re-sent rather than swallowed.
       __resizeInFlight = false; __lastReportedWH = "";
     }
-    // Report req = physical_px / 2; the host renders req × hidpi_scale(2) = the
-    // window's PHYSICAL pixels (crisp 1:1, NOT over-rendered) at any display
-    // density — Retina (dpr=2) → req = CSS px, non-Retina (dpr=1) → req = CSS/2.
+    // Report req = physical_px / HIDPI_SCALE; the host renders req × scale = the
+    // window's PHYSICAL pixels (crisp 1:1, NOT over-rendered), and draws the UI
+    // at `scale` (the Display-scale control). Both ends must use the same scale.
     const dpr = window.devicePixelRatio || 1;
-    const w = Math.max(320, Math.round(stage.clientWidth * dpr / 2)) & ~1;
-    const h = Math.max(240, Math.round(stage.clientHeight * dpr / 2)) & ~1;
+    const w = Math.max(320, Math.round(stage.clientWidth * dpr / HIDPI_SCALE)) & ~1;
+    const h = Math.max(240, Math.round(stage.clientHeight * dpr / HIDPI_SCALE)) & ~1;
     const key = w + "x" + h;
     if (!w || !h || key === __lastReportedWH) return;
     __lastReportedWH = key;
