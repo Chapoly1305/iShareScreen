@@ -518,6 +518,11 @@ class Session:
         # clear the gray.
         self._dpb_fir_count: int = 0
         self._last_dpb_error_t: float = 0.0
+        # Armed (SINGLE-TILE / AVC only) when a DPB-break recovery fires; drives
+        # the stall escalation in `_drain_pending_fir`. Single-tile only because
+        # then `keyframe_required` is unambiguously the affected tile — we can't
+        # mistake an unrelated tile's ordinary loss for the break.
+        self._dpb_forceall_pending: bool = False
         # Gray-out event aggregator. Multiple paths (per-tile gate FIR,
         # batched DPB-break FIR) can emit FIRs within a few ms. Buffer
         # the tile indices and the most recent libav concealment message
@@ -1876,6 +1881,16 @@ class Session:
     # manual click, slow enough not to blanket-FIR on transient single-frame
     # loss (which the targeted FIR + natural IDR already handles).
     _DPB_FORCEALL_AFTER_FIRS: int = 3
+    # Stall escalation: if a DPB break hasn't recovered this long after its
+    # per-tile FIR, escalate to a full force-IDR (gate reset + FIR all tiles).
+    # Catches the AVC over-reference case where only ONE "reference picture
+    # missing" fires (then the corruption continues as harmless-signature
+    # "discarding one"), so the COUNT-based force-all above never triggers and
+    # the stream sits gray until a manual Force-IDR. Time- not count-based.
+    # Must sit clear of the gate's recovery-quiet window (quality_gate
+    # _RECOVERY_QUIET_S=1.5) so we only escalate after the per-tile FIR has
+    # genuinely failed, not while it's about to succeed.
+    _DPB_FORCEALL_STALL_S: float = 2.5
     # A gap this long with no "Could not find ref" means the previous storm
     # cleared (real recovery); reset the escalation counter.
     _DPB_STORM_RESET_S: float = 3.0
@@ -1954,6 +1969,13 @@ class Session:
                 self._last_dpb_fast_recovery_t = now
                 events.clear()
                 self._dpb_fir_count += 1
+                # Arm the time-based stall escalation (see _drain_pending_fir),
+                # SINGLE-TILE only (AVC): if this per-tile FIR doesn't recover
+                # within the grace window, force-IDR even though no further
+                # ref-miss fires. Multi-tile (HEVC) keeps the count-based path —
+                # a stall-escalation there could blanket-FIR on unrelated loss.
+                if self.num_tiles == 1:
+                    self._dpb_forceall_pending = True
                 if self._dpb_fir_count >= self._DPB_FORCEALL_AFTER_FIRS:
                     # The per-tile FIR above isn't clearing the storm. Escalate
                     # to the SAME action the TUI 'f' key does — request_fir(None)
@@ -1968,6 +1990,7 @@ class Session:
                         self._dpb_fir_count,
                     )
                     self._dpb_fir_count = 0
+                    self._dpb_forceall_pending = False  # count-path did the force-all
                     self.request_fir(None)
                 else:
                     log.warning(
@@ -3583,6 +3606,32 @@ class Session:
                 and time.monotonic() - self._grayout_window_t
                 >= self._GRAYOUT_WINDOW_S):
             self._flush_grayout_event()
+        # Stall escalation: a DPB break whose per-tile FIR hasn't recovered the
+        # picture within the grace window. The COUNT-based force-all only fires
+        # after `_DPB_FORCEALL_AFTER_FIRS` ref-miss events; the AVC over-reference
+        # case emits just ONE "reference picture missing" (then continues as the
+        # harmless-signature "discarding one"), so it would sit gray until a
+        # manual Force-IDR. Force-IDR all tiles ONCE — the gate reset a manual
+        # Force-IDR does — then disarm; re-armed by the next DPB break.
+        # Key off the DPB-AFFECTED tiles specifically: an unrelated tile's
+        # ordinary loss sitting in keyframe_required must NOT drive this
+        # force-IDR-all (that's the blanket-FIR-on-transient-loss the count-path
+        # deliberately avoids).
+        # Single-tile (AVC) only — `_dpb_forceall_pending` is armed only then, so
+        # `keyframe_required` is unambiguously the affected tile (no risk of an
+        # unrelated tile's ordinary loss driving a blanket force-IDR, and no
+        # cross-thread set to race on).
+        if self._dpb_forceall_pending and self.num_tiles == 1:
+            if not self._decoder._gate._keyframe_required:
+                self._dpb_forceall_pending = False   # recovered → disarm
+            elif (time.monotonic() - self._last_dpb_error_t
+                    >= self._DPB_FORCEALL_STALL_S):
+                self._dpb_forceall_pending = False   # one-shot per storm
+                log.warning(
+                    "DPB break unrecovered %.1fs after per-tile FIR — escalating "
+                    "to force-IDR ALL tiles",
+                    time.monotonic() - self._last_dpb_error_t)
+                self.request_fir(None)
 
     def _send_fir_for_tile(self, tile_idx: int, log_per_tile: bool = True) -> bool:
         """Returns True if a FIR was actually emitted (False if rate-
