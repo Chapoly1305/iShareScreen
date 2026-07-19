@@ -590,7 +590,9 @@ _DECODER_LABELS = {
 # ONCE at iss startup (background), so (a) the dropdown lists only decoders that
 # actually work here, not just platform-appropriate ones, and (b) the session
 # doesn't re-probe at stream start (which logged "hevc444 probe: unavailable"
-# noise). Until the probe finishes the dropdown falls back to a platform filter.
+# noise). The form render waits for the probe (normally already done by the
+# time the browser connects), so even the first page load is filtered to the
+# hardware that's really present.
 _PROBE_DONE = threading.Event()
 
 
@@ -627,11 +629,14 @@ def _spec_offerable(s, probe_ready: bool) -> bool:
 
 def _decoder_options_html() -> str:
     """<option>s for the decoder dropdown, filtered to decoders available on
-    THIS machine (real hardware probe once warm; platform filter before that).
-    'Auto' first + selected."""
+    THIS machine. Waits for the startup hardware probe so the FIRST page load
+    already shows the correctly filtered list (the probe runs while the
+    browser is still launching, so this wait is normally instant). Only if the
+    probe is somehow still running after the cap do we fall back to the
+    platform filter rather than hang the form."""
     import html as _h
     opts = ['<option value="auto" selected>Auto (best available)</option>']
-    probe_ready = _PROBE_DONE.is_set()
+    probe_ready = _PROBE_DONE.wait(timeout=5.0)
     try:
         from isharescreen.proxy.media.registry import all_specs
         for s in all_specs():
