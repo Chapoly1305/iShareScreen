@@ -686,12 +686,16 @@ async function main() {
     if (cfg.hidpi_scale > 0) HIDPI_SCALE = cfg.hidpi_scale;
     const dr = cfg.display_rects || [];
     cropRect = (DISPLAY_IDX != null && DISPLAY_IDX >= 0 && DISPLAY_IDX < dr.length)
-      ? dr[DISPLAY_IDX] : null;
+      ? dr[DISPLAY_IDX]
+      : (DISPLAY_IDX == null && cfg.content_rect ? cfg.content_rect : null);
     setupDisplayPicker(dr);
     if (DISPLAY_IDX != null) {
       srvLog("info", cropRect
         ? `display ${DISPLAY_IDX}: crop ${cropRect.w}x${cropRect.h} @${cropRect.x},${cropRect.y}`
         : `display ${DISPLAY_IDX} not in layout (${dr.length} display(s)); showing full canvas`);
+    } else if (cropRect) {
+      srvLog("info", `auto-cropping host layout gap to ${cropRect.w}x${cropRect.h} `
+             + `@${cropRect.x},${cropRect.y}`);
     }
     fitCanvasToStage(cfg.canvas_w, cfg.canvas_h);
     // A config means the host session is up and streaming (and, after a resize,

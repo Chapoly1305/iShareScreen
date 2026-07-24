@@ -472,6 +472,11 @@ def run(
     # own crop (set when secondaries are spawned); None = use renderer state
     # (single-window / --display N path, unchanged).
     _view_crop: list = [None]
+    # True when the primary window is automatically cropping an outer
+    # AppleDisplayLayout gap (reported displays cover less than the backing
+    # canvas). Kept separate from explicit --display/multi-window crops so a
+    # dynamic resize can refresh or remove only this corrective crop.
+    _auto_gap_crop: list = [False]
 
     # Registry of every multi-window view (primary + secondaries) as
     # {"win": glfw_window, "crop": (x, y, w, h)}. Empty in single-window mode.
@@ -1198,6 +1203,21 @@ def run(
         slot_h_resolved = False
         first_seen = [False] * num_tiles
         renderer = Renderer(device, surface_format, canvas_w, canvas_h)
+        # In the default single-monitor/auto mode, a layout gap may first
+        # appear on a later dynamic resize rather than in the initial layout.
+        # Arm the corrective crop then too. `_mw_views` is non-empty once a
+        # true multi-monitor layout owns the primary crop, so never overwrite
+        # an explicit per-monitor view here.
+        if (display_all and _secondaries_spawned[0] and not _mw_views
+                and session.display_content_rect is not None):
+            _auto_gap_crop[0] = True
+        if _auto_gap_crop[0]:
+            _gap = session.display_content_rect
+            _view_crop[0] = (
+                (_gap.x, _gap.y, _gap.w, _gap.h)
+                if _gap is not None else None
+            )
+            renderer.set_source_rect(_view_crop[0])
         # The new renderer has no cursor texture/scale; re-apply both so the
         # overlay doesn't vanish or mis-size across a resolution change.
         if _canvas_cursor:
@@ -1327,12 +1347,23 @@ def run(
                     log.info("multi-window: opened %d window(s) for %d host monitor(s)",
                              1 + len(secondaries), len(_rects))
                 else:
-                    # Single-monitor host: keep the one window showing the whole
-                    # canvas, with dynamic resolution intact. Don't pin a crop — a
-                    # pinned crop would go stale the moment a dynamic re-advertise
-                    # changes the canvas dimensions.
-                    log.info("single-monitor host — one window, dynamic=%s",
-                             _dynamic[0])
+                    # A host can transiently report one real display inside a
+                    # larger backing canvas. Showing the whole backing produces
+                    # the characteristic top-half picture + black bottom. Crop
+                    # to the reported display bounds; _apply_new_canvas refreshes
+                    # this crop on every dynamic resize so it cannot go stale.
+                    _gap = session.display_content_rect
+                    if _gap is not None:
+                        _view_crop[0] = (_gap.x, _gap.y, _gap.w, _gap.h)
+                        _auto_gap_crop[0] = True
+                        renderer.set_source_rect(_view_crop[0])
+                        log.warning(
+                            "single-monitor layout covers less than canvas — "
+                            "auto-cropping to @%d,%d %dx%d",
+                            _gap.x, _gap.y, _gap.w, _gap.h)
+                    else:
+                        log.info("single-monitor host — one window, dynamic=%s",
+                                 _dynamic[0])
                 _secondaries_spawned[0] = True
 
         # Reap secondaries the user closed (independently of the primary).

@@ -9,7 +9,9 @@ handling, decoder lifecycles) stays in the respective modules.
 from __future__ import annotations
 
 import logging
+import os
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -19,6 +21,50 @@ from .tiles import TileFrame
 
 
 log = logging.getLogger(__name__)
+
+
+# ── chroma-signature diagnostic (ISS_CHROMA_TRACE=1) ─────────────────────
+# Off by default (a single bool check per frame). When on, logs the luma and
+# chroma-plane mean/std ~2×/s. Purpose: the "bluish tint that sticks" artifact
+# is a SILENT corruption — libav sets no decode-error flag and the pixel gate
+# doesn't flag a detailed-but-colour-shifted frame — so nothing detects it. A
+# bad reference shifts the chroma DC uniformly (U=Cb rises for blue) and it
+# PERSISTS/drifts until an IDR, whereas a legitimately-blue window has stable,
+# content-shaped chroma. This trace captures that signature so a detector can
+# be built that distinguishes the two instead of FIR-storming on blue content.
+_CHROMA_TRACE = os.environ.get("ISS_CHROMA_TRACE") == "1"
+_chroma_last_log_t: list[float] = [0.0]
+
+
+def chroma_trace(tile_idx: int, tf: TileFrame, had_error: bool) -> None:
+    """Throttled per-frame chroma-plane stats. No-op unless ISS_CHROMA_TRACE=1."""
+    if not _CHROMA_TRACE or tf is None:
+        return
+    now = time.monotonic()
+    if now - _chroma_last_log_t[0] < 0.5:      # ~2 Hz — the expensive part
+        return
+    _chroma_last_log_t[0] = now
+    try:
+        import numpy as np
+
+        def _stats(buf: bytes, stride: int, w: int, h: int) -> tuple[float, float]:
+            a = np.frombuffer(buf, dtype=np.uint8)
+            if stride >= w and len(a) >= stride * h:   # strip row padding
+                a = a.reshape(h, stride)[:, :w]
+            return float(a.mean()), float(a.std())
+
+        ym, ys = _stats(tf.y, tf.y_stride, tf.width, tf.height)
+        um, us = _stats(tf.u, tf.uv_stride, tf.chroma_width, tf.chroma_height)
+        vm, vs = (_stats(tf.v, tf.uv_stride, tf.chroma_width, tf.chroma_height)
+                  if tf.v is not None else (-1.0, -1.0))
+        log.info(
+            "CHROMA_TRACE tile=%d err=%s Y=%.1f/%.1f U=%.1f/%.1f V=%.1f/%.1f "
+            "(mean/std; U,V neutral=128, a persistent U/V-mean drift = the "
+            "silent chroma corruption)",
+            tile_idx, had_error, ym, ys, um, us, vm, vs,
+        )
+    except Exception as e:
+        log.debug("chroma_trace failed: %s", e)
 
 
 # ── constants ────────────────────────────────────────────────────────

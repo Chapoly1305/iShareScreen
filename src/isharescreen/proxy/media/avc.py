@@ -25,6 +25,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from typing import Callable, Optional
 
 import av
@@ -32,7 +33,7 @@ import av
 from .avc_nalu import h264_nal_type
 from .decode_common import (
     _CODEC_FLAG_LOW_DELAY, _CODEC_FLAG2_FAST,
-    _NAL_START_CODE, _TileSlot, _av_frame_to_tile,
+    _NAL_START_CODE, _TileSlot, _av_frame_to_tile, chroma_trace,
 )
 from .tiles import TileFrame
 from .quality_gate import FrameQualityGate
@@ -243,6 +244,15 @@ class AvcDecoder:
         # Decode latency monitoring: EMA of submit→frame round-trip (ms).
         self._decode_latency_ms: float = 0.0
         self._queue_full_drops: int = 0
+        # Event-time diagnostics for rare, hours-later DPB failures. These are
+        # deliberately cheap counters so the libav log callback can snapshot
+        # decoder history without enabling frame-by-frame debug logging.
+        self._nalus_fed: int = 0
+        self._keyframes_seen: int = 0
+        self._frames_since_keyframe: int = 0
+        self._last_keyframe_t: float = 0.0
+        self._restart_count: int = 0
+        self._sps_patch_applied: bool = False
 
     # -- setup ---------------------------------------------------------
 
@@ -254,7 +264,9 @@ class AvcDecoder:
         self._pps = next(iter(all_pps.values())) if all_pps else b""
 
     def _build_extradata(self) -> bytes:
-        return _NAL_START_CODE + _patch_avc_sps_dpb(self._sps) + _NAL_START_CODE + self._pps
+        patched_sps = _patch_avc_sps_dpb(self._sps)
+        self._sps_patch_applied = patched_sps != self._sps
+        return _NAL_START_CODE + patched_sps + _NAL_START_CODE + self._pps
 
     def _ensure_codec_locked(self) -> Optional[av.codec.context.CodecContext]:
         """Build the shared context if needed (HW accel first, SW fallback).
@@ -346,6 +358,13 @@ class AvcDecoder:
                 self._await_key = False
             else:
                 return
+        self._nalus_fed += 1
+        if is_key:
+            self._keyframes_seen += 1
+            self._frames_since_keyframe = 0
+            self._last_keyframe_t = time.monotonic()
+        elif t in (1, 5):
+            self._frames_since_keyframe += 1
         # Each Apple tile-frame is one slice = one complete access unit, so we
         # build the av.Packet directly and decode() it — NO ctx.parse(). The
         # libav H.264 parser can't tell an AU is complete until the *next* slice
@@ -442,6 +461,7 @@ class AvcDecoder:
             self._gate.mark_clean(tile_idx)
             with slot.lock:
                 slot.clean_count += 1
+        chroma_trace(tile_idx, tile_frame, had_error)
         if not self._gate.should_publish(tile_idx, tile_frame):
             return None
         return tile_frame
@@ -477,6 +497,24 @@ class AvcDecoder:
         return self._queue_full_drops
 
     @property
+    def recovery_diagnostics(self) -> dict[str, object]:
+        """Small lock-free snapshot safe to read from libav's log callback."""
+        last_key_age = (
+            time.monotonic() - self._last_keyframe_t
+            if self._last_keyframe_t > 0.0 else -1.0
+        )
+        return {
+            "decoder": self._hw_name or "software",
+            "nalus_fed": self._nalus_fed,
+            "keyframes_seen": self._keyframes_seen,
+            "frames_since_keyframe": self._frames_since_keyframe,
+            "last_keyframe_age_s": last_key_age,
+            "restarts": self._restart_count,
+            "sps_patch": self._sps_patch_applied,
+            "await_key": self._await_key,
+        }
+
+    @property
     def good_counts(self) -> list:
         return [t.good_count for t in self._tiles]
 
@@ -490,6 +528,7 @@ class AvcDecoder:
         context while feed_nalu is mid-decode. Resets the gate too (HEVC does
         this in _teardown) so post-restart publish/FIR decisions start clean."""
         with self._codec_lock:
+            self._restart_count += 1
             if self._codec is not None:
                 try:
                     self._codec.close()

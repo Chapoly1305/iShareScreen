@@ -117,23 +117,34 @@ _APPLE_AUDIO_F9 = b"".join(_build_audio_f9_entry(*t) for t in _AUDIO_F9_TIERS)
 
 # ── HEVC + AVC parameter strings ──────────────────────────────────────
 
-# `LTR;` advertises the long-term-reference capability. LTRP is now ON by
-# default (set ISS_LTRP=0 to disable). The full path is verified working:
-# the encoder creates LTRs, and iss acks them by DONL so they resolve to
-# real encoder tokens (see session._send_ltr_ack). `LTR;` here + the
-# structured ltrpEnabled field7 + allowRTCPFB together enable it.
+# `LTR;` advertises the long-term-reference capability. LTRP is ON by default
+# for HEVC (set ISS_LTRP=0 to disable). It must stay OFF for AVC: the H.264
+# decoder has no clean DONL to acknowledge, so advertising the feature there is
+# a protocol mismatch. Live diagnostics showed that Apple can still use its own
+# H.264 long-term references with LTRP disabled; SSRC-generation mixing, not
+# this capability bit alone, caused the observed 17-picture DPB overflow.
 import os as _os
-_HEVC_PARAMS = (
-    (b"FLS;MS:-1;LF:-1;LTR;CABAC;POS:0;EOD:1;HTS:2;RR:3;"
-     b"AR:16/9,5/8;XR:16/9,5/8;")
-    if _os.environ.get("ISS_LTRP", "1") != "0" else
-    (b"FLS;MS:-1;LF:-1;CABAC;POS:0;EOD:1;HTS:2;RR:3;"
-     b"AR:16/9,5/8;XR:16/9,5/8;")
+_HEVC_PARAMS_LTR = (
+    b"FLS;MS:-1;LF:-1;LTR;CABAC;POS:0;EOD:1;HTS:2;RR:3;"
+    b"AR:16/9,5/8;XR:16/9,5/8;"
+)
+_HEVC_PARAMS_NO_LTR = (
+    b"FLS;MS:-1;LF:-1;CABAC;POS:0;EOD:1;HTS:2;RR:3;"
+    b"AR:16/9,5/8;XR:16/9,5/8;"
 )
 _AVC_PARAMS = (
     b"FLS;LF:-1;POS:5;EOD:1;HTS:2;RR:3;POSE:4;"
     b"AR:16/9,5/8;XR:16/9,5/8;"
 )
+
+
+def _ltrp_enabled_for_codec(codec: str) -> bool:
+    """LTRP is implemented end-to-end only for HEVC.
+
+    Evaluate this at offer-build time rather than module import time: the CLI
+    resolves ``--codec`` after importing the protocol modules.
+    """
+    return codec != "avc" and _os.environ.get("ISS_LTRP", "1") != "0"
 
 
 def _build_remote_endpoint_info() -> bytes:
@@ -195,13 +206,20 @@ def _build_mediablob(
     only affects mode 8: when False, the audio-stream gate (field4) is set
     below the server's tier floor so no audio is transmitted."""
     if mode == 7:
+        # Codec selection is consulted before building the banks because the
+        # bank that yields AVC uses the HEVC-labelled parameter string (Apple's
+        # response mapping is inverted; see below). LTR therefore has to be
+        # removed from that string as well as from structured field 7.
+        _codec = _os.environ.get("ISS_VIDEO_CODEC", "both").lower()
+        ltrp_on = _ltrp_enabled_for_codec(_codec)
+        hevc_params = _HEVC_PARAMS_LTR if ltrp_on else _HEVC_PARAMS_NO_LTR
         res_entry = _field_varint(1, 1) + _field_varint(2, 1) + _field_varint(3, 50115) + _field_varint(4, 0)
         res_entry_alt = _field_varint(1, 1) + _field_varint(2, 2) + _field_varint(3, 50115) + _field_varint(4, 0)
         hevc_bank = (
             _field_varint(1, 123)
             + _field_bytes(2, res_entry) + _field_bytes(2, res_entry_alt)
             + _field_bytes(2, res_entry) + _field_bytes(2, res_entry_alt)
-            + _field_bytes(3, _HEVC_PARAMS)
+            + _field_bytes(3, hevc_params)
             + _field_varint(4, 1)
         )
         avc_bank = (
@@ -217,7 +235,6 @@ def _build_mediablob(
         # decoder handles but browser WebCodecs can't, due to cross-tile
         # references). ISS_TILES_PER_FRAME=1 requests a SINGLE picture per frame
         # — decodable by any standard decoder. (iOS CoreDevice defaults to 1.)
-        ltrp_on = _os.environ.get("ISS_LTRP", "1") != "0"
         _tiles_per_frame = tiles_per_frame()
         # Codec selection. Default "both" is byte-identical to Apple's native
         # offer (HEVC 4:4:4 + the H.264 4:2:0 fallback bank). ISS_VIDEO_CODEC=avc
@@ -227,7 +244,6 @@ def _build_mediablob(
         # server actually switches codecs (NAL types in the profile snapshot)
         # before wiring a real H.264 decode path. ISS_VIDEO_CODEC=hevc forces
         # HEVC-only.
-        _codec = _os.environ.get("ISS_VIDEO_CODEC", "both").lower()
         # DANGER — the bank variables are named for the PARAMS they carry, but
         # the server's response is INVERTED from that. Live testing PROVED:
         #   hevc_bank (field1=123, HEVC params) → server sends H.264 4:2:0

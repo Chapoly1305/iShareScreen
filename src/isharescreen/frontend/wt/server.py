@@ -1070,20 +1070,29 @@ class WebTransportBridge:
             {"id": r.display_id, "x": r.x, "y": r.y, "w": r.w, "h": r.h}
             for r in session.display_rects
         ]
+        _content = session.display_content_rect
+        content_rect = (
+            {"x": _content.x, "y": _content.y, "w": _content.w, "h": _content.h}
+            if _content is not None else None
+        )
         # (Re)send config on the first frame, and again when the canvas size
         # changes mid-session (dynamic resolution) — but only on a keyframe, so
         # the browser re-inits its decoder at the new size on a clean IDR that
         # already carries the new SPS (a delta at the new size would fail).
         if (not self._config_sent
                 or (is_key and (cw, ch) != getattr(self, "_last_config_wh", None))
-                or (is_key and drects != getattr(self, "_last_config_drects", None))):
+                or (is_key and drects != getattr(self, "_last_config_drects", None))
+                or (is_key and content_rect
+                    != getattr(self, "_last_config_content_rect", None))):
             nt = max(1, session.num_tiles)
             self._last_config_wh = (cw, ch)
             self._last_config_drects = drects
+            self._last_config_content_rect = content_rect
             cfg = json.dumps({
                 "num_tiles": nt, "canvas_w": cw, "canvas_h": ch,
                 "tile_h": ch // nt, "codec": self._codec_string(session),
                 "display_rects": drects,
+                "content_rect": content_rect,
                 "hidpi_scale": self._display_scale(),
             }).encode()
             self._last_config_env = _config_envelope(cfg)

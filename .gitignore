@@ -12,6 +12,7 @@ tools/*
 *.pcap
 *.pcapng
 *.key
+*.log
 
 # macOS Finder metadata
 .DS_Store

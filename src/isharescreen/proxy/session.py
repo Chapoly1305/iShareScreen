@@ -488,8 +488,13 @@ class Session:
         # long-term reference. The DONL acks resolve to real encoder reference
         # tokens, keeping the encoder's references near (within our decoder's
         # picture buffer) instead of reaching far back and forcing a full IDR.
-        # ON by default; set ISS_LTRP=0 to disable.
-        self._ltr_enabled = os.environ.get("ISS_LTRP", "1") != "0"
+        # LTRP is implemented only for HEVC: AVC has no clean DONL to echo in
+        # the acknowledgment. Keep the runtime sender aligned with offer
+        # negotiation instead of advertising a capability AVC cannot complete.
+        self._ltr_enabled = (
+            self._video_codec == "hevc"
+            and os.environ.get("ISS_LTRP", "1") != "0"
+        )
         self._ltr_last_acked: int = 0
         self._ltr_acks_sent: int = 0
         # The per-ack LTR log fires at frame rate and drowns the debug log
@@ -518,6 +523,7 @@ class Session:
         # clear the gray.
         self._dpb_fir_count: int = 0
         self._last_dpb_error_t: float = 0.0
+        self._last_dpb_diag_loss_total: int = 0
         # Armed (SINGLE-TILE / AVC only) when a DPB-break recovery fires; drives
         # the stall escalation in `_drain_pending_fir`. Single-tile only because
         # then `keyframe_required` is unambiguously the affected tile — we can't
@@ -814,6 +820,32 @@ class Session:
             if faked:
                 return faked
         return list(self._display_rects)
+
+    @property
+    def display_content_rect(self) -> Optional[DisplayRect]:
+        """Outer bounds of the host-reported displays when they do not cover
+        the whole backing canvas.
+
+        Some host/session transitions report a backing canvas taller than the
+        union of the actual display rectangles. The encoded picture occupies
+        the reported display bounds and the remainder is black (or green while
+        a decoder is being reconfigured). Both frontends use this rect as an
+        automatic crop; ``None`` means the display layout already covers the
+        full canvas and no corrective crop is needed.
+        """
+        cw, ch = self.canvas_dims
+        rects = self.display_rects
+        if cw <= 0 or ch <= 0 or not rects:
+            return None
+        x0 = max(0, min(r.x for r in rects))
+        y0 = max(0, min(r.y for r in rects))
+        x1 = min(cw, max(r.x + r.w for r in rects))
+        y1 = min(ch, max(r.y + r.h for r in rects))
+        if x1 <= x0 or y1 <= y0:
+            return None
+        if x0 == 0 and y0 == 0 and x1 == cw and y1 == ch:
+            return None
+        return DisplayRect(display_id=0, x=x0, y=y0, w=x1 - x0, h=y1 - y0)
 
     def _fake_display_rects(self, spec: str) -> list[DisplayRect]:
         """Test hook: fabricate a multi-monitor layout so the per-monitor
@@ -1492,8 +1524,9 @@ class Session:
                 # bytes look non-utf8-clean.
                 try:
                     self._input.cut_text(cur)
-                    log.info("clipboard send: %d chars (preview=%r)",
-                             len(cur), cur[:40].replace("\n", "\\n"))
+                    # Clipboard text may contain credentials, tokens, personal
+                    # messages, or other sensitive data. Log metadata only.
+                    log.info("clipboard send: %d chars", len(cur))
                 except Exception as e:
                     log.debug("outbound cut_text send failed: %s", e)
 
@@ -1775,6 +1808,7 @@ class Session:
             "no frame!",
             "missing reference",
             "reference picture missing",   # AVC "reference picture missing during reorder"
+            "number of reference frames",  # AVC DPB overflow: "(8+9) exceeds max (16)"
             "decode_slice_header error",
             "skipping bitstream",
         )
@@ -1943,7 +1977,9 @@ class Session:
         _ml = msg.lower()
         if ("could not find ref" in _ml
                 or "reference picture missing" in _ml
-                or "missing reference picture" in _ml):
+                or "missing reference picture" in _ml
+                or ("number of reference frames" in _ml
+                    and "exceeds max" in _ml)):
             self._last_concealment_msg = msg
             # Storm tracking for reconnect escalation: a long gap since the
             # last ref-miss means the prior storm cleared → reset the count.
@@ -1999,6 +2035,7 @@ class Session:
                         self._DPB_ERR_THRESHOLD, self._DPB_ERR_WINDOW_S,
                         self._dpb_fir_count, self._DPB_FORCEALL_AFTER_FIRS,
                     )
+                self._log_dpb_diagnostics(msg, now)
                 # Don't blanket-FIR all tiles. The libav log line
                 # doesn't tell us which tile produced the ref-miss,
                 # but the per-tile post-decode `had_decode_error`
@@ -2019,6 +2056,13 @@ class Session:
                         ti for ti in range(min(self.num_tiles, len(states)))
                         if states[ti].bad_streak > 0
                     ]
+                    # AVC is a single-picture stream, so a context-wide libav
+                    # DPB warning is attributable to tile 0 even if the frame's
+                    # decode_error_flags have not been drained yet. Without
+                    # this fallback the warning said "FIR" but merely armed a
+                    # timer against an empty gate and sent nothing.
+                    if not bad_tiles and self.num_tiles == 1 and states:
+                        bad_tiles = [0]
                     for ti in bad_tiles:
                         # Sourced from the libav "Could not find ref" log →
                         # reliable=False: this is the silent-gray-capable
@@ -2037,6 +2081,64 @@ class Session:
         log.warning("libav decoder error: %s", msg[:120])
         # Soft-concealment, also sourced from the libav log → reliable=False.
         self._decoder._gate.mark_decode_error(0, reliable=False)
+
+    def _log_dpb_diagnostics(self, trigger: str, now: float) -> None:
+        """Emit one compact forensic snapshot per rate-limited DPB event.
+
+        These failures can take hours to recur, so the normal INFO log must
+        preserve enough state to distinguish transport loss, decoder overflow,
+        stale geometry, and an overly long inter-keyframe reference chain.
+        """
+        dec = self._decoder
+        diag = getattr(dec, "recovery_diagnostics", {}) if dec is not None else {}
+        if not isinstance(diag, dict):
+            diag = {}
+        loss_total = getattr(self, "_lost_pkts", 0)
+        loss_since = loss_total - getattr(self, "_last_dpb_diag_loss_total", 0)
+        self._last_dpb_diag_loss_total = loss_total
+        video_q = getattr(self, "_video_q", None)
+        try:
+            video_q_depth = video_q.qsize() if video_q is not None else -1
+        except Exception:
+            video_q_depth = -1
+        uptime_s = (
+            time.time() - self._connect_wall_ts
+            if getattr(self, "_connect_wall_ts", 0.0) > 0.0 else -1.0
+        )
+        video_age_s = (
+            now - self._last_video_pkt_t
+            if getattr(self, "_last_video_pkt_t", 0.0) > 0.0 else -1.0
+        )
+        cw, ch = self.canvas_dims
+        log.warning(
+            "DPB diagnostic: codec=%s decoder=%s uptime=%.1fs "
+            "keyframes=%s frames_since_key=%s last_key_age=%.1fs "
+            "nalus=%s restarts=%s await_key=%s sps_patch=%s "
+            "ltr_enabled=%s ltr_acks=%s loss_total=%d loss_since_dpb=%d "
+            "video_q=%d/%d video_q_drop=%d video_age=%.3fs "
+            "canvas=%dx%d avc_reconfig=%s trigger=%s",
+            self._video_codec,
+            diag.get("decoder", getattr(dec, "_hw_name", None) or "software"),
+            uptime_s,
+            diag.get("keyframes_seen", "?"),
+            diag.get("frames_since_keyframe", "?"),
+            float(diag.get("last_keyframe_age_s", -1.0)),
+            diag.get("nalus_fed", "?"),
+            diag.get("restarts", "?"),
+            diag.get("await_key", "?"),
+            diag.get("sps_patch", "?"),
+            self._ltr_enabled,
+            self._ltr_acks_sent,
+            loss_total,
+            loss_since,
+            video_q_depth,
+            _UDP_DRAIN_QUEUE_MAX,
+            getattr(self, "_video_q_dropped", 0),
+            video_age_s,
+            cw, ch,
+            getattr(self, "_avc_needs_reconfig", False),
+            trigger[:160],
+        )
 
     # ── video RX: drain + process split ──────────────────────────────
     #
@@ -2211,6 +2313,15 @@ class Session:
         # new-resolution slices (else: stale-sized context → -12909).
         if self._video_codec == "avc" and self._avc_needs_reconfig:
             self._maybe_reharvest_avc_config(ordered)
+            if self._avc_needs_reconfig:
+                # The layout switches before Apple's new avcC necessarily
+                # reaches us. Do not forward/decode new-canvas slices under the
+                # OLD SPS: growing the canvas would then paint the old-height
+                # picture at the top and leave the newly added bottom rows
+                # black/green in both the desktop and browser frontends.
+                # The post-layout FIR makes Apple repeat the config/keyframe;
+                # resume only after _maybe_reharvest_avc_config installs it.
+                return
         _reassemble = reassemble_h264 if self._video_codec == "avc" else reassemble_group
         au_cb = self._video_au_callback if self._video_codec == "avc" else None
 
@@ -2517,18 +2628,33 @@ class Session:
                 # NALUs and the new context starves until an unprompted
                 # IDR shows up (often never).
                 self._dpb_error_window.clear()
-                # Guard against rapid back-to-back SSRC rotations (e.g.
-                # Apple emitting two new groups within 2 s at curtain
-                # start): the second full restart discards IDR frames
-                # in-flight for the first group's FIR, making recovery
-                # nearly impossible. If we just restarted within 3 s
-                # the decoder is already fresh — skip the redundant
-                # teardown and let the FIR re-anchor the new group.
+                # AVC SSRCs are decoder generations, not interchangeable
+                # packet sources. A newly adopted AVC SSRC must always get an
+                # empty DPB: feeding it into the prior generation's context
+                # combines both reference sets and immediately produces
+                # "number of reference frames (6+11) exceeds max (16)" even
+                # with zero transport loss. AvcDecoder.restart() also arms its
+                # keyframe gate, so new-generation P-slices are dropped until
+                # the FIR response re-roots the context.
+                #
+                # Keep the rapid-restart guard for tiled HEVC. Apple can emit
+                # two HEVC groups within 2 s at curtain start, and a second
+                # teardown there discards IDRs still in flight for the first
+                # group's FIR.
                 # NOTE: read the prior restart time BEFORE stamping `now`,
                 # otherwise the gap is always 0 and the restart never fires.
                 last_restart = self._last_decoder_restart_t
-                if now - last_restart >= 3.0:
+                must_restart = (
+                    self._video_codec == "avc"
+                    or now - last_restart >= 3.0
+                )
+                if must_restart:
                     self._last_decoder_restart_t = now
+                    if self._video_codec == "avc":
+                        log.info(
+                            "AVC SSRC generation change: resetting decoder "
+                            "DPB before fresh keyframe"
+                        )
                     self._decoder.restart()
                 self.request_fir()
 
@@ -2906,6 +3032,28 @@ class Session:
                             " changed=%s",
                             sw, sh, bw, bh, changed,
                         )
+                        # Diagnostic for the "top squished / bottom black"
+                        # multi-monitor bug: does the per-display layout cover
+                        # the whole backing canvas? If the rects' union is
+                        # smaller than the canvas, the uncovered region is the
+                        # BLACK area the stream shows — the host is encoding a
+                        # canvas bigger than any display it reports, so iss has
+                        # no per-display rect to crop the black away. (If instead
+                        # there are ≥2 rects that DO cover it, the black is a
+                        # reported empty display and the per-monitor split should
+                        # handle it — check the "N display(s)" line above.)
+                        if self._display_rects and bw and bh:
+                            cov_w = max(r.x + r.w for r in self._display_rects)
+                            cov_h = max(r.y + r.h for r in self._display_rects)
+                            if cov_w < bw or cov_h < bh:
+                                log.warning(
+                                    "display layout GAP: %d rect(s) cover only "
+                                    "%dx%d of the %dx%d canvas — the uncovered "
+                                    "%dx%d (bottom/right) is the black region "
+                                    "(host isn't reporting it as a display)",
+                                    len(self._display_rects), cov_w, cov_h,
+                                    bw, bh, max(0, bw - cov_w), max(0, bh - cov_h),
+                                )
                         if changed:
                             # Re-offer the media session (0x1c) below for EVERY
                             # codec. The server stops encoding after a geometry
@@ -3200,10 +3348,12 @@ class Session:
         if text is None:
             log.info("clipboard recv: no text flavour (utis=%s)", utis)
             return
-        preview = text[:40].replace("\n", "\\n")
+        # Never include clipboard contents in logs. Diagnostic logs are often
+        # attached to bug reports, and copied text commonly contains secrets or
+        # personal information.
         log.info(
-            "clipboard recv: %d items, text=%d chars (preview=%r)",
-            len(items), len(text), preview,
+            "clipboard recv: %d items, text=%d chars",
+            len(items), len(text),
         )
         self._last_received_clipboard_text = text
         local_clipboard.push_text(text)
@@ -3571,12 +3721,37 @@ class Session:
     def _drain_pending_fir(self) -> None:
         if self._decoder is None:
             return
+        # Armed force-all escalation runs FIRST — before BOTH the Apple-idle
+        # and browser-health guards below — because it is a bounded one-shot
+        # that MUST fire even when the stream has gone quiet. Field evidence
+        # (Windows→Mac, AVC, lossy link): a reference break (Apple over-
+        # references past H.264's 16-frame cap → libav drops a ref → smear)
+        # lands, the per-tile FIR arms this escalation, then the screen goes
+        # static so Apple stops sending. Every idle-guarded tick then returned
+        # early and the 2.5 s escalation never ran — the picture stayed broken
+        # until a MANUAL Force-IDR. A Force-IDR (request_fir(None)) makes Apple
+        # emit a fresh IDR even while idle — the manual fix working is exactly
+        # what proves it — so neither guard may gate it. Armed only after a real
+        # DPB break, disarms itself after one shot → no storm. Single-tile (AVC)
+        # only: there keyframe_required unambiguously means the affected tile.
+        if self._dpb_forceall_pending and self.num_tiles == 1:
+            if not self._decoder._gate._keyframe_required:
+                self._dpb_forceall_pending = False   # recovered → disarm
+            elif (time.monotonic() - self._last_dpb_error_t
+                    >= self._DPB_FORCEALL_STALL_S):
+                self._dpb_forceall_pending = False   # one-shot per storm
+                log.warning(
+                    "DPB break unrecovered %.1fs after per-tile FIR — escalating "
+                    "to force-IDR ALL tiles",
+                    time.monotonic() - self._last_dpb_error_t)
+                self.request_fir(None)
         # Apple-idle suppression: if no video packet has arrived in the
         # last 1.5 s, Apple's encoder rate-controlled to silence on a
         # static screen — there's nothing to FIR productively (Apple
         # ISN'T encoding). Wait for packets to resume; the gate's
         # keyframe_required stays populated so the next packet that
-        # does arrive triggers a fresh FIR cycle naturally.
+        # does arrive triggers a fresh FIR cycle naturally. (The armed
+        # force-all escalation above is deliberately exempt — see there.)
         if self._last_video_pkt_t > 0.0:
             quiet_for = time.monotonic() - self._last_video_pkt_t
             if quiet_for >= 1.5:
@@ -3587,11 +3762,19 @@ class Session:
         # the session-side libav gate's flags are stale false positives (on
         # d3d11va the gate can't self-confirm recovery, so it would re-fire FIR —
         # and the "recovering via FIR" log — forever on a healthy stream). Skip.
-        # This keys ONLY off a confirmed-good picture, never off "no error"
-        # signals — a silent d3d11va wedge grays with no error/loss, and the
-        # browser stops reporting "ok" for it, so this window lapses (~1.5s) and
-        # FIRs resume to recover it.
-        if time.monotonic() - getattr(self, "_browser_healthy_t", 0.0) < 1.5:
+        # Always allow the FIRST request for a newly detected break through.
+        # "ok" only rules out the browser's flat/gray artifact classes; it does
+        # not rule out normal-FPS smearing/blocking.  Once one FIR has gone out,
+        # retain the suppression so a healthy browser is not disturbed by the
+        # local decoder's sticky false-positive retries.
+        gate = self._decoder._gate
+        first_recovery_request = bool(
+            gate._keyframe_required
+            and gate._fir_attempts[0] == 0
+        )
+        if (not first_recovery_request
+                and time.monotonic()
+                    - getattr(self, "_browser_healthy_t", 0.0) < 1.5):
             return
         sent: list[int] = []
         for ti in self._decoder.consume_fir_request():
@@ -3606,32 +3789,6 @@ class Session:
                 and time.monotonic() - self._grayout_window_t
                 >= self._GRAYOUT_WINDOW_S):
             self._flush_grayout_event()
-        # Stall escalation: a DPB break whose per-tile FIR hasn't recovered the
-        # picture within the grace window. The COUNT-based force-all only fires
-        # after `_DPB_FORCEALL_AFTER_FIRS` ref-miss events; the AVC over-reference
-        # case emits just ONE "reference picture missing" (then continues as the
-        # harmless-signature "discarding one"), so it would sit gray until a
-        # manual Force-IDR. Force-IDR all tiles ONCE — the gate reset a manual
-        # Force-IDR does — then disarm; re-armed by the next DPB break.
-        # Key off the DPB-AFFECTED tiles specifically: an unrelated tile's
-        # ordinary loss sitting in keyframe_required must NOT drive this
-        # force-IDR-all (that's the blanket-FIR-on-transient-loss the count-path
-        # deliberately avoids).
-        # Single-tile (AVC) only — `_dpb_forceall_pending` is armed only then, so
-        # `keyframe_required` is unambiguously the affected tile (no risk of an
-        # unrelated tile's ordinary loss driving a blanket force-IDR, and no
-        # cross-thread set to race on).
-        if self._dpb_forceall_pending and self.num_tiles == 1:
-            if not self._decoder._gate._keyframe_required:
-                self._dpb_forceall_pending = False   # recovered → disarm
-            elif (time.monotonic() - self._last_dpb_error_t
-                    >= self._DPB_FORCEALL_STALL_S):
-                self._dpb_forceall_pending = False   # one-shot per storm
-                log.warning(
-                    "DPB break unrecovered %.1fs after per-tile FIR — escalating "
-                    "to force-IDR ALL tiles",
-                    time.monotonic() - self._last_dpb_error_t)
-                self.request_fir(None)
 
     def _send_fir_for_tile(self, tile_idx: int, log_per_tile: bool = True) -> bool:
         """Returns True if a FIR was actually emitted (False if rate-
