@@ -234,7 +234,12 @@ class AvcDecoder:
         # re-roots it (see feed_nalu). Armed at construction so the initial
         # burst's IDR opens the gate.
         self._await_key = True
-        self._hw_name: Optional[str] = None  # software-only for now
+        self._hw_name: Optional[str] = None
+        # PyAV can open a nominal HWAccel context, then have FFmpeg reject the
+        # actual stream/device combination on first decode and continue through
+        # its allowed software fallback. The session's libav callback marks
+        # that explicit setup failure here so later restarts do not retry it.
+        self._hw_failed: bool = False
         self.nalu_counts_per_tile: list[dict[int, int]] = [
             {} for _ in range(num_tiles)
         ]
@@ -284,7 +289,7 @@ class AvcDecoder:
         if self._codec is not None or not (self._sps and self._pps):
             return self._codec
         extradata = self._build_extradata()
-        if self._prefer_hwaccel:
+        if self._prefer_hwaccel and not self._hw_failed:
             for hw_type in _h264_hwaccels():
                 ctx = self._try_hwaccel_locked(hw_type, extradata)
                 if ctx is not None:
@@ -476,6 +481,26 @@ class AvcDecoder:
         if self._on_frame_published is not None:
             for ti in published:
                 self._on_frame_published(ti)
+
+    def mark_hwaccel_failed(self, trigger: str = "") -> None:
+        """Record FFmpeg's explicit late hardware-initialization failure.
+
+        PyAV deliberately transfers successful hardware frames back to a CPU
+        pixel format, so the returned frame format cannot distinguish hardware
+        decode from software fallback. The libav error is authoritative. Keep
+        the already-running fallback context; only make the label truthful and
+        skip the broken accelerator on future context rebuilds.
+        """
+        if self._hw_failed:
+            return
+        failed = self._hw_name or "requested accelerator"
+        self._hw_failed = True
+        self._hw_name = None
+        log.warning(
+            "AVC hwaccel %r failed during stream setup; continuing in "
+            "software and disabling HW retries for this session (%s)",
+            failed, trigger[:120] or "libav hardware initialization error",
+        )
 
     # -- consume -------------------------------------------------------
 

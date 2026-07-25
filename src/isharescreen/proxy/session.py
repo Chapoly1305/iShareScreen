@@ -1812,6 +1812,11 @@ class Session:
             "decode_slice_header error",
             "skipping bitstream",
         )
+        hwaccel_failure_keywords = (
+            "failed to get the decoder guids",
+            "failed setup for format d3d11",
+            "hwaccel initialisation returned error",
+        )
 
         class _LibavConcealmentHandler(logging.Handler):
             def emit(self_h, record):  # noqa: N805
@@ -1820,9 +1825,18 @@ class Session:
                 except Exception:
                     return
                 msg = raw.lower()
-                if _log_all_libav:
+                is_hwaccel_failure = any(
+                    kw in msg for kw in hwaccel_failure_keywords
+                )
+                if _log_all_libav and not is_hwaccel_failure:
                     # Diagnostic: log it ALL, before the whitelist drops it.
                     log.info("LIBAV_RAW[%s] %s", record.levelname, raw)
+                if is_hwaccel_failure:
+                    for sess in tuple(getattr(Session, "_active_sessions", ())):
+                        try:
+                            sess._on_libav_hwaccel_failure(raw)
+                        except Exception:
+                            pass
                 if not any(kw in msg for kw in concealment_keywords):
                     return
                 for sess in tuple(getattr(Session, "_active_sessions", ())):
@@ -1845,6 +1859,8 @@ class Session:
             "could not find ref",
             "non-existing pps",
             "concealing",
+            "failed to get the decoder guids",
+            "failed setup for format d3d11",
         )
 
         class _SuppressLibavConcealment(logging.Filter):
@@ -1863,6 +1879,14 @@ class Session:
 
         Session._libav_log_installed = True
         log.info("libav concealment-log handler installed (root handlers filter the noise)")
+
+    def _on_libav_hwaccel_failure(self, msg: str) -> None:
+        """Keep PyAV's successful software fallback, but stop HW retries."""
+        if self._decoder is None:
+            return
+        mark_failed = getattr(self._decoder, "mark_hwaccel_failed", None)
+        if callable(mark_failed):
+            mark_failed(msg)
 
     # Sliding-window thresholds for "Could not find ref" detection.
     # Trigger the fast FIR path on the FIRST "Could not find ref" event
