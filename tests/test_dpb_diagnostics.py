@@ -22,6 +22,8 @@ def test_dpb_diagnostic_captures_decoder_transport_and_geometry(caplog):
             "restarts": 2,
             "sps_patch": True,
             "await_key": False,
+            "reference_reset_pending": True,
+            "reference_resets": 3,
         },
     )
     session._video_codec = "avc"
@@ -48,6 +50,7 @@ def test_dpb_diagnostic_captures_decoder_transport_and_geometry(caplog):
     line = caplog.messages[-1]
     assert "decoder=d3d11va" in line
     assert "frames_since_key=900" in line
+    assert "ref_reset_pending=True ref_resets=3" in line
     assert "loss_total=12 loss_since_dpb=7" in line
     assert "video_q=1/16384 video_q_drop=3" in line
     assert "canvas=3072x1728" in line
@@ -62,7 +65,11 @@ def test_single_tile_dpb_log_arms_recovery_before_frame_flag(monkeypatch):
     """
     gate = FrameQualityGate(1)
     session = Session.__new__(Session)
-    session._decoder = types.SimpleNamespace(_gate=gate)
+    armed: list[str] = []
+    session._decoder = types.SimpleNamespace(
+        _gate=gate,
+        mark_reference_chain_broken=armed.append,
+    )
     session._observed_tile_count = 1
     session._dpb_error_window = __import__("collections").deque()
     session._last_decoder_restart_t = 0.0
@@ -78,3 +85,35 @@ def test_single_tile_dpb_log_arms_recovery_before_frame_flag(monkeypatch):
     assert gate._keyframe_required == {0}
     assert gate._states[0].bad_streak == 1
     assert session._dpb_forceall_pending is True
+    assert armed == [
+        "number of reference frames (6+11) exceeds max (16), discarding one",
+    ]
+
+
+def test_dpb_log_arms_decoder_even_while_fir_fast_path_is_cooling_down(
+        monkeypatch):
+    """Decoder gating is immediate; only the outbound FIR is rate-limited."""
+    gate = FrameQualityGate(1)
+    armed: list[str] = []
+    session = Session.__new__(Session)
+    session._decoder = types.SimpleNamespace(
+        _gate=gate,
+        mark_reference_chain_broken=armed.append,
+    )
+    session._observed_tile_count = 1
+    session._dpb_error_window = __import__("collections").deque()
+    session._last_decoder_restart_t = 0.0
+    session._last_dpb_error_t = time.monotonic()
+    session._last_dpb_fast_recovery_t = time.monotonic()
+    session._dpb_fir_count = 1
+    session._dpb_forceall_pending = False
+    session._last_publish_t = time.monotonic()
+    monkeypatch.setattr(session, "_log_dpb_diagnostics", lambda *_args: None)
+
+    msg = "reference picture missing during reorder"
+    session._on_libav_concealment(msg)
+
+    assert armed == [msg]
+    # No second fast-path FIR was armed inside the one-second cooldown.
+    assert gate._keyframe_required == set()
+    assert session._dpb_fir_count == 1

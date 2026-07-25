@@ -1981,6 +1981,18 @@ class Session:
                 or ("number of reference frames" in _ml
                     and "exceeds max" in _ml)):
             self._last_concealment_msg = msg
+            # Detection and wire-rate limiting are separate concerns. Every
+            # confirmed AVC reference miss must gate deltas immediately, even
+            # when a previous FIR keeps the fast-send path below on cooldown.
+            # Otherwise a second break just after a recovery intra frame can
+            # keep feeding a newly poisoned DPB for nearly a second. The
+            # decoder method is lock-free/idempotent; actual context teardown
+            # remains deferred until the next complete intra frame.
+            arm_reference_reset = getattr(
+                self._decoder, "mark_reference_chain_broken", None,
+            )
+            if callable(arm_reference_reset):
+                arm_reference_reset(msg)
             # Storm tracking for reconnect escalation: a long gap since the
             # last ref-miss means the prior storm cleared → reset the count.
             if now - self._last_dpb_error_t > self._DPB_STORM_RESET_S:
@@ -2114,6 +2126,7 @@ class Session:
             "DPB diagnostic: codec=%s decoder=%s uptime=%.1fs "
             "keyframes=%s frames_since_key=%s last_key_age=%.1fs "
             "nalus=%s restarts=%s await_key=%s sps_patch=%s "
+            "ref_reset_pending=%s ref_resets=%s "
             "ltr_enabled=%s ltr_acks=%s loss_total=%d loss_since_dpb=%d "
             "video_q=%d/%d video_q_drop=%d video_age=%.3fs "
             "canvas=%dx%d avc_reconfig=%s trigger=%s",
@@ -2127,6 +2140,8 @@ class Session:
             diag.get("restarts", "?"),
             diag.get("await_key", "?"),
             diag.get("sps_patch", "?"),
+            diag.get("reference_reset_pending", "?"),
+            diag.get("reference_resets", "?"),
             self._ltr_enabled,
             self._ltr_acks_sent,
             loss_total,

@@ -253,6 +253,16 @@ class AvcDecoder:
         self._last_keyframe_t: float = 0.0
         self._restart_count: int = 0
         self._sps_patch_applied: bool = False
+        # Apple's AVC recovery pictures are non-IDR intra slices (NAL type 1),
+        # so libav does not automatically flush a poisoned DPB when one lands.
+        # A confirmed reference-chain break arms this flag from libav's log
+        # callback. We then drop deltas and rebuild the codec context exactly
+        # when the next complete intra slice arrives, using that independently
+        # decodable picture to seed an empty DPB.
+        self._reference_reset_pending: bool = False
+        self._reference_reset_count: int = 0
+        self._reference_break_t: float = 0.0
+        self._reference_break_trigger: str = ""
 
     # -- setup ---------------------------------------------------------
 
@@ -344,20 +354,15 @@ class AvcDecoder:
             return
         nb = nalu if isinstance(nalu, bytes) else bytes(nalu)
         is_key = _nal_is_keyframe(nb)
-        # Post-restart keyframe gate. After a restart (incl. the session's
-        # SSRC-adoption / VT-wedge restart) the DPB is empty, so feeding the
-        # inter (P) slices that arrive before the next IDR makes the decoder
-        # reference frames it never decoded → "reference frames N+1 exceeds
-        # max" / -12909, and the session's restart-on-wedge then re-wedges on
-        # the next P-slice flood — a permanent freeze on resize. Drop slices
-        # until a keyframe re-roots the DPB. Direct-decode (no parser) has no
-        # tolerance here, so this gate is what makes it safe; the FIR the
-        # session sends on restart fetches the keyframe that clears it.
-        if self._await_key:
-            if is_key:
-                self._await_key = False
-            else:
-                return
+        # Post-restart / broken-reference keyframe gate. After a restart the
+        # DPB is empty; after a confirmed reference miss it is poisoned. In
+        # either case, feeding inter slices before a fresh intra picture merely
+        # extends the failure. Apple's AVC "keyframe" is a non-IDR type-1 I
+        # slice, so the broken-reference case additionally needs an explicit
+        # context rebuild when that slice arrives (performed under the codec
+        # lock below). Until then, freeze on the last good frame.
+        if self._await_key and not is_key:
+            return
         self._nalus_fed += 1
         if is_key:
             self._keyframes_seen += 1
@@ -378,11 +383,34 @@ class AvcDecoder:
         import time as _time
         published: list[int] = []
         with self._codec_lock:
+            reset_for_this_key = False
+            if is_key and self._reference_reset_pending:
+                waited = (
+                    _time.monotonic() - self._reference_break_t
+                    if self._reference_break_t > 0.0 else -1.0
+                )
+                trigger = self._reference_break_trigger
+                self._close_codec_context_locked()
+                self._reference_reset_pending = False
+                self._reference_reset_count += 1
+                reset_for_this_key = True
+                log.warning(
+                    "AVC recovery: reset poisoned decoder DPB on fresh intra "
+                    "frame (wait=%.3fs reset=%d trigger=%s)",
+                    waited,
+                    self._reference_reset_count,
+                    trigger[:120] or "reference-chain break",
+                )
             ctx = self._ensure_codec_locked()
             if ctx is None:
                 return  # no params yet — don't register a pts that never drains
-            # Every keyframe re-roots the shared DPB for all tiles, so re-mark
-            # IDR observation on each one (mirrors HevcDecoder). Without this
+            if is_key:
+                self._await_key = False
+            # Every independently decodable intra frame is a recovery
+            # observation for all tiles, so re-mark the quality gate (mirrors
+            # HevcDecoder). The explicit context reset above, not the non-IDR
+            # NAL itself, is what actually clears a poisoned libav DPB. Without
+            # this gate observation
             # the gate only ever marks the first frame: a tile that drops into
             # `keyframe_required` mid-stream (a post-SSRC-adoption P-frame
             # error) can never satisfy mark_clean's IDR-observed condition, so
@@ -412,11 +440,24 @@ class AvcDecoder:
                 # map doesn't leak the in-flight entry.
                 self._pts_to_tile.pop(pts, None)
                 self._pts_submit_t.pop(pts, None)
+                if reset_for_this_key:
+                    # The recovery intra picture itself was unusable. Keep
+                    # deltas gated and wait for the sticky FIR loop's retry
+                    # instead of feeding an empty DPB immediately afterward.
+                    self.mark_reference_chain_broken(
+                        "fresh intra frame failed after DPB reset",
+                    )
                 self._gate.mark_decode_error(tile_idx)
                 return
             for frame in frames:
                 ti = self._pts_to_tile.pop(frame.pts, tile_idx)
                 submit_t = self._pts_submit_t.pop(frame.pts, None)
+                # The libav callback can arm recovery synchronously from inside
+                # ctx.decode(pkt). Never publish that same concealed frame:
+                # hold the last known-good picture while deltas are gated and
+                # the requested intra recovery frame is in flight.
+                if self._reference_reset_pending:
+                    continue
                 if submit_t is not None:
                     latency_ms = (_time.monotonic() - submit_t) * 1000
                     self._decode_latency_ms = (
@@ -512,6 +553,8 @@ class AvcDecoder:
             "restarts": self._restart_count,
             "sps_patch": self._sps_patch_applied,
             "await_key": self._await_key,
+            "reference_reset_pending": self._reference_reset_pending,
+            "reference_resets": self._reference_reset_count,
         }
 
     @property
@@ -522,6 +565,40 @@ class AvcDecoder:
     def clean_counts(self) -> list:
         return [t.clean_count for t in self._tiles]
 
+    def mark_reference_chain_broken(self, trigger: str = "") -> None:
+        """Arm loss recovery without touching libav from its log callback.
+
+        This method is intentionally lock-free: PyAV invokes the session's
+        concealment handler synchronously while ``ctx.decode()`` holds
+        ``_codec_lock``, so closing the codec here would deadlock. The next
+        ``feed_nalu`` drops deltas until a complete intra frame arrives, then
+        performs the actual context rebuild under the normal decode lock.
+        """
+        if not self._reference_reset_pending:
+            self._reference_break_t = time.monotonic()
+            self._reference_break_trigger = trigger
+        self._reference_reset_pending = True
+        self._await_key = True
+
+    def _close_codec_context_locked(self) -> None:
+        """Clear only codec/DPB state; caller holds ``_codec_lock``.
+
+        The quality gate deliberately survives this operation so its sticky
+        FIR request cannot clear until the newly seeded decoder publishes a
+        clean frame.
+        """
+        if self._codec is not None:
+            try:
+                self._codec.close()
+            except Exception:
+                pass
+            self._codec = None
+        self._pts_to_tile.clear()
+        self._pts_submit_t.clear()
+        self._dpb_ready = False
+        self._await_key = True
+        self._decode_latency_ms = 0.0
+
     def restart(self) -> None:
         """Tear down + rebuild the shared codec context. May fire from the
         stall-watchdog thread, so it takes _codec_lock to avoid freeing the
@@ -529,17 +606,10 @@ class AvcDecoder:
         this in _teardown) so post-restart publish/FIR decisions start clean."""
         with self._codec_lock:
             self._restart_count += 1
-            if self._codec is not None:
-                try:
-                    self._codec.close()
-                except Exception:
-                    pass
-                self._codec = None
-            self._pts_to_tile.clear()
-            self._pts_submit_t.clear()
-            self._dpb_ready = False
-            self._await_key = True
-            self._decode_latency_ms = 0.0
+            self._close_codec_context_locked()
+            self._reference_reset_pending = False
+            self._reference_break_t = 0.0
+            self._reference_break_trigger = ""
             self._gate.reset()
             if self._sps and self._pps:
                 self._ensure_codec_locked()
