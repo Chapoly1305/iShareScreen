@@ -338,7 +338,14 @@ def _setup_logging(args: argparse.Namespace) -> None:
     )
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
     if args.log_file:
-        handlers.append(logging.FileHandler(args.log_file, encoding="utf-8"))
+        # The browser launcher writes first-run logs below ~/.iss. On a clean
+        # machine that directory does not exist yet, and FileHandler does not
+        # create parent directories itself. Normalize user-provided paths and
+        # create the parent before opening so a fresh install can connect
+        # without requiring a manual `mkdir ~/.iss`.
+        log_path = os.path.abspath(os.path.expanduser(args.log_file))
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
     for h in handlers:
         h.setFormatter(fmt)
         h.setLevel(level)
