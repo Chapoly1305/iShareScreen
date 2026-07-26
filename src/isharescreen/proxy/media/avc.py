@@ -253,6 +253,12 @@ class AvcDecoder:
         # deliberately cheap counters so the libav log callback can snapshot
         # decoder history without enabling frame-by-frame debug logging.
         self._nalus_fed: int = 0
+        # Decodable pictures fed since the codec context/DPB was created.
+        # Unlike `_frames_since_keyframe`, this deliberately does not reset on
+        # Apple's non-IDR intra pictures: those do not necessarily clear a
+        # D3D11VA reference buffer. The session uses this counter to rebuild
+        # d3d11va before H.264's picture-order counter can wrap silently.
+        self._frames_since_context_reset: int = 0
         self._keyframes_seen: int = 0
         self._frames_since_keyframe: int = 0
         self._last_keyframe_t: float = 0.0
@@ -369,6 +375,8 @@ class AvcDecoder:
         if self._await_key and not is_key:
             return
         self._nalus_fed += 1
+        if t in (1, 5):
+            self._frames_since_context_reset += 1
         if is_key:
             self._keyframes_seen += 1
             self._frames_since_keyframe = 0
@@ -572,6 +580,7 @@ class AvcDecoder:
         return {
             "decoder": self._hw_name or "software",
             "nalus_fed": self._nalus_fed,
+            "frames_since_context_reset": self._frames_since_context_reset,
             "keyframes_seen": self._keyframes_seen,
             "frames_since_keyframe": self._frames_since_keyframe,
             "last_keyframe_age_s": last_key_age,
@@ -623,6 +632,7 @@ class AvcDecoder:
         self._dpb_ready = False
         self._await_key = True
         self._decode_latency_ms = 0.0
+        self._frames_since_context_reset = 0
 
     def restart(self) -> None:
         """Tear down + rebuild the shared codec context. May fire from the

@@ -58,6 +58,7 @@ def test_reference_break_drops_deltas_then_rebuilds_on_intra():
     assert decoder.recovery_diagnostics["reference_reset_pending"] is False
     assert decoder.recovery_diagnostics["reference_resets"] == 1
     assert decoder.recovery_diagnostics["await_key"] is False
+    assert decoder.recovery_diagnostics["frames_since_context_reset"] == 0
     # The codec-only reset must preserve sticky FIR/recovery state until the
     # newly seeded decoder's frame is consumed and confirmed clean.
     assert decoder._gate._keyframe_required == {0}

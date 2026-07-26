@@ -18,6 +18,7 @@ def test_dpb_diagnostic_captures_decoder_transport_and_geometry(caplog):
             "nalus_fed": 4321,
             "keyframes_seen": 7,
             "frames_since_keyframe": 900,
+            "frames_since_context_reset": 6800,
             "last_keyframe_age_s": 42.5,
             "restarts": 2,
             "sps_patch": True,
@@ -50,6 +51,7 @@ def test_dpb_diagnostic_captures_decoder_transport_and_geometry(caplog):
     line = caplog.messages[-1]
     assert "decoder=d3d11va" in line
     assert "frames_since_key=900" in line
+    assert "context_frames=6800" in line
     assert "ref_reset_pending=True ref_resets=3" in line
     assert "loss_total=12 loss_since_dpb=7" in line
     assert "video_q=1/16384 video_q_drop=3" in line

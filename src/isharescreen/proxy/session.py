@@ -103,6 +103,11 @@ _PROFILE_RX = os.environ.get("ISS_WT_PROFILE", "0") == "1"
 # ISS_WT_LOCAL_DECODE=1 to keep the local decode (e.g. for the iss quality gate).
 _PASSTHROUGH_LOCAL_DECODE = os.environ.get("ISS_WT_LOCAL_DECODE", "0") == "1"
 
+# Apple's AVC stream uses a 13-bit picture-order counter (wrap at 8192).
+# Leave enough room for a FIR round-trip and fresh intra delivery before
+# rebuilding the affected D3D11VA decoder's DPB.
+_AVC_D3D11_REANCHOR_FRAMES = 7000
+
 # Initial-burst re-arm: occasionally TCP negotiation fully succeeds and the
 # host accepts the canvas, but screensharingd never starts sending RTP -- a
 # host-side encoder/agent stall. Rather than bail fatally we tear the TCP
@@ -2148,7 +2153,8 @@ class Session:
         cw, ch = self.canvas_dims
         log.warning(
             "DPB diagnostic: codec=%s decoder=%s uptime=%.1fs "
-            "keyframes=%s frames_since_key=%s last_key_age=%.1fs "
+            "keyframes=%s frames_since_key=%s context_frames=%s "
+            "last_key_age=%.1fs "
             "nalus=%s restarts=%s await_key=%s sps_patch=%s "
             "ref_reset_pending=%s ref_resets=%s "
             "ltr_enabled=%s ltr_acks=%s loss_total=%d loss_since_dpb=%d "
@@ -2159,6 +2165,7 @@ class Session:
             uptime_s,
             diag.get("keyframes_seen", "?"),
             diag.get("frames_since_keyframe", "?"),
+            diag.get("frames_since_context_reset", "?"),
             float(diag.get("last_keyframe_age_s", -1.0)),
             diag.get("nalus_fed", "?"),
             diag.get("restarts", "?"),
@@ -3432,6 +3439,7 @@ class Session:
                     self.request_fir()
                 self._drain_pending_fir()
                 self._drain_pending_nack()
+                self._maybe_reanchor_d3d11va_avc()
                 self._check_stall()
                 self._maybe_poll_cursor()
                 if self._tx_tick % _TX_PROFILE_EVERY_N_TICKS == 0:
@@ -3914,6 +3922,44 @@ class Session:
                 sock.sendto(enc.protect(compound), (self._dest_host, self._ctrl_dest_port))
             except OSError as e:
                 log.debug("NACK send failed: %s", e)
+
+    def _maybe_reanchor_d3d11va_avc(self) -> None:
+        """Preempt D3D11VA's silent H.264 picture-order-wrap corruption.
+
+        This path is intentionally narrow: desktop AVC, active d3d11va
+        hardware decode, and only when the current codec context has consumed
+        enough pictures to approach the stream's 13-bit POC wrap. Apple's
+        ordinary intra pictures do not reliably empty the hardware DPB, so arm
+        the existing reference-reset gate and request a fresh intra. The next
+        intra rebuilds the codec context and seeds an empty DPB.
+        """
+        if (not self._connected or self._video_codec != "avc"
+                or self._decoder is None
+                or self._decoder.hw_accel != "d3d11va"):
+            return
+        diag = getattr(self._decoder, "recovery_diagnostics", {})
+        if diag.get("reference_reset_pending"):
+            return
+        frames = int(diag.get("frames_since_context_reset", 0))
+        if frames < _AVC_D3D11_REANCHOR_FRAMES:
+            return
+        mark_broken = getattr(
+            self._decoder, "mark_reference_chain_broken", None,
+        )
+        if not callable(mark_broken):
+            return
+        trigger = (
+            "preventive d3d11va DPB re-anchor before H.264 POC wrap "
+            f"({frames} frames since context reset)"
+        )
+        log.warning(
+            "AVC d3d11va re-anchor: %d frames since decoder reset "
+            "(threshold=%d) — requesting fresh intra and clean DPB",
+            frames,
+            _AVC_D3D11_REANCHOR_FRAMES,
+        )
+        mark_broken(trigger)
+        self.request_fir(None)
 
     def _check_stall(self) -> None:
         """Decoder-stall recovery. Two failure modes:
