@@ -166,7 +166,7 @@ def _make_parser() -> argparse.ArgumentParser:
             "'on' = 2x (Retina: normal-size UI on a 4K backing); 'off' = 1x "
             "(flat, small UI, ~1/4 the bandwidth). Or a number 1.0-4.0 for a "
             "custom scale (e.g. 2.5 = bigger UI than 2x); higher = larger UI. "
-            "The browser connect form exposes this as 'Display scale' (%)."
+            "The browser connect form exposes this as 'Display scale' (%%)."
         ),
     )
     g.add_argument(
