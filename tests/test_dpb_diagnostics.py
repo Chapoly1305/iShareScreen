@@ -68,10 +68,13 @@ def test_single_tile_dpb_log_arms_recovery_before_frame_flag(monkeypatch):
     gate = FrameQualityGate(1)
     session = Session.__new__(Session)
     armed: list[str] = []
+    hw_failed: list[str] = []
     session._decoder = types.SimpleNamespace(
         _gate=gate,
         mark_reference_chain_broken=armed.append,
+        mark_hwaccel_reference_failure=hw_failed.append,
     )
+    session._video_codec = "avc"
     session._observed_tile_count = 1
     session._dpb_error_window = __import__("collections").deque()
     session._last_decoder_restart_t = 0.0
@@ -88,6 +91,9 @@ def test_single_tile_dpb_log_arms_recovery_before_frame_flag(monkeypatch):
     assert gate._states[0].bad_streak == 1
     assert session._dpb_forceall_pending is True
     assert armed == [
+        "number of reference frames (6+11) exceeds max (16), discarding one",
+    ]
+    assert hw_failed == [
         "number of reference frames (6+11) exceeds max (16), discarding one",
     ]
 

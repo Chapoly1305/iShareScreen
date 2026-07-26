@@ -2022,6 +2022,19 @@ class Session:
             )
             if callable(arm_reference_reset):
                 arm_reference_reset(msg)
+            # A confirmed reference-chain break from an active D3D11VA AVC
+            # context is the point where hardware has proved unreliable for
+            # THIS connection. Keep hardware as the Windows/new-session
+            # default, but make the already-armed fresh-intra rebuild use
+            # software so D3D11 cannot silently keep publishing damaged frames
+            # after the log-visible reset. Other codecs/accelerators do not
+            # implement this hook and remain unchanged.
+            mark_hw_reference_failure = getattr(
+                self._decoder, "mark_hwaccel_reference_failure", None,
+            )
+            if getattr(self, "_video_codec", "") == "avc" and callable(
+                    mark_hw_reference_failure):
+                mark_hw_reference_failure(msg)
             # Storm tracking for reconnect escalation: a long gap since the
             # last ref-miss means the prior storm cleared → reset the count.
             if now - self._last_dpb_error_t > self._DPB_STORM_RESET_S:

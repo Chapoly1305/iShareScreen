@@ -237,8 +237,10 @@ class AvcDecoder:
         self._hw_name: Optional[str] = None
         # PyAV can open a nominal HWAccel context, then have FFmpeg reject the
         # actual stream/device combination on first decode and continue through
-        # its allowed software fallback. The session's libav callback marks
-        # that explicit setup failure here so later restarts do not retry it.
+        # its allowed software fallback. D3D11VA can also accept the stream but
+        # later return persistently corrupt frames after a confirmed reference
+        # break. Both paths set this per-decoder/session latch so the next
+        # context rebuild uses software instead of retrying broken hardware.
         self._hw_failed: bool = False
         self.nalu_counts_per_tile: list[dict[int, int]] = [
             {} for _ in range(num_tiles)
@@ -508,6 +510,24 @@ class AvcDecoder:
             "AVC hwaccel %r failed during stream setup; continuing in "
             "software and disabling HW retries for this session (%s)",
             failed, trigger[:120] or "libav hardware initialization error",
+        )
+
+    def mark_hwaccel_reference_failure(self, trigger: str = "") -> None:
+        """Fall back only after an active D3D11VA decoder proves unreliable.
+
+        Keep ``_hw_name`` until the already-armed reference recovery reaches a
+        fresh intra frame. That preserves truthful event diagnostics
+        (``decoder=d3d11va``); the ensuing codec rebuild sees ``_hw_failed`` and
+        creates a software context for the remainder of this connection.
+        """
+        if self._hw_failed or self._hw_name != "d3d11va":
+            return
+        self._hw_failed = True
+        log.warning(
+            "AVC d3d11va produced a confirmed broken reference chain; "
+            "the fresh-intra recovery will switch this session to software "
+            "(hardware remains the default for new sessions; %s)",
+            trigger[:120] or "libav reference-picture error",
         )
 
     # -- consume -------------------------------------------------------
