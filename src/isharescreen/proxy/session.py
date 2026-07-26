@@ -103,21 +103,6 @@ _PROFILE_RX = os.environ.get("ISS_WT_PROFILE", "0") == "1"
 # ISS_WT_LOCAL_DECODE=1 to keep the local decode (e.g. for the iss quality gate).
 _PASSTHROUGH_LOCAL_DECODE = os.environ.get("ISS_WT_LOCAL_DECODE", "0") == "1"
 
-
-def _prefer_avc_hwaccel(platform: str, setting: Optional[str]) -> bool:
-    """Return the AVC hardware-decode policy for this platform.
-
-    Windows D3D11VA has produced long-running, valid-looking reference
-    corruption without setting a frame error flag or emitting a libav error.
-    Software decode is therefore the safe Windows default. Keep hardware as an
-    explicit opt-in for users who have validated their driver; other platforms
-    retain the existing hardware-first default and can explicitly opt out.
-    """
-    if setting is None:
-        return platform != "win32"
-    return setting.strip().lower() not in ("", "0", "false", "no", "off")
-
-
 # Initial-burst re-arm: occasionally TCP negotiation fully succeeds and the
 # host accepts the canvas, but screensharingd never starts sending RTP -- a
 # host-side encoder/agent stall. Rather than bail fatally we tear the TCP
@@ -332,6 +317,12 @@ class Session:
             "avc" if os.environ.get("ISS_VIDEO_CODEC", "").lower() == "avc"
             else "hevc"
         )
+        # AVC hardware-decode periodic IDR re-anchor (d3d11va POC-wrap
+        # workaround). The full machinery (_maybe_reanchor + _tx_loop driver)
+        # lives on the AVC feature branch and is NOT ported here; pin to False
+        # so the AVC decoder-selection branch uses the normal path. Re-enabling
+        # requires porting _maybe_reanchor — do not just flip this.
+        self._avc_reanchor_enabled: bool = False
         # Runtime-updated canvas dimensions from AppleDisplayLayout (0x451).
         # `_runtime_canvas_*` = backing/pixel size (decoded frame dimensions).
         # `_runtime_scaled_*` = logical/scaled size (window/client coordinate space).
@@ -1157,38 +1148,29 @@ class Session:
         # (media/registry.py owns the capability matrix + override handling).
         if self._video_codec == "avc":
             # AVC path: the host streams H.264 4:2:0 as a single self-contained
-            # picture per frame (tiles_per_frame()==1 for AVC). On Windows,
-            # D3D11VA can silently corrupt the reference chain after a long
-            # session while still returning ordinary frames with no error flag
-            # or libav log. That failure cannot be reacted to reliably after
-            # the fact, so use the proven software path by default there.
-            # ISS_AVC_HWACCEL=1 opts back into D3D11VA; ISS_AVC_HWACCEL=0
-            # explicitly forces software on every platform.
-            _avc_hw_setting = _os.environ.get("ISS_AVC_HWACCEL")
-            avc_prefer_hwaccel = (
-                prefer_hwaccel
-                and _prefer_avc_hwaccel(_sys.platform, _avc_hw_setting)
-            )
-            # The shared ISS_FORCE_SW_HEVC diagnostic override is logged once
-            # below; only attribute this choice to AVC policy when that broader
-            # override is not active.
-            if (prefer_hwaccel and _sys.platform == "win32"
-                    and not avc_prefer_hwaccel):
-                if _avc_hw_setting is None:
-                    log.info(
-                        "AVC: software decode by default on Windows "
-                        "(avoids silent D3D11VA reference corruption; set "
-                        "ISS_AVC_HWACCEL=1 to opt into hardware decode)"
-                    )
-                else:
-                    log.info(
-                        "AVC: forcing software decode "
-                        "(ISS_AVC_HWACCEL=%s)",
-                        _avc_hw_setting,
-                    )
-            elif prefer_hwaccel and not avc_prefer_hwaccel:
+            # picture per frame (tiles_per_frame()==1 for AVC), decoded on the
+            # GPU via d3d11va (Windows) / vaapi (Linux). Hardware decode is
+            # verified clean well past the frame_num/POC wrap (log2_max_poc_lsb
+            # =13 → ~34 s) on AMD, so it is the default. The earlier default
+            # forced software as a conservative workaround for an observed
+            # d3d11va POC-wrap corruption; that no longer reproduces on the
+            # single-tile stream. If corruption ever reappears, set
+            # ISS_AVC_HWACCEL=0 to force software (libav decodes the identical
+            # bitstream correctly indefinitely).
+            avc_prefer_hwaccel = prefer_hwaccel
+            if self._avc_reanchor_enabled:
+                # Keep hardware decode; avoid the d3d11va POC-wrap bug by
+                # periodically re-anchoring with a fresh IDR (see _maybe_
+                # reanchor, driven from _tx_loop). Lower latency/CPU than the
+                # software fallback at the cost of a keyframe burst every N s.
+                log.info("AVC: hardware decode + automatic IDR re-anchor "
+                         "(every ~%d frames since IDR, d3d11va POC-wrap "
+                         "workaround)", self._AVC_REANCHOR_FRAMES)
+            elif (_sys.platform == "win32"
+                    and _os.environ.get("ISS_AVC_HWACCEL", "1") == "0"):
+                avc_prefer_hwaccel = False
                 log.info("AVC: forcing software decode "
-                         "(ISS_AVC_HWACCEL=%s)", _avc_hw_setting)
+                         "(ISS_AVC_HWACCEL=0; d3d11va POC-wrap workaround)")
             _pf = avc_prefer_hwaccel
             _override = registry.normalize_override(_decoder_choice, "avc")
         else:

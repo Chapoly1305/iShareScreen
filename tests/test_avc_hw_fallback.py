@@ -4,23 +4,7 @@ from __future__ import annotations
 import types
 
 from isharescreen.proxy.media.avc import AvcDecoder
-from isharescreen.proxy.session import Session, _prefer_avc_hwaccel
-
-
-def test_windows_avc_defaults_to_software():
-    assert _prefer_avc_hwaccel("win32", None) is False
-
-
-def test_windows_avc_hardware_requires_explicit_opt_in():
-    assert _prefer_avc_hwaccel("win32", "1") is True
-    assert _prefer_avc_hwaccel("win32", "true") is True
-    assert _prefer_avc_hwaccel("win32", "0") is False
-
-
-def test_non_windows_avc_retains_hardware_first_default():
-    assert _prefer_avc_hwaccel("darwin", None) is True
-    assert _prefer_avc_hwaccel("linux", None) is True
-    assert _prefer_avc_hwaccel("linux", "off") is False
+from isharescreen.proxy.session import Session
 
 
 def test_explicit_hw_failure_relabels_decoder_as_software():
