@@ -105,7 +105,8 @@ _PASSTHROUGH_LOCAL_DECODE = os.environ.get("ISS_WT_LOCAL_DECODE", "0") == "1"
 
 # Apple's AVC stream uses a 13-bit picture-order counter (wrap at 8192).
 # Leave enough room for a FIR round-trip and fresh intra delivery before
-# rebuilding the affected D3D11VA decoder's DPB.
+# rollover. The preventive path requests the intra without rebuilding D3D11VA;
+# full reset/fallback remains reserved for a confirmed decoder error.
 _AVC_D3D11_REANCHOR_FRAMES = 7000
 
 # Initial-burst re-arm: occasionally TCP negotiation fully succeeds and the
@@ -546,6 +547,11 @@ class Session:
         # Path B). Separate from `_last_decoder_restart_t` so it never
         # blocks the 15 s total-freeze restart (Path A).
         self._last_stuck_tile_fir_t: float = 0.0
+        # Preventive d3d11va AVC keyframe request. This is deliberately only a
+        # wire-level FIR: Apple's recovery picture is a non-IDR intra, so
+        # rebuilding the decoder on it can itself seed persistent artifacts.
+        # The timestamp retries a lost request without firing every tx tick.
+        self._last_avc_reanchor_t: float = 0.0
 
         # Per-tile FIR rate limit, applied at the wire layer in
         # `_send_fir_for_tile` so it coalesces requests from every
@@ -3850,7 +3856,13 @@ class Session:
                 >= self._GRAYOUT_WINDOW_S):
             self._flush_grayout_event()
 
-    def _send_fir_for_tile(self, tile_idx: int, log_per_tile: bool = True) -> bool:
+    def _send_fir_for_tile(
+        self,
+        tile_idx: int,
+        log_per_tile: bool = True,
+        *,
+        record_grayout: bool = True,
+    ) -> bool:
         """Returns True if a FIR was actually emitted (False if rate-
         limited or missing wire state). `log_per_tile=False` suppresses
         the per-tile DEBUG line so the bulk-drain caller can log a
@@ -3886,7 +3898,8 @@ class Session:
             sock.sendto(enc.protect(compound), (self._dest_host, self._ctrl_dest_port))
             if log_per_tile:
                 log.debug("FIR/PLI sent for tile %d (ssrc=0x%08x)", tile_idx, target_ssrc)
-            self._record_grayout_tile(tile_idx, now)
+            if record_grayout:
+                self._record_grayout_tile(tile_idx, now)
             return True
         except OSError as e:
             log.debug("FIR send failed: %s", e)
@@ -3940,11 +3953,11 @@ class Session:
         """Preempt D3D11VA's silent H.264 picture-order-wrap corruption.
 
         This path is intentionally narrow: desktop AVC, active d3d11va
-        hardware decode, and only when the current codec context has consumed
-        enough pictures to approach the stream's 13-bit POC wrap. Apple's
-        ordinary intra pictures do not reliably empty the hardware DPB, so arm
-        the existing reference-reset gate and request a fresh intra. The next
-        intra rebuilds the codec context and seeds an empty DPB.
+        hardware decode, and only when the stream has consumed enough pictures
+        since its last intra to approach the 13-bit POC wrap. Request a fresh
+        intra WITHOUT gating frames or rebuilding the decoder context. Apple's
+        recovery picture is non-IDR; treating it as a clean-DPB seed caused the
+        very persistent artifacts this path is meant to prevent.
         """
         if (not self._connected or self._video_codec != "avc"
                 or self._decoder is None
@@ -3953,26 +3966,27 @@ class Session:
         diag = getattr(self._decoder, "recovery_diagnostics", {})
         if diag.get("reference_reset_pending"):
             return
-        frames = int(diag.get("frames_since_context_reset", 0))
+        frames = int(diag.get("frames_since_keyframe", 0))
         if frames < _AVC_D3D11_REANCHOR_FRAMES:
             return
-        mark_broken = getattr(
-            self._decoder, "mark_reference_chain_broken", None,
-        )
-        if not callable(mark_broken):
+        now = time.monotonic()
+        if now - getattr(self, "_last_avc_reanchor_t", 0.0) < 3.0:
             return
-        trigger = (
-            "preventive d3d11va DPB re-anchor before H.264 POC wrap "
-            f"({frames} frames since context reset)"
+        self._last_avc_reanchor_t = now
+        sent = sum(
+            1 for ti in range(self.num_tiles)
+            if self._send_fir_for_tile(
+                ti, log_per_tile=False, record_grayout=False,
+            )
         )
-        log.warning(
-            "AVC d3d11va re-anchor: %d frames since decoder reset "
-            "(threshold=%d) — requesting fresh intra and clean DPB",
+        log.info(
+            "AVC d3d11va re-anchor: %d frames since intra (threshold=%d) "
+            "— requested fresh intra without decoder reset (%d/%d tiles)",
             frames,
             _AVC_D3D11_REANCHOR_FRAMES,
+            sent,
+            self.num_tiles,
         )
-        mark_broken(trigger)
-        self.request_fir(None)
 
     def _check_stall(self) -> None:
         """Decoder-stall recovery. Two failure modes:

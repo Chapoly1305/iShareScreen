@@ -1,4 +1,4 @@
-"""Preventive D3D11VA DPB resets stay narrow and frame-count driven."""
+"""Preventive D3D11VA re-anchors never rebuild the decoder context."""
 from __future__ import annotations
 
 import types
@@ -14,28 +14,30 @@ def _session(decoder):
     session._connected = True
     session._video_codec = "avc"
     session._decoder = decoder
+    session._observed_tile_count = 1
+    session._last_avc_reanchor_t = 0.0
     return session
 
 
-def test_d3d11va_reanchors_before_picture_order_wrap():
-    marked: list[str] = []
-    firs: list[object] = []
+def test_d3d11va_requests_intra_without_decoder_reset_before_wrap():
+    firs: list[tuple[int, bool, bool]] = []
     decoder = types.SimpleNamespace(
         hw_accel="d3d11va",
         recovery_diagnostics={
-            "frames_since_context_reset": _AVC_D3D11_REANCHOR_FRAMES,
+            "frames_since_keyframe": _AVC_D3D11_REANCHOR_FRAMES,
             "reference_reset_pending": False,
         },
-        mark_reference_chain_broken=marked.append,
     )
     session = _session(decoder)
-    session.request_fir = firs.append
+    session._send_fir_for_tile = (
+        lambda tile, log_per_tile, record_grayout:
+        firs.append((tile, log_per_tile, record_grayout)) or True
+    )
 
     session._maybe_reanchor_d3d11va_avc()
 
-    assert len(marked) == 1
-    assert "POC wrap" in marked[0]
-    assert firs == [None]
+    assert firs == [(0, False, False)]
+    assert decoder.recovery_diagnostics["reference_reset_pending"] is False
 
 
 def test_reanchor_ignores_software_and_pre_threshold_hardware():
@@ -43,36 +45,34 @@ def test_reanchor_ignores_software_and_pre_threshold_hardware():
         (None, _AVC_D3D11_REANCHOR_FRAMES),
         ("d3d11va", _AVC_D3D11_REANCHOR_FRAMES - 1),
     ):
-        marked: list[str] = []
+        firs: list[int] = []
         decoder = types.SimpleNamespace(
             hw_accel=hw_accel,
             recovery_diagnostics={
-                "frames_since_context_reset": frames,
+                "frames_since_keyframe": frames,
                 "reference_reset_pending": False,
             },
-            mark_reference_chain_broken=marked.append,
         )
         session = _session(decoder)
-        session.request_fir = lambda _tile: None
+        session._send_fir_for_tile = lambda tile, **_kwargs: firs.append(tile)
 
         session._maybe_reanchor_d3d11va_avc()
 
-        assert marked == []
+        assert firs == []
 
 
-def test_reanchor_does_not_duplicate_an_inflight_reset():
-    marked: list[str] = []
+def test_reanchor_does_not_fire_during_an_inflight_reset():
+    firs: list[int] = []
     decoder = types.SimpleNamespace(
         hw_accel="d3d11va",
         recovery_diagnostics={
-            "frames_since_context_reset": _AVC_D3D11_REANCHOR_FRAMES + 50,
+            "frames_since_keyframe": _AVC_D3D11_REANCHOR_FRAMES + 50,
             "reference_reset_pending": True,
         },
-        mark_reference_chain_broken=marked.append,
     )
     session = _session(decoder)
-    session.request_fir = lambda _tile: None
+    session._send_fir_for_tile = lambda tile, **_kwargs: firs.append(tile)
 
     session._maybe_reanchor_d3d11va_avc()
 
-    assert marked == []
+    assert firs == []
