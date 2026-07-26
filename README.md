@@ -33,7 +33,15 @@ available.
    pip install git+https://github.com/renegadelink/iShareScreen.git
    ```
 
-3. (Optional, only if you want audio) install **libfdk-aac** — Apple's
+3. H.264/AVC sessions use software decoding by default on Windows because
+   some D3D11VA drivers silently corrupt long-running reference chains.
+   Hardware decoding remains available as an explicit opt-in:
+   ```powershell
+   $env:ISS_AVC_HWACCEL = "1"
+   iss
+   ```
+
+4. (Optional, only if you want audio) install **libfdk-aac** — Apple's
    PT=101 audio uses AAC-ELD-SBR, which Windows Media Foundation can't
    decode. The cleanest source is [MSYS2](https://www.msys2.org):
    ```sh
