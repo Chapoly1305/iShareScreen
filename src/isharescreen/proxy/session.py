@@ -166,6 +166,13 @@ _SSRC_ADOPT_STALL_S = 2.0
 # pending-groups dict growing unbounded on lossy links.
 _PENDING_GROUP_TTL_S = 0.2
 
+# AVC only: once a later packet exposes an RTP sequence gap, retain that access
+# unit (and later units behind it) briefly while an immediate NACK asks Apple
+# for the missing packet. LAN retransmits normally arrive within a few
+# milliseconds; 75 ms gives generous headroom without adding latency to
+# healthy frames, which still flush immediately.
+_AVC_RTP_REPAIR_WAIT_S = 0.075
+
 # How long a completed (marker-flushed) (SSRC, ts) key stays in the dedup
 # set so we drop late retransmits of already-processed packets without
 # re-feeding duplicate NALUs into the decoder. 2 s is comfortably wider
@@ -451,6 +458,12 @@ class Session:
         self._pending_groups: dict[tuple[int, int], list[_PktTuple]] = {}
         self._group_arrival: dict[tuple[int, int], float] = {}
         self._recently_flushed: dict[tuple[int, int], float] = {}
+        self._group_repair_deadline: dict[tuple[int, int], float] = {}
+        # Marker sequence of the last consumed AU per SSRC. This catches a
+        # packet missing at the *start* of the next AU, which an internal-only
+        # gap check cannot see.
+        self._last_group_marker_seq: dict[int, int] = {}
+        self._last_group_evict_t: float = 0.0
 
         # Per-SSRC sequence tracking for NACK detection + receiver reports.
         self._max_seq: dict[int, int] = {}
@@ -480,6 +493,9 @@ class Session:
 
         # Threads + lifecycle.
         self._stop_evt = threading.Event()
+        # Sequence-gap detection wakes the TX loop so NACK is sent promptly
+        # instead of waiting for the next 500 ms heartbeat tick.
+        self._tx_wakeup = threading.Event()
         self._threads: list[threading.Thread] = []
         self._fresh_evt = threading.Event()
         self._connected = False
@@ -1258,6 +1274,7 @@ class Session:
 
         # 10) Spawn rx + tx threads.
         self._stop_evt.clear()
+        self._tx_wakeup.clear()
         self._fresh_evt.clear()
         self._last_publish_t = time.monotonic()
         self._spawn_threads()
@@ -1566,6 +1583,7 @@ class Session:
             self._control = None
 
         self._stop_evt.set()
+        self._tx_wakeup.set()
         for t in self._threads:
             if t.is_alive() and t is not threading.current_thread():
                 t.join(timeout=2.0)
@@ -1627,6 +1645,9 @@ class Session:
         self._pending_groups = {}
         self._group_arrival = {}
         self._recently_flushed = {}
+        self._group_repair_deadline = {}
+        self._last_group_marker_seq = {}
+        self._last_group_evict_t = 0.0
         self._max_seq = {}
         self._roc = {}
         self._nack_pending = defaultdict(set)
@@ -2314,41 +2335,189 @@ class Session:
 
             self._track_seq(ssrc, seq)
             self._note_unknown_ssrc(ssrc)
+            self._queue_video_group_packet(ssrc, ts, seq, marker, payload)
 
-            key = (ssrc, ts)
-            if key in self._recently_flushed:
-                continue
-            grp = self._pending_groups.get(key)
-            if grp is None:
-                grp = []
-                self._pending_groups[key] = grp
-                self._group_arrival[key] = time.monotonic()
+            # Expire repair/no-marker holes even while the queue stays busy.
+            # Previously eviction ran only on queue.Empty, which may never
+            # happen during an active 60 fps stream.
+            now = time.monotonic()
+            if now - self._last_group_evict_t >= 0.020:
+                self._last_group_evict_t = now
+                self._evict_stale_groups()
+
+    @staticmethod
+    def _sorted_group_packets(grp: list[_PktTuple]) -> list[_PktTuple]:
+        """Sequence-order one timestamp group, including 65535→0 wrap."""
+        packets = sorted(grp, key=lambda x: x[0])
+        if len(packets) < 2 or packets[-1][0] - packets[0][0] <= 0x8000:
+            return packets
+
+        # Start immediately after the largest circular gap. This remains
+        # correct when several packets precede wrap (e.g. 65534,65535,0,1);
+        # choosing either min or max as the anchor misorders one of those
+        # perfectly ordinary cases.
+        gaps = [
+            ((packets[(i + 1) % len(packets)][0] - packet[0]) & 0xFFFF, i)
+            for i, packet in enumerate(packets)
+        ]
+        _, gap_idx = max(gaps)
+        start = (gap_idx + 1) % len(packets)
+        return packets[start:] + packets[:start]
+
+    def _group_complete(self, key: tuple[int, int], grp: list[_PktTuple]) -> bool:
+        """True when marker boundaries and the AU's sequence range are intact."""
+        if not grp or not any(p[1] for p in grp):
+            return False
+        packets = self._sorted_group_packets(grp)
+        # The marker must terminate the circularly ordered access unit.
+        if not packets[-1][1]:
+            return False
+        if any(
+            ((packets[i + 1][0] - packets[i][0]) & 0xFFFF) > 1
+            for i in range(len(packets) - 1)
+        ):
+            return False
+
+        # Internal contiguity alone misses loss immediately before the first
+        # packet of this AU. Compare it with the last AU marker once an anchor
+        # is available. The first observed AU is intentionally self-anchoring.
+        previous_marker = getattr(self, "_last_group_marker_seq", {}).get(key[0])
+        return (
+            previous_marker is None
+            or packets[0][0] == ((previous_marker + 1) & 0xFFFF)
+        )
+
+    def _ordered_group_keys(self, ssrc: int) -> list[tuple[int, int]]:
+        """Order pending AUs from the last consumed RTP marker.
+
+        Arrival time alone is insufficient because a NACK retransmission for a
+        wholly missing AU naturally arrives after the later AU that exposed
+        the gap. Sequence distance restores the actual decode order.
+        """
+        keys = [key for key in self._pending_groups if key[0] == ssrc]
+        previous_marker = self._last_group_marker_seq.get(ssrc)
+        if previous_marker is None:
+            return sorted(
+                keys,
+                key=lambda key: self._group_arrival.get(key, float("inf")),
+            )
+        expected = (previous_marker + 1) & 0xFFFF
+
+        def order_key(key: tuple[int, int]) -> tuple[float, float]:
+            grp = self._pending_groups.get(key, [])
+            if not grp:
+                return (float("inf"), self._group_arrival.get(key, float("inf")))
+            first_seq = self._sorted_group_packets(grp)[0][0]
+            return (
+                float((first_seq - expected) & 0xFFFF),
+                self._group_arrival.get(key, float("inf")),
+            )
+
+        return sorted(keys, key=order_key)
+
+    def _queue_video_group_packet(
+        self,
+        ssrc: int,
+        ts: int,
+        seq: int,
+        marker: bool,
+        payload: bytes,
+    ) -> None:
+        """Accumulate one RTP payload and flush it in decode order.
+
+        Healthy groups still flush immediately at marker. An AVC group whose
+        marker exposes a sequence hole is retained for a short NACK repair
+        window, and later timestamp groups for that SSRC wait behind it so the
+        decoder never receives future P pictures before the repaired reference.
+        """
+        key = (ssrc, ts)
+        if key in self._recently_flushed:
+            return
+        grp = self._pending_groups.get(key)
+        if grp is None:
+            grp = []
+            self._pending_groups[key] = grp
+            self._group_arrival[key] = time.monotonic()
+        # Retransmits can duplicate a packet already received. Keep one copy so
+        # duplicate sequence numbers cannot confuse gap detection/reassembly.
+        if not any(p[0] == seq for p in grp):
             grp.append((seq, marker, payload))
 
-            if marker:
-                self._flush_group(key)
+        if not any(p[1] for p in grp):
+            return
+        if self._video_codec != "avc":
+            self._flush_group(key)
+            return
+
+        now = time.monotonic()
+        ordered_keys = self._ordered_group_keys(ssrc)
+        preceding_keys = ordered_keys[:ordered_keys.index(key)]
+        # If a newer timestamp appears while an older AU still lacks its
+        # marker, the skipped RTP packet may be that older AU's tail. Give it
+        # the same short repair window and keep the newer AU behind it.
+        for other_key in preceding_keys:
+            other_grp = self._pending_groups.get(other_key, [])
+            if not any(p[1] for p in other_grp):
+                self._group_repair_deadline.setdefault(
+                    other_key, now + _AVC_RTP_REPAIR_WAIT_S,
+                )
+
+        earlier_block = any(k in self._group_repair_deadline for k in preceding_keys)
+        if earlier_block:
+            return
+
+        if not self._group_complete(key, grp):
+            self._group_repair_deadline.setdefault(
+                key, now + _AVC_RTP_REPAIR_WAIT_S,
+            )
+            return
+
+        self._group_repair_deadline.pop(key, None)
+        self._flush_group(key)
+        self._flush_ready_groups(ssrc)
+
+    def _flush_ready_groups(self, ssrc: int) -> None:
+        """Drain complete buffered groups for one SSRC in decode order."""
+        while True:
+            keys = self._ordered_group_keys(ssrc)
+            if not keys:
+                return
+            key = keys[0]
+            grp = self._pending_groups.get(key, [])
+            if not self._group_complete(key, grp):
+                self._group_repair_deadline.setdefault(
+                    key, time.monotonic() + _AVC_RTP_REPAIR_WAIT_S,
+                )
+                return
+            # A predecessor may have been repaired or intentionally dropped,
+            # making this group complete under the newly advanced boundary.
+            self._group_repair_deadline.pop(key, None)
+            self._flush_group(key)
 
     def _flush_group(self, key: tuple[int, int]) -> None:
         if self._decoder is None:
             return
         grp = self._pending_groups.pop(key, None)
         self._group_arrival.pop(key, None)
+        repair_deadlines = getattr(self, "_group_repair_deadline", None)
+        if repair_deadlines is not None:
+            repair_deadlines.pop(key, None)
         if grp is None:
             return
         self._recently_flushed[key] = time.monotonic()
         ssrc, _ts = key
+        packets = self._sorted_group_packets(grp)
+        marker_seqs = [seq for seq, marker, _payload in packets if marker]
+        if marker_seqs:
+            marker_map = getattr(self, "_last_group_marker_seq", None)
+            if marker_map is None:
+                marker_map = self._last_group_marker_seq = {}
+            marker_map[ssrc] = marker_seqs[-1]
         ti = self._ssrc_to_tile.get(ssrc)
         if ti is None:
             return  # SSRC not part of the subscribed tier
 
         # Sort by seq, wraparound-aware.
-        seqs = [s for s, _, _ in grp]
-        if seqs and max(seqs) - min(seqs) > 0x8000:
-            base = min(seqs)
-            packets = sorted(grp, key=lambda x: (x[0] - base) & 0xFFFF)
-        else:
-            packets = sorted(grp, key=lambda x: x[0])
-
         ordered = [p for _, _, p in packets]
         self._tile_bytes[ti] = self._tile_bytes.get(ti, 0) + sum(len(p) for p in ordered)
 
@@ -2535,19 +2704,74 @@ class Session:
             self._needs_param_harvest = False
             self.request_fir()
 
+    def _drop_incomplete_group(
+        self,
+        key: tuple[int, int],
+        *,
+        reason: str,
+        now: float,
+    ) -> Optional[int]:
+        """Drop one unrepaired AU and arm clean-reference recovery."""
+        grp = self._pending_groups.pop(key, None)
+        started = self._group_arrival.pop(key, now)
+        self._group_repair_deadline.pop(key, None)
+        self._recently_flushed[key] = now
+        if grp is None:
+            return None
+        ssrc, _ts = key
+        packets = self._sorted_group_packets(grp)
+        marker_seqs = [seq for seq, marker, _payload in packets if marker]
+        if marker_seqs:
+            # The damaged AU is intentionally consumed as a hole. Anchor the
+            # following AU at its known boundary so buffered clean groups can
+            # drain while the decoder waits for a fresh intra frame.
+            self._last_group_marker_seq[ssrc] = marker_seqs[-1]
+        else:
+            # With no marker, the lost boundary is unknowable; let the next
+            # internally complete AU establish a new transport anchor.
+            self._last_group_marker_seq.pop(ssrc, None)
+        ti = self._ssrc_to_tile.get(ssrc)
+        if self._video_codec == "avc" and ti is not None and self._decoder is not None:
+            trigger = (
+                f"RTP access unit incomplete after repair window ({reason}; "
+                f"packets={len(grp)} age={(now - started) * 1000:.1f}ms)"
+            )
+            log.warning("%s — dropping frame and requesting fresh intra", trigger)
+            mark_broken = getattr(
+                self._decoder, "mark_reference_chain_broken", None,
+            )
+            if callable(mark_broken):
+                mark_broken(trigger)
+            try:
+                self._decoder._gate.mark_decode_error(ti)
+            except Exception:
+                pass
+            wake = getattr(self, "_tx_wakeup", None)
+            if wake is not None:
+                wake.set()
+        return ssrc
+
     def _evict_stale_groups(self) -> None:
-        """Drop incomplete groups whose marker never arrived, and expire
-        old entries from the late-arrival dedup set. Both bounds are
-        proportional to expected RTP timing, so the dicts stay small."""
+        """Expire unrepaired/no-marker groups and late-arrival dedup state."""
         now = time.monotonic()
-        if self._pending_groups:
-            for k in [
-                k for k, t in self._group_arrival.items()
-                if now - t > _PENDING_GROUP_TTL_S
-            ]:
-                self._pending_groups.pop(k, None)
-                self._group_arrival.pop(k, None)
-                self._recently_flushed[k] = now
+        unblocked_ssrcs: set[int] = set()
+        for key, deadline in list(self._group_repair_deadline.items()):
+            if now >= deadline:
+                ssrc = self._drop_incomplete_group(
+                    key, reason="NACK/reorder timeout", now=now,
+                )
+                if ssrc is not None:
+                    unblocked_ssrcs.add(ssrc)
+        for key, started in list(self._group_arrival.items()):
+            if (key not in self._group_repair_deadline
+                    and now - started > _PENDING_GROUP_TTL_S):
+                ssrc = self._drop_incomplete_group(
+                    key, reason="RTP marker timeout", now=now,
+                )
+                if ssrc is not None:
+                    unblocked_ssrcs.add(ssrc)
+        for ssrc in unblocked_ssrcs:
+            self._flush_ready_groups(ssrc)
         if self._recently_flushed:
             for k in [
                 k for k, t in self._recently_flushed.items()
@@ -2570,15 +2794,18 @@ class Session:
             self._roc[ssrc] = 0
             return
         diff = (seq - prev) & 0xFFFF
-        if diff == 0 or diff > 0x8000:
-            return  # duplicate or reorder
+        if diff == 0:
+            return  # duplicate
+        if diff > 0x8000:
+            # Late/reordered retransmit. If its NACK has not been drained yet,
+            # cancel that request; the group repair path will decide whether
+            # the access unit is now complete.
+            self._nack_pending[ssrc].discard(seq)
+            return
         # Forward jump → record any skipped seqs as NACK candidates.
-        # Transport-layer error signal: when we observe a sequence-
-        # number gap, we KNOW packets are missing and the next P/B
-        # slice for that tile will reference data we may not have.
-        # Mark the tile's decoder state suspect so a FIR will fire
-        # if NACK retransmits don't recover in time — the transport
-        # detects loss before the decoder ever sees the bad slice.
+        # Do not mark the decoder broken yet: this may be ordinary UDP reorder,
+        # and the short group repair window gives NACK a chance to fill it.
+        # Only `_drop_incomplete_group` escalates after that window expires.
         tile_idx = self._ssrc_to_tile.get(ssrc)
         had_loss = False
         for missed in range(1, min(diff, 32)):
@@ -2588,11 +2815,10 @@ class Session:
             had_loss = True
             if tile_idx is not None and tile_idx < len(self._lost_pkts_per_tile):
                 self._lost_pkts_per_tile[tile_idx] += 1
-        if had_loss and tile_idx is not None and self._decoder is not None:
-            try:
-                self._decoder._gate.mark_decode_error(tile_idx)
-            except Exception:
-                pass
+        if had_loss:
+            wake = getattr(self, "_tx_wakeup", None)
+            if wake is not None:
+                wake.set()
         if seq < prev:
             self._roc[ssrc] += 1
         self._max_seq[ssrc] = seq
@@ -3449,6 +3675,10 @@ class Session:
 
     def _tx_loop(self) -> None:
         while not self._stop_evt.is_set():
+            # Clear before processing so a wake raised during this tick remains
+            # set for the wait below; clearing after wait can lose that race
+            # and postpone a NACK by another 500 ms.
+            self._tx_wakeup.clear()
             self._tx_tick += 1
             try:
                 self._send_heartbeat()
@@ -3456,8 +3686,10 @@ class Session:
                 if self._needs_post_layout_fir:
                     self._needs_post_layout_fir = False
                     self.request_fir()
-                self._drain_pending_fir()
+                # NACK first: a promptly repaired packet avoids the FIR/context
+                # recovery path entirely.
                 self._drain_pending_nack()
+                self._drain_pending_fir()
                 self._maybe_reanchor_d3d11va_avc()
                 self._check_stall()
                 self._maybe_poll_cursor()
@@ -3465,7 +3697,7 @@ class Session:
                     self._log_profile_snapshot()
             except Exception as e:
                 log.debug("tx loop tick error: %s", e)
-            self._stop_evt.wait(_TX_INTERVAL_S)
+            self._tx_wakeup.wait(_TX_INTERVAL_S)
 
     def _audio_rtcp_rates(self, elapsed: float) -> dict:
         """Split the rtcp-muxed 'ctrl' socket into its real components: the
