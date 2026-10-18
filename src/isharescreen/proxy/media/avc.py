@@ -147,13 +147,14 @@ def _patch_avc_sps_dpb(sps: bytes) -> bytes:
 _H264_HWACCELS: dict[str, tuple[str, ...]] = {
     "darwin": ("videotoolbox",),
     "win32": ("d3d11va", "dxva2"),
-    "linux": ("vaapi",),
+    "linux": ("vaapi", "cuda"),
     "*": (),
 }
 
 
 def _h264_hwaccels() -> tuple[str, ...]:
-    return _H264_HWACCELS.get(sys.platform, _H264_HWACCELS["*"])
+    from .decode_common import available_hwaccels
+    return available_hwaccels(_H264_HWACCELS.get(sys.platform, _H264_HWACCELS["*"]))
 
 
 def _vt_accepts_h264(sps: bytes, pps: bytes) -> bool:
