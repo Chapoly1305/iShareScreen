@@ -101,6 +101,26 @@ the control path and bounded advancing playback.
 
 ## Other tools and interpretation
 
+### Parallel continuation of a preserved run
+
+`resume_parallel` can finish one remaining model with isolated clip workers. Stop
+the original producer and its LPIPS companion explicitly before using it; it
+refuses live original processes and never overwrites their results. The recorded
+inference script, adapter, environment and model identities must remain unchanged.
+
+```sh
+.venv/bin/python -m benchmarks.super_resolution.resume_parallel \
+  --run /path/to/stopped-producer --manifest /path/to/original-manifest.json \
+  --cache /path/to/stopped-perceptual --output /path/to/fresh-campaign --workers 3
+```
+
+Only unpublished clips are reconstructed. Completed files are hash-checked and
+hard-linked into a fresh audited assembly on the same filesystem. LPIPS then runs
+in disjoint clip groups, with explicit derived-cache provenance and mandatory
+RGB-hash checks before reusing scores. The originals remain immutable. Each child
+has a hard deadline; failures are preserved without automatic retry. Set GPU
+visibility explicitly and check available host resources before increasing workers.
+
 `prepare`, `benchmark` and `report` provide a separate still-frame protocol;
 `compare_precision` compares matched FP32/AMP runs; `verify_native` checks official
 preprocessing/quantization; `verify_video_repeat` checks separate repeated runs.
