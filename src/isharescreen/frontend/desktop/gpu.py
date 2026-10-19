@@ -195,6 +195,16 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 """
 
 
+WGSL_RGB = WGSL[:WGSL.index("@group(0) @binding(0) var y_tex")] + """
+@group(0) @binding(0) var rgb_tex: texture_2d<f32>;
+@group(0) @binding(3) var samp: sampler;
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4<f32> {
+    return textureSample(rgb_tex, samp, in.uv * U.uv_scale + U.uv_offset);
+}
+"""
+
+
 class Renderer:
     """Build once, call `upload_tile` per fresh tile, then `draw`."""
 
@@ -205,6 +215,9 @@ class Renderer:
         self._device = device
         self._w = canvas_w
         self._h = canvas_h
+        self._enhanced = False
+        self._rgb_tex = None
+        self._rgb_pipeline = None
 
         # Real decoded-content extent within the canvas textures, grown as
         # tiles upload. 0 until the first tile lands (content_dims then
@@ -545,6 +558,39 @@ class Renderer:
             (cw, chroma_rows, 1),
         )
 
+    def clear_enhancement(self) -> None:
+        self._enhanced = False
+
+    def upload_enhanced(self, rgb: np.ndarray) -> None:
+        """Upload a complete ×2 RGB canvas; source/cursor coordinates stay native."""
+        if rgb.dtype != np.uint8 or rgb.shape != (self._h*2, self._w*2, 3):
+            raise ValueError("Enhanced output does not match the current ×2 canvas")
+        device = self._device
+        if self._rgb_pipeline is None:
+            shader = device.create_shader_module(code=WGSL_RGB)
+            layout = device.create_bind_group_layout(entries=[
+                {"binding":0, **self._tex_entry},
+                {"binding":3, "visibility":wgpu.ShaderStage.FRAGMENT, "sampler":{}},
+                {"binding":4, **self._uniform_entry},
+            ])
+            self._rgb_pipeline = device.create_render_pipeline(
+                layout=device.create_pipeline_layout(bind_group_layouts=[layout]),
+                vertex={"module":shader, "entry_point":"vs"},
+                fragment={"module":shader, "entry_point":"fs", "targets":[{"format":self._surface_format}]},
+                primitive={"topology":wgpu.PrimitiveTopology.triangle_list})
+            self._rgb_tex = device.create_texture(
+                size=(self._w*2,self._h*2,1), format="rgba8unorm",
+                usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
+            self._rgb_bind = device.create_bind_group(layout=layout, entries=[
+                {"binding":0,"resource":self._rgb_tex.create_view()},
+                {"binding":3,"resource":self._sampler},
+                {"binding":4,"resource":self._uniform_resource}])
+        rgba = np.empty((self._h*2,self._w*2,4),np.uint8)
+        rgba[...,:3] = rgb; rgba[...,3] = 255
+        device.queue.write_texture({"texture":self._rgb_tex}, rgba,
+                                   {"bytes_per_row":self._w*2*4}, (self._w*2,self._h*2,1))
+        self._enhanced = True
+
     def content_dims(self) -> tuple[int, int]:
         """Real decoded-frame size in canvas-texel units. Equals the full
         canvas once the encoder fills it; smaller (content pinned to the
@@ -701,7 +747,10 @@ class Renderer:
             "store_op": wgpu.StoreOp.store,
             "clear_value": (0, 0, 0, 1),
         }])
-        if self._mode == "biplanar":
+        if self._enhanced:
+            rpass.set_pipeline(self._rgb_pipeline)
+            rpass.set_bind_group(0, self._rgb_bind)
+        elif self._mode == "biplanar":
             rpass.set_pipeline(self._pipeline_biplanar)
             rpass.set_bind_group(0, self._bind_biplanar)
         else:

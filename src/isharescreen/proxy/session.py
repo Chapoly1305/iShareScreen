@@ -397,6 +397,9 @@ class Session:
         self._dest_host: str = self._config.host
         # Optional control server (TUI subscribers); see `control.py`.
         self._control: Optional[ControlServer] = None
+        # Optional desktop-owned asynchronous enhancement backend. Commands only
+        # change its bounded request slot; inference never runs on this thread.
+        self._enhancement_backend = None
         # Optional packet capture; see `util/pcap_recorder.py`. Created on
         # connect when cfg.record_pcap is set, finalised on teardown.
         # `_record_cycle` counts connect() cycles so a reconnect writes a
@@ -1482,6 +1485,16 @@ class Session:
         if action == "set":
             key = cmd.get("key")
             value = cmd.get("value")
+            if key == "enhancement":
+                backend = self._enhancement_backend
+                if backend is None:
+                    log.warning("enhancement requires an active native desktop frontend")
+                    return
+                try:
+                    backend.select(value)
+                except (ValueError, TypeError):
+                    log.warning("rejected enhancement model %r", value)
+                return
             # Audio toggle: unhook (or rehook) the sink callback. The
             # network audio still arrives; we just stop feeding it to
             # PortAudio. Cheap, reversible.
@@ -3931,12 +3944,15 @@ class Session:
         # any subscribed TUI / monitor clients. The shape is documented in
         # control.py.
         if self._control is not None:
+            enhancement_backend = self._enhancement_backend
             self._control.publish_snapshot({
                 "uptime_s": (
                     time.time() - self._connect_wall_ts
                     if self._connect_wall_ts > 0 else 0.0
                 ),
                 "decoder": decoder_name,
+                "enhancement": (enhancement_backend.snapshot()
+                                if enhancement_backend is not None else None),
                 "tiles": [
                     {"frames": g, "fps": r, "loss_s": l}
                     for g, r, l in zip(good, rates, loss_delta)

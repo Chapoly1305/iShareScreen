@@ -24,6 +24,7 @@ from ...proxy.session import Session, SessionConfig
 from .audio_sink import make_audio_sink
 from .gpu import Renderer
 from .keymap import GLFW_KEY_TO_X11, glfw_button_to_rfb_bit
+from ...enhancement.live import EnhancementDisplay, EnhancementWorker
 
 
 # X11 keysyms for the Cmd-equivalent (Super_L / Super_R). When Ctrl→Cmd
@@ -430,6 +431,9 @@ def run(
     )
 
     renderer = Renderer(device, surface_format, canvas_w, canvas_h)
+    enhancement = EnhancementWorker(device=os.environ.get("ISS_SR_DEVICE", "auto"))
+    session._enhancement_backend = enhancement
+    sr_display = EnhancementDisplay(enhancement, renderer, canvas_w, canvas_h, num_tiles)
 
     def _cursor_user_mult() -> float:
         """Manual ISS_CURSOR_SCALE multiplier (default 1.0)."""
@@ -1203,6 +1207,7 @@ def run(
         slot_h_resolved = False
         first_seen = [False] * num_tiles
         renderer = Renderer(device, surface_format, canvas_w, canvas_h)
+        sr_display.reconfigure(renderer, canvas_w, canvas_h, num_tiles)
         # In the default single-monitor/auto mode, a layout gap may first
         # appear on a later dynamic resize rather than in the initial layout.
         # Arm the corrective crop then too. `_mw_views` is non-empty once a
@@ -1400,7 +1405,13 @@ def run(
                 slot_h = tf.height
                 slot_h_resolved = True
             renderer.upload_tile(ti, tf, slot_h)
+            sr_display.update_tile(ti, tf, slot_h)
             any_fresh = True
+
+        # Model switching also repaints static screens. Retain just one pending
+        # canvas while inference runs; stale work from prior selections/resizes
+        # is rejected by the worker's generation counter.
+        sr_changed = sr_display.step()
 
         # Present after a fresh upload, OR when the overlay cursor moved or
         # changed shape — otherwise a pointer that moves/reshapes over a
@@ -1409,7 +1420,7 @@ def run(
         cursor_moved = _canvas_cursor and cursor != _last_drawn_cursor
         _sec_moved = _canvas_cursor and any(
             sv.cursor != sv.last_drawn for sv in secondaries)
-        if ((any_fresh or cursor_moved or _sec_moved or _cursor_dirty["v"])
+        if ((any_fresh or sr_changed or cursor_moved or _sec_moved or _cursor_dirty["v"])
                 and any(first_seen)):
             if display_all:
                 # Draw each window with its own crop. Every draw callback
@@ -1426,6 +1437,8 @@ def run(
             _cursor_dirty["v"] = False
 
     log.info("desktop frontend closing")
+    session._enhancement_backend = None
+    enhancement.close()
     for sv in secondaries:
         try:
             sv.window.close()

@@ -476,6 +476,14 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
   <a id="videobtn" class="btn primary" style="display:none;text-decoration:none" target="_blank" rel="noopener" title="Open the live video stream in a new tab — in this same browser.">▶ Open video</a>
   <a class="new" href="/new">+ new connection</a></div>
  <div class="cards">
+  <div class="card" id="enhancement-card" hidden>
+   <h3>Video enhancement</h3>
+   <label for="enhancement-model">Display model</label>
+   <select id="enhancement-model" aria-label="Video enhancement model"
+     style="width:100%;margin:8px 0;padding:8px;background:#141518;color:#dfe1e4;border:1px solid #3a3d42;border-radius:6px"
+     onchange="setEnhancement(this.value)"></select>
+   <div id="enhancement-status" style="font-size:13px;color:#9aa0a6" role="status"></div>
+  </div>
   <div class="card"><h3 title="What's being streamed and how it's decoded.">Stream</h3>
    <div class="kv" data-tip="Session lifecycle: connecting → running → ended. Stuck on 'connecting' → check the host address / username / password, or a firewall blocking TCP 5900. 'ended' unexpectedly → see the log below.">
      <span>Status</span><b id="s_status">—</b></div>
@@ -539,6 +547,34 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
             `<div class="bar"><i style="width:${Math.min(100,fps/maxf*100)}%"></i></div></div>`;
    }).join('');
  }
+ let enhancementOptions = '';
+ async function setEnhancement(model) {
+   set('enhancement-status', 'Switching…');
+   try {
+     const response = await fetch('/action', {method:'POST',
+       body:new URLSearchParams({action:'enhancement', model})});
+     if (!response.ok) throw new Error(await response.text());
+   } catch (error) { set('enhancement-status', 'Switch failed: '+error.message); }
+ }
+ function enhancementState(state) {
+   const card=$('enhancement-card'); card.hidden=!state;
+   if (!state) return;
+   const menu=$('enhancement-model'), signature=JSON.stringify(state.options||[]);
+   if(signature!==enhancementOptions){
+     menu.replaceChildren();
+     for(const model of state.options||[]){
+       const option=document.createElement('option'); option.value=model.id;
+       option.textContent=model.label+(model.available?'':' (unavailable)');
+       option.disabled=!model.available; option.title=model.reason||'';
+       menu.appendChild(option);
+     }
+     enhancementOptions=signature;
+   }
+   menu.value=state.selected||'off';
+   const processing=state.p50_ms==null?'':` · ${state.p50_ms.toFixed(1)} ms processing`;
+   const dropped=state.dropped?` · ${state.dropped} superseded frames`:'';
+   set('enhancement-status', state.error||(`${state.state} · displaying ${state.displayed||'off'}`+processing+dropped));
+ }
  const es = new EventSource('/events');
  es.addEventListener('status', e => { const s=JSON.parse(e.data);
    $('dot').className='dot '+(s.status||'idle'); set('s_status', s.status);
@@ -560,6 +596,7 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
    set('q_vid', qf(uq.video)); set('q_ctrl', qf(uq.ctrl));
    set('q_dec', qf(d.decode_q));
    set('q_lat', d.decode_latency_ms!=null?d.decode_latency_ms+' ms':'—');
+   enhancementState(d.enhancement);
    tiles(d.tiles); });
  const logEl=$('log');
  es.addEventListener('log', e => { const line=JSON.parse(e.data);
@@ -722,6 +759,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             action = values.get("action")
             if action == "fir":
                 _send_command({"action": "fir"})
+            elif action == "enhancement":
+                model = values.get("model", "off")
+                with _LOCK:
+                    state = _LATEST.get("enhancement") or {}
+                if not any(item.get("id") == model and item.get("available")
+                           for item in state.get("options", [])):
+                    self._html(b"model is unavailable in this session", 400)
+                    return
+                if not _send_command({"action":"set", "key":"enhancement", "value":model}):
+                    self._html(b"session control is disconnected", 503)
+                    return
             elif action == "reconnect":
                 threading.Thread(target=_reconnect, daemon=True).start()
             elif action == "session_choice":
