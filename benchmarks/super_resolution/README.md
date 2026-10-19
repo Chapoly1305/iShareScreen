@@ -3,6 +3,9 @@
 These optional source-checkout tools compare paired reference recordings with
 low-resolution HEVC streams reconstructed by the production enhancement adapter.
 They are not included in the viewer wheel. See [runtime setup and architecture](../../docs/video-enhancement.md).
+The [evaluation protocol](EVALUATION.md) defines controls and acceptance gates.
+The [measured results](RESULTS.md) separate complete-video quality, still-image
+precision/timing and the limits of the current validation.
 
 ## Environment
 
@@ -19,6 +22,12 @@ python3 -m venv .venv
 PyTorch CUDA build first on NVIDIA hosts. FFmpeg/ffprobe with libx264rgb and libx265
 is required for video preparation and viewing copies. Select a free GPU explicitly;
 these tools do not schedule remote jobs or manage other users' processes.
+
+`requirements-macos-arm64.lock.txt` (Python 3.11/MPS) and
+`requirements-linux-cuda124.lock.txt` (Python 3.10/CUDA 12.4) preserve the measured
+environments. Install a snapshot from this directory; for the CUDA snapshot also
+pass `--extra-index-url https://download.pytorch.org/whl/cu124`. They are separate
+platform snapshots, not a single cross-platform lock.
 
 ## Complete video workflow
 
