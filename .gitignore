@@ -19,3 +19,10 @@ tools/*
 
 # Local agent / editor session scratch
 .claude/
+
+# Reproducible benchmark inputs, weights and generated outputs
+benchmarks/super_resolution/vendor/
+benchmarks/super_resolution/checkpoints/
+benchmarks/super_resolution/artifacts/
+benchmarks/super_resolution/.venv*/
+debug-captures/

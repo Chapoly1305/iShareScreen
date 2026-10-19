@@ -116,6 +116,18 @@ For CI / scripted use:
 echo "$PASSWORD" | iss --headless --host mac.local -u me --password-stdin --auto-quit-secs 30
 ```
 
+## Optional video enhancement
+
+The native desktop viewer can apply pretrained ×2 upscaling after decoding.
+After connecting, use **Video enhancement → Display model** in Diagnostics to
+select an installed model or return to **Original (native scaling)**.
+Enhancement dependencies and model downloads are optional; browser playback and
+the ordinary viewer installation are unchanged.
+
+See [setup and runtime architecture](docs/video-enhancement.md) and the
+[recorded-video evaluation tools](benchmarks/super_resolution/README.md).
+Evaluation uses paired PSNR, SSIM and LPIPS; offline timings are not client FPS.
+
 ## License
 
 AGPL-3.0-or-later. See [LICENSE](LICENSE).

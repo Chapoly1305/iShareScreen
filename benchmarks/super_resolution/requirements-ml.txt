@@ -1,0 +1,12 @@
+# Canonical super-resolution inference/evaluation dependencies, shared by both entry points.
+torch==2.6.0
+torchvision==0.21.0
+numpy==1.26.4
+opencv-python-headless==4.11.0.86
+scikit-image==0.25.2
+scipy==1.15.3
+Pillow==11.2.1
+matplotlib==3.10.3
+einops==0.8.1
+lpips==0.1.4
+tqdm==4.67.1

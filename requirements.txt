@@ -1,0 +1,4 @@
+# Optional video enhancement development environment. Run from the repository root.
+# Python 3.10/3.11; install the desired CUDA torch build first on NVIDIA hosts.
+-e .[test]
+-r benchmarks/super_resolution/requirements-ml.txt
