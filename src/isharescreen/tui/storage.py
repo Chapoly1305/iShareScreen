@@ -3,8 +3,7 @@
 Just one file today: `~/.iss/last.json` (or the platform-equivalent),
 holding the most recently submitted connect form (sans password). On
 launch the browser connect GUI prefills its form from it. Passwords are
-deliberately NOT persisted — getting that wrong becomes a security
-incident; the convenience win is not worth the risk.
+never written here; optional password storage uses the OS credential store.
 """
 from __future__ import annotations
 
@@ -41,6 +40,12 @@ class ConnectFormValues:
     dynamic_resolution: bool = False
     hidpi: str = "auto"
     decoder: str = "auto"  # decoder name or "auto"
+    remember_password: bool = False
+    port: int = 5900
+    auth: str = "srp"
+    krb_realm: str = ""
+    krb_principal: str = ""
+    krb_service: str = ""
 
 
 def _state_dir() -> Path:
@@ -72,6 +77,12 @@ def load_last() -> Optional[ConnectFormValues]:
         return None
     if not isinstance(data, dict):
         return None
+    try:
+        port = int(data.get("port", 5900))
+        if not 1 <= port <= 65535:
+            return None
+    except (TypeError, ValueError):
+        return None
     return ConnectFormValues(
         host=str(data.get("host", "")),
         user=str(data.get("user", "")),
@@ -86,6 +97,12 @@ def load_last() -> Optional[ConnectFormValues]:
         dynamic_resolution=bool(data.get("dynamic_resolution", False)),
         hidpi=str(data.get("hidpi", "auto")),
         decoder=str(data.get("decoder", "auto")),
+        remember_password=bool(data.get("remember_password", False)),
+        port=port,
+        auth=str(data.get("auth", "srp")),
+        krb_realm=str(data.get("krb_realm", "")),
+        krb_principal=str(data.get("krb_principal", "")),
+        krb_service=str(data.get("krb_service", "")),
     )
 
 
@@ -108,6 +125,12 @@ def save_last(values: ConnectFormValues) -> None:
             "dynamic_resolution": values.dynamic_resolution,
             "hidpi": values.hidpi,
             "decoder": values.decoder,
+            "remember_password": values.remember_password,
+            "port": values.port,
+            "auth": values.auth,
+            "krb_realm": values.krb_realm,
+            "krb_principal": values.krb_principal,
+            "krb_service": values.krb_service,
         }
         p.write_text(json.dumps(data, indent=2))
         try:

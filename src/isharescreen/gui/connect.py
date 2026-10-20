@@ -256,8 +256,19 @@ def _launch(values: dict) -> None:
     host = values.get("host", "").strip()
     user = values.get("user", "").strip()
     password = values.get("password", "")
-    if not (host and user and password):
-        _emit("log", "[gui] host, user, and password are all required")
+    try:
+        port = int(values.get("port", "5900"))
+        if not 1 <= port <= 65535:
+            raise ValueError
+    except ValueError:
+        _emit("log", "[gui] port must be between 1 and 65535")
+        return
+    auth = values.get("auth", "srp")
+    if auth not in ("srp", "nonsrp", "kerberos"):
+        _emit("log", "[gui] invalid authentication mode")
+        return
+    if not (host and user):
+        _emit("log", "[gui] host and user are required")
         _STATE["status"] = "idle"
         _emit("status", dict(_STATE))
         return
@@ -286,6 +297,9 @@ def _launch(values: dict) -> None:
         "--frontend", frontend, "--control-socket", sock_path,
         "--log-file", log_path,
     ]
+    if values.get("remember_password") == "on":
+        cmd.append("--remember-password")
+    cmd += ["--port", str(port), "--auth", auth]
     if evaluation:
         cmd += ["--codec", "hevc", "--no-dynamic", "--hidpi", "off", "--display", "combined", "--curtain"]
     # Resolution = the encoded BACKING (bandwidth); Display scale = UI size.
@@ -351,6 +365,17 @@ def _launch(values: dict) -> None:
         start_new_session=True, bufsize=1, text=True,
     )
     _PROC = proc
+    # Persist only non-secret form metadata. The child saves the password in
+    # the OS store once remote authentication/negotiation has succeeded.
+    from isharescreen.tui.storage import ConnectFormValues, save_last
+    save_last(ConnectFormValues(
+        host=host, user=user, password="", advertise=values.get("advertise", "auto"),
+        audio=values.get("audio") == "on", curtain=values.get("curtain") == "on",
+        hdr=False, share_console=False, alt_session=False, frontend=frontend,
+        hidpi=scale, decoder=decoder,
+        remember_password=values.get("remember_password") == "on",
+        port=port, auth=auth,
+    ))
     _STATE["pid"] = proc.pid
     assert proc.stdin is not None
     proc.stdin.write(password + "\n")
@@ -394,7 +419,7 @@ _FORM = """<!doctype html><html><head><title>iShareScreen — Connect</title>__H
  .card { width:360px; background:#1e1f22; border:1px solid #2c2e33; border-radius:16px; padding:28px 28px 24px; box-shadow:0 12px 40px #0008; }
  h1 { margin:0 0 2px; font-size:22px; } .sub { margin:0 0 20px; color:#9aa0a6; font-size:13px; }
  label { display:block; margin:0 0 6px; color:#c7c9cf; font-size:13px; }
- input[type=text],input[type=password],select { width:100%; margin:0 0 14px; padding:10px 12px; font-size:15px; color:#e8e8ea; background:#2b2d31; border:1px solid #3a3d42; border-radius:9px; outline:none; }
+ input[type=text],input[type=password],input[type=number],select { width:100%; margin:0 0 14px; padding:10px 12px; font-size:15px; color:#e8e8ea; background:#2b2d31; border:1px solid #3a3d42; border-radius:9px; outline:none; }
  input:focus,select:focus { border-color:#4f8cff; }
  .row { display:flex; gap:10px; align-items:center; margin:2px 0 12px; } .row input { width:auto; margin:0; }
  button { width:100%; margin-top:8px; padding:12px; font-size:15px; font-weight:600; color:#fff; background:#4f8cff; border:0; border-radius:9px; cursor:pointer; } button:hover { background:#5f97ff; }
@@ -402,8 +427,17 @@ _FORM = """<!doctype html><html><head><title>iShareScreen — Connect</title>__H
  <form class="card" method="post" action="/connect" onsubmit="return prepVideo()">
   <h1>iShareScreen</h1><p class="sub">Connect to a Mac</p>
   <label>Host</label><input type="text" name="host" placeholder="Mac hostname or IP" value="__HOST__" autofocus>
+  <label>Port</label><input type="number" name="port" value="__PORT__" min="1" max="65535" required>
   <label>User</label><input type="text" name="user" placeholder="macOS account" value="__USER__">
-  <label>Password</label><input type="password" name="password" placeholder="password">
+  <label>Authentication</label><select name="auth">
+   <option value="srp" __SRP_SEL__>Password (SRP)</option>
+   <option value="nonsrp" __NONSRP_SEL__>Password (legacy RSA1)</option>
+   <option value="kerberos" __KERBEROS_SEL__>Kerberos</option>
+  </select>
+  <label>Password</label><input type="password" name="password" placeholder="Leave blank to use saved password" autocomplete="current-password">
+  <div class="row"><input type="checkbox" name="remember_password" id="remember-password" __REMEMBER__><label for="remember-password" style="margin:0">Remember password in system credential store</label></div>
+  <button type="button" onclick="forgetPassword()" style="background:#2b2d31;font-size:13px;margin-bottom:14px">Forget saved password</button>
+  <p id="credential-status" role="status" style="font-size:13px;color:#9aa0a6"></p>
   <div class="row"><input type="checkbox" name="sr_evaluation" id="sr-evaluation" onchange="evaluationMode()"><label for="sr-evaluation" style="margin:0">Super-resolution evaluation</label></div>
   <p id="evaluation-settings" hidden style="font-size:13px;color:#9aa0a6">Locked: Desktop · 960×540 input · 100% scale · HEVC · GPU-only PyTorch FP32 · CPU fallback disabled · dynamic resolution off · audio off · private virtual display (blanks the host screen). Only the display model changes during comparison.</p>
   <label>Frontend</label>
@@ -444,6 +478,16 @@ _FORM = """<!doctype html><html><head><title>iShareScreen — Connect</title>__H
   <button type="submit">Connect</button>
  </form>
  <script>
+ async function forgetPassword(){
+   const status=document.getElementById('credential-status');
+   status.textContent='Removing saved password…';
+   try{
+     const form=document.querySelector('form'), body=new URLSearchParams();
+     for(const key of ['host','port','user']) body.set(key,form.elements[key].value);
+     const response=await fetch('/forget-password',{method:'POST',body});
+     status.textContent=await response.text();
+   }catch(e){status.textContent='Could not reach credential store';}
+ }
  function evaluationMode(){
    const enabled=document.getElementById('sr-evaluation').checked;
    const decoder=document.querySelector('[name=decoder]');
@@ -766,6 +810,8 @@ def _decoder_options_html() -> str:
 def _form_page() -> bytes:
     host = user = ""
     frontend = "browser"
+    remember_password = False
+    last = None
     if load_last is not None:
         try:
             last = load_last()
@@ -775,11 +821,17 @@ def _form_page() -> bytes:
             host = getattr(last, "host", "") or ""
             user = getattr(last, "user", "") or ""
             frontend = getattr(last, "frontend", "browser") or "browser"
+            remember_password = getattr(last, "remember_password", False)
     import html as _html
     return (_FORM
             .replace("__HEAD__", _HEAD)
             .replace("__HOST__", _html.escape(host, quote=True))
             .replace("__USER__", _html.escape(user, quote=True))
+            .replace("__REMEMBER__", "checked" if remember_password else "")
+            .replace("__PORT__", _html.escape(str(getattr(last, "port", 5900)), quote=True))
+            .replace("__SRP_SEL__", "selected" if getattr(last, "auth", "srp") == "srp" else "")
+            .replace("__NONSRP_SEL__", "selected" if getattr(last, "auth", "srp") == "nonsrp" else "")
+            .replace("__KERBEROS_SEL__", "selected" if getattr(last, "auth", "srp") == "kerberos" else "")
             .replace("__BROWSER_SEL__", "selected" if frontend == "browser" else "")
             .replace("__DESKTOP_SEL__", "selected" if frontend == "desktop" else "")
             .replace("__DECODER_OPTIONS__", _decoder_options_html())).encode()
@@ -831,6 +883,23 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length).decode("utf-8") if length else ""
         values = {k: v[0] for k, v in parse_qs(raw).items()}
+        if self.path == "/forget-password":
+            from isharescreen import credentials
+            host, user = values.get("host", "").strip(), values.get("user", "").strip()
+            try:
+                port = int(values.get("port", "5900"))
+                if not host or not user or not 1 <= port <= 65535:
+                    raise ValueError
+            except ValueError:
+                self._html(b"Enter host, port and user first", 400)
+                return
+            try:
+                credentials.delete_password(host, port, user)
+            except credentials.CredentialStoreError as error:
+                self._html(str(error).encode(), 503)
+            else:
+                self._html(b"Saved password removed (if present)")
+            return
         if self.path == "/action":
             action = values.get("action")
             if action == "fir":
