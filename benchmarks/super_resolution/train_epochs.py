@@ -54,8 +54,8 @@ def recorded_sources_match(sources):
     """Accept current sources or the original completed epoch campaign, read-only.
 
     The archived source-map fingerprint belongs to Git revision aaa72f8ebb5b.
-    It permits auditing/rendering those checkpoints, not resuming them under
-    changed sources. Resume and budget extension still require exact sources.
+    Ordinary resume requires exact sources. The extension tool may explicitly
+    upgrade this recognized source map while preserving the full training state.
     """
     current = source_hashes()
     if sources == current:

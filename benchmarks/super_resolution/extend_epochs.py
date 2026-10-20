@@ -1,8 +1,9 @@
 """Budget-only true-epoch continuation into a fresh, traceable output directory.
 
 The source run is never edited. Recovery uses CURRENT weights, Adam and RNG;
-historical best weights and all prefix observations remain available. The core
-runner stays byte-for-byte unchanged. Only two schedule fields are rebound.
+historical best weights and all prefix observations remain available. Only the
+epoch ceiling changes by default. An explicit source upgrade can migrate the
+recognized pre-cleanup epoch campaign to the current implementation.
 """
 import argparse
 import copy
@@ -37,7 +38,7 @@ def same(a, b):
     return a == b
 
 
-def extended_policy(policy, epochs):
+def extended_policy(policy, epochs, *, upgrade_sources=False):
     result = copy.deepcopy(policy)
     old = result["schedule"]
     require(isinstance(epochs, int) and not isinstance(epochs, bool) and epochs > old["epochs"],
@@ -48,10 +49,14 @@ def extended_policy(policy, epochs):
                 ("selection_every_epochs", "full_every_epochs")),
             "Parent ceiling must be on both validation cadences")
     old.update(epochs=epochs, total_updates=epochs*old["updates_per_epoch"])
+    if upgrade_sources:
+        require(train_epochs.recorded_sources_match(policy["sources"]),
+                "Unrecognized training sources; source upgrade refused")
+        result["sources"] = train_epochs.source_hashes()
     return result
 
 
-def prepare(source, output, epochs, pairs, folds, home):
+def prepare(source, output, epochs, pairs, folds, home, *, upgrade_sources=False):
     import torch
     torch.set_num_threads(1)
     source, output = Path(source), Path(output)
@@ -59,7 +64,9 @@ def prepare(source, output, epochs, pairs, folds, home):
     require(not (source / "FAILED.json").exists(), "Failed parent requires investigation")
     policy, config, done = (read(source / n) for n in ("protocol.json", "config.json", "COMPLETED.json"))
     require(policy["schema"] == "sr_true_epoch_protocol_v1", "Not a true-epoch parent")
-    require(policy["sources"] == train_epochs.source_hashes(), "Pinned training sources changed")
+    require(upgrade_sources or policy["sources"] == train_epochs.source_hashes(),
+            "Pinned training sources changed; recognized epoch checkpoints need --upgrade-sources")
+    new_policy = extended_policy(policy, epochs, upgrade_sources=upgrade_sources)
     require(policy["pairs_sha256"] == sha256(pairs) and policy["folds_sha256"] == sha256(folds),
             "Frozen data or fold identity changed")
     schedule = policy["schedule"]
@@ -98,7 +105,6 @@ def prepare(source, output, epochs, pairs, folds, home):
         pixel_metrics=policy["pixel_metrics"], validate_every=policy["selection_every_epochs"],
         full_every=policy["full_every_epochs"], checkpoint_every=policy["checkpoint_every_updates"],
         selection_per_clip=policy["selection_per_clip"])
-    new_policy = extended_policy(policy, epochs)
     new_binding = training_state.fingerprint(new_policy)
     # Archive an independent, byte-identical parent subset. The full original
     # snapshot archive remains at source. Never hardlink writable child files.
@@ -133,10 +139,13 @@ def prepare(source, output, epochs, pairs, folds, home):
         old_epochs=cap, new_epochs=epochs, added_epochs=epochs-cap,
         old_steps=total, new_steps=new_policy["schedule"]["total_updates"],
         allowed_policy_changes=["schedule.epochs", "schedule.total_updates"],
+        source_upgrade=policy["sources"] != new_policy["sources"],
         resume_from="parent CURRENT last.pt, not selected best.pt",
         exported_checkpoint_rebinding="metadata only; original payloads retained in parent-history",
         optimizer_and_rng_preserved=True, cross_device_bitwise_equivalence=False,
         generator_sha256=sha256(Path(__file__)))
+    if receipt["source_upgrade"]:
+        receipt["allowed_policy_changes"].append("sources")
     atomic_json(output / "EXTENSION.json", receipt)
     verify_prepared(output)
     return receipt
@@ -151,7 +160,11 @@ def verify_prepared(output):
     for name, digest in receipt["parent_artifacts_sha256"].items():
         require(sha256(archive / name) == digest, "Archived parent artifact changed")
     old = read(archive / "protocol.json")
-    require(policy == extended_policy(old, receipt["new_epochs"]), "Extension changed more than budget")
+    upgraded = receipt.get("source_upgrade", False)
+    require(policy == extended_policy(old, receipt["new_epochs"], upgrade_sources=upgraded),
+            "Extension changed more than the permitted budget/source upgrade")
+    allowed = ["schedule.epochs", "schedule.total_updates"] + (["sources"] if upgraded else [])
+    require(receipt["allowed_policy_changes"] == allowed, "Unexpected permitted policy changes")
     require(training_state.fingerprint(old) == receipt["old_binding"]
             and training_state.fingerprint(policy) == receipt["new_binding"], "Extension binding differs")
     for name, field in (("last.pt", "binding"), ("best.pt", "protocol_binding"),
@@ -163,7 +176,8 @@ def verify_prepared(output):
         before[field] = after[field]
         require(same(before, after), "Continuation changed CURRENT weights, Adam, RNG or historical best")
     for path in output.iterdir():
-        if path.name in receipt["parent_artifacts_sha256"] and path.name not in ("last.pt", "best.pt", "protocol.json", "config.json"):
+        if path.name in receipt["parent_artifacts_sha256"] and path.name not in (
+                "last.pt", "best.pt", "protocol.json", "config.json", "EXTENSION.json"):
             require(sha256(path) == receipt["parent_artifacts_sha256"][path.name], "Imported observation changed")
     require(not any((output / n).exists() for n in ("COMPLETED.json", "FAILED.json", "status.json")),
             "Prepared continuation contains a stale execution marker")
@@ -175,6 +189,8 @@ def main():
     for name in ("source", "output", "pairs", "folds", "home"):
         p.add_argument(f"--{name}", type=Path, required=True)
     p.add_argument("--epochs", type=int, required=True, help="Cumulative ceiling, not extra epochs")
+    p.add_argument("--upgrade-sources", action="store_true",
+                   help="Explicitly migrate the recognized pre-cleanup epoch sources; preserve all training state")
     print(json.dumps(prepare(**vars(p.parse_args())), indent=2))
 
 

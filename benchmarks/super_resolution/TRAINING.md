@@ -110,10 +110,24 @@ later optimizer state.
 
 To extend a completed budget, `extend_epochs` requires unchanged sources/data
 and a fresh output. It preserves CURRENT weights, Adam, RNG and the earlier best,
-changing only the cumulative ceiling. Resume and extension reject source drift.
-Original-source checkpoints must use their original Git revision for further
-training; the cleaned checkout can audit and render the completed epoch campaign
-using its pinned historical source-map identity, without relabelling it as current.
+changing only the cumulative ceiling. Ordinary resume and extension reject source
+drift. For the recognized pre-cleanup epoch campaign, explicitly add
+`--upgrade-sources` to migrate into a fresh output under the current code:
+
+```sh
+python -m benchmarks.super_resolution.extend_epochs \
+  --source /path/to/completed/imdn-fold-0 --output /path/to/continued/imdn-fold-0 \
+  --pairs /path/to/packed/manifest.json --folds /path/to/frozen/folds.json \
+  --home /path/to/model-assets --epochs 2000 --upgrade-sources
+```
+
+The ceiling is cumulative. Migration changes only the ceiling and source binding,
+not weights, Adam, RNG, completed steps, best weights, data or recipe. The original
+checkpoint remains untouched; `EXTENSION.json` and `parent-history/` preserve
+its provenance. Resume the new output with the same recipe, new ceiling and
+`--resume --execute`. Torch/CUDA and metric identities must still match.
+Unknown source maps are rejected even with the upgrade flag. Old source checkouts
+are not required after successful migration.
 
 ## Report and select
 
@@ -133,3 +147,17 @@ from saved scores; it does not rerun metric inference.
 Curves show CURRENT snapshots, not a running-best curve. Training-loss curves show
 frame-weighted batch L1 per epoch. Selected epochs can differ by model and fold.
 A five-fold model collection is not a single all-data deployment checkpoint.
+
+## Verification
+
+`ISS_SR_TRAIN_SMOKE=1 python -m pytest` enables cached official-model backpropagation
+and checkpoint round-trip tests in addition to the normal regression suite.
+
+The current runner was also checked on RTX A5000 with PyTorch 2.6.0/CUDA 12.4:
+all three official models completed short runs on real paired crops, full metric
+evaluation, exact mid-epoch recovery, budget extension and report/curve generation.
+All 15 existing 1,500-epoch checkpoints passed migration-state checks. Copies of
+fold 0 for each model continued from update 156,000 to 156,002 with a pause and
+resume between updates, without resetting Adam, RNG or the historical best.
+Original checkpoints and scores were unchanged. These are short functional checks,
+not another training campaign or live-viewer performance measurements.

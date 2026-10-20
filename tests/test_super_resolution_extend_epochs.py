@@ -5,11 +5,90 @@ import pytest
 
 from benchmarks.super_resolution import extend_epochs
 from test_super_resolution_epochs import tiny_campaign
+from test_super_resolution_sources import ARCHIVED_SOURCES
 
 
 def hashes(folder):
     from isharescreen.enhancement.models import sha256
     return {str(p.relative_to(folder)): sha256(p) for p in folder.rglob("*") if p.is_file()}
+
+
+def archived_parent(folder):
+    """Rebind a synthetic fixture to the recognized historical source identity."""
+    import torch
+    from benchmarks.super_resolution import training_state
+    from isharescreen.enhancement.models import sha256
+    policy = json.loads((folder / "protocol.json").read_text())
+    policy["sources"] = dict(ARCHIVED_SOURCES)
+    binding = training_state.fingerprint(policy)
+    (folder / "protocol.json").write_text(json.dumps(policy))
+    for name, field in (("last.pt", "binding"), ("best.pt", "protocol_binding"),
+                        ("snapshots/epoch-0000.pt", "protocol_binding")):
+        value = torch.load(folder / name, weights_only=True)
+        value[field] = binding
+        torch.save(value, folder / name)
+    done = json.loads((folder / "COMPLETED.json").read_text())
+    done.update(protocol_binding=binding, checkpoint_sha256=sha256(folder / "best.pt"))
+    (folder / "COMPLETED.json").write_text(json.dumps(done))
+
+
+def test_explicit_source_upgrade_preserves_state_and_continues_identically(tiny_campaign):
+    import torch
+    runner, args, _ = tiny_campaign
+    args.epochs, args.full_every = 4, 2
+    assert runner.run(args) == 0
+    expected = torch.load(args.output / "last.pt", weights_only=True)
+    args.output, args.epochs = args.output.with_name("archived-parent"), 2
+    assert runner.run(args) == 0
+    archived_parent(args.output)
+    before = hashes(args.output)
+    child = args.output.with_name("upgraded")
+    with pytest.raises(ValueError, match="upgrade-sources"):
+        extend_epochs.prepare(args.output, child, 4, args.pairs, args.folds, args.home)
+    receipt = extend_epochs.prepare(args.output, child, 4, args.pairs, args.folds,
+                                   args.home, upgrade_sources=True)
+    assert receipt["source_upgrade"]
+    assert receipt["allowed_policy_changes"] == ["schedule.epochs", "schedule.total_updates", "sources"]
+    state = torch.load(child / "last.pt", weights_only=True)
+    assert state["metadata"]["step"] == 6
+    assert hashes(args.output) == before
+    args.output, args.epochs, args.resume = child, 4, True
+    assert runner.run(args) == 0
+    actual = torch.load(child / "last.pt", weights_only=True)
+    for field in ("state_dict", "optimizer", "rng", "torch_rng", "cuda_rng", "best_state"):
+        assert extend_epochs.same(expected[field], actual[field]), field
+    assert actual["metadata"]["step"] == 12
+
+
+def test_source_upgrade_rejects_unrecognized_source_before_writing(tiny_campaign):
+    runner, args, _ = tiny_campaign
+    args.epochs = 2
+    assert runner.run(args) == 0
+    policy = json.loads((args.output / "protocol.json").read_text())
+    policy["sources"]["train.py"] = "unknown"
+    (args.output / "protocol.json").write_text(json.dumps(policy))
+    child = args.output.with_name("invalid-upgrade")
+    with pytest.raises(ValueError, match="Unrecognized training sources"):
+        extend_epochs.prepare(args.output, child, 4, args.pairs, args.folds,
+                             args.home, upgrade_sources=True)
+    assert not child.exists()
+
+
+def test_already_extended_parent_can_continue_again(tiny_campaign):
+    runner, args, _ = tiny_campaign
+    args.epochs, args.full_every = 2, 2
+    assert runner.run(args) == 0
+    first = args.output.with_name("first-extension")
+    extend_epochs.prepare(args.output, first, 4, args.pairs, args.folds, args.home)
+    args.output, args.epochs, args.resume = first, 4, True
+    assert runner.run(args) == 0
+    before = hashes(first)
+    second = first.with_name("second-extension")
+    extend_epochs.prepare(first, second, 6, args.pairs, args.folds, args.home)
+    assert extend_epochs.verify_prepared(second)["old_epochs"] == 4
+    assert hashes(first) == before
+    args.output, args.epochs = second, 6
+    assert runner.run(args) == 0
 
 
 def test_budget_extension_matches_uninterrupted_current_adam_rng_and_best(tiny_campaign):
