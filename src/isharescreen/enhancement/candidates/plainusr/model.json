@@ -1,0 +1,22 @@
+{
+  "id": "plainusr",
+  "label": "PlainUSR-U",
+  "scale": 2,
+  "repo": "icandle/PlainUSR",
+  "revision": "d7ff11afe3d12a68c12375a7959d3aa8a3a50eda",
+  "license_id": "MIT",
+  "files": {
+    "source/architecture.py": {
+      "url": "https://raw.githubusercontent.com/icandle/PlainUSR/d7ff11afe3d12a68c12375a7959d3aa8a3a50eda/2024_PlainUSR_ACCV/archs/PlainUSR_inference_arch.py",
+      "sha256": "644a890686c53b6ac82153576f132683ed2e203ed15f306f83e2656b3dcf19b4"
+    },
+    "LICENSE": {
+      "url": "https://raw.githubusercontent.com/icandle/PlainUSR/d7ff11afe3d12a68c12375a7959d3aa8a3a50eda/LICENSE",
+      "sha256": "fe3f8bbef5d2a4c8e7f39ec493a06b9cb3f26ce11edcd74d991193dfa967bf24"
+    },
+    "weights.pth": {
+      "url": "https://raw.githubusercontent.com/icandle/PlainUSR/d7ff11afe3d12a68c12375a7959d3aa8a3a50eda/2024_PlainUSR_ACCV/pretrained_model/PlainUSRU_Rep_x2.pth",
+      "sha256": "8c6c9f82bceaab6b84bacad643443c367bee93e9ecdabb7c7e4cc595dc82df81"
+    }
+  }
+}

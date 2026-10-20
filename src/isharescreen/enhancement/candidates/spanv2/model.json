@@ -1,0 +1,22 @@
+{
+  "id": "spanv2",
+  "label": "SPANV2-ESR C2",
+  "scale": 4,
+  "repo": "Amazingren/NTIRE2026_ESR",
+  "revision": "4592ce6db68b395699f13e7e2a4e3baf317ef1c6",
+  "license_id": "MIT",
+  "files": {
+    "source/architecture.py": {
+      "url": "https://raw.githubusercontent.com/Amazingren/NTIRE2026_ESR/4592ce6db68b395699f13e7e2a4e3baf317ef1c6/models/team22_SPANV2_ESR.py",
+      "sha256": "003a2153020515b3eb5e496ec3e74b5733e8c41d9afdbde5180ee2dd5429b48f"
+    },
+    "LICENSE": {
+      "url": "https://raw.githubusercontent.com/Amazingren/NTIRE2026_ESR/4592ce6db68b395699f13e7e2a4e3baf317ef1c6/LICENSE",
+      "sha256": "40e745bd8e0a681b0f919f8cb601357461dcaf5b5e6785fa7006abcc81841381"
+    },
+    "weights.pth": {
+      "url": "https://raw.githubusercontent.com/Amazingren/NTIRE2026_ESR/4592ce6db68b395699f13e7e2a4e3baf317ef1c6/model_zoo/team22_spanv2_c2.pth",
+      "sha256": "fca2743272b8a7fb32931ed3287454173c7d209f204cb2f58084ee868414d371"
+    }
+  }
+}

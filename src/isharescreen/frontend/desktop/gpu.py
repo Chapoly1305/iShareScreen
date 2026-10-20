@@ -205,6 +205,17 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 """
 
 
+def _pack_rgba(rgb: np.ndarray, rgba: np.ndarray) -> None:
+    """Pack into owned staging memory without requiring OpenCV for playback."""
+    try:
+        import cv2
+    except ImportError:
+        rgba[..., :3] = rgb
+        rgba[..., 3] = 255
+    else:
+        cv2.cvtColor(rgb, cv2.COLOR_RGB2RGBA, dst=rgba)
+
+
 class Renderer:
     """Build once, call `upload_tile` per fresh tile, then `draw`."""
 
@@ -218,6 +229,7 @@ class Renderer:
         self._enhanced = False
         self._rgb_tex = None
         self._rgb_pipeline = None
+        self._rgb_staging = None
 
         # Real decoded-content extent within the canvas textures, grown as
         # tiles upload. 0 until the first tile lands (content_dims then
@@ -585,8 +597,10 @@ class Renderer:
                 {"binding":0,"resource":self._rgb_tex.create_view()},
                 {"binding":3,"resource":self._sampler},
                 {"binding":4,"resource":self._uniform_resource}])
-        rgba = np.empty((self._h*2,self._w*2,4),np.uint8)
-        rgba[...,:3] = rgb; rgba[...,3] = 255
+        if self._rgb_staging is None:
+            self._rgb_staging = np.empty((self._h*2,self._w*2,4),np.uint8)
+        rgba = self._rgb_staging
+        _pack_rgba(rgb, rgba)
         device.queue.write_texture({"texture":self._rgb_tex}, rgba,
                                    {"bytes_per_row":self._w*2*4}, (self._w*2,self._h*2,1))
         self._enhanced = True

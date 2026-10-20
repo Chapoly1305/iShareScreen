@@ -10,7 +10,7 @@ from typing import NamedTuple
 
 import numpy as np
 
-from .models import Upscaler, availability
+from .variants import availability, load
 from ..proxy.media.tiles import TileFrame
 
 log = logging.getLogger(__name__)
@@ -98,14 +98,15 @@ class EnhancementWorker:
     construction and inference never hold the control condition lock.
     """
 
-    def __init__(self, device="auto", factory=Upscaler):
+    def __init__(self, device="auto", factory=load):
         self.device, self.factory = device, factory
         self._cv = threading.Condition()
         self._selected, self._generation, self._pending, self._result = "off", 0, None, None
         self._closed = False
         self._options = availability()
         self._stats = {"selected":"off", "active":"off", "displayed":"off", "state":"bypass",
-                       "error":"", "submitted":0, "processed":0, "dropped":0, "device":device}
+                       "error":"", "submitted":0, "processed":0, "dropped":0, "device":device,
+                       "provenance":{}, "timing_ms":{}, "display_upload_ms":None}
         self._latencies = deque(maxlen=120)
         self._thread = threading.Thread(target=self._run, name="iss-super-resolution", daemon=True)
         self._thread.start()
@@ -124,7 +125,7 @@ class EnhancementWorker:
             self._latencies.clear()
             self._stats.update(selected=key, active="off", displayed="off",
                                state="bypass" if key == "off" else "loading", error="",
-                               last_ms=None,age_ms=None)
+                               last_ms=None,age_ms=None,provenance={},timing_ms={},display_upload_ms=None)
             self._cv.notify_all()
 
     def invalidate(self):
@@ -133,7 +134,7 @@ class EnhancementWorker:
             self._generation += 1
             self._pending = self._result = None
             self._latencies.clear()
-            self._stats.update(displayed="off",last_ms=None,age_ms=None)
+            self._stats.update(displayed="off",last_ms=None,age_ms=None,timing_ms={},display_upload_ms=None)
             self._cv.notify_all()
 
     def submit(self, frame):
@@ -154,12 +155,13 @@ class EnhancementWorker:
                 return None
             return result
 
-    def displayed(self, generation, key):
+    def displayed(self, generation, key, upload_ms=None):
         """Confirm presentation only if the control state still owns this output."""
         with self._cv:
             if (not self._closed and generation == self._generation and key == self._selected
                     and self._stats["state"] != "error"):
                 self._stats["displayed"] = key
+                self._stats["display_upload_ms"] = upload_ms
                 return True
             return False
 
@@ -175,7 +177,9 @@ class EnhancementWorker:
 
     def snapshot(self):
         with self._cv:
-            return dict(self._stats, options=[dict(option) for option in self._options], pending=int(self._pending is not None),
+            return dict(self._stats, provenance=dict(self._stats["provenance"]),
+                        timing_ms=dict(self._stats["timing_ms"]),
+                        options=[dict(option) for option in self._options], pending=int(self._pending is not None),
                         generation=self._generation,
                         p50_ms=float(np.median(self._latencies)) if self._latencies else None)
 
@@ -210,7 +214,8 @@ class EnhancementWorker:
                         if self._closed:
                             return
                         if generation == self._generation:
-                            self._stats.update(active=key, state="bypass" if key == "off" else "ready")
+                            self._stats.update(active=key, state="bypass" if key == "off" else "ready",
+                                               provenance=dict(getattr(model, "provenance", {})))
                             # Loading may take seconds. Start with the latest
                             # canvas that arrived during loading, rather than
                             # briefly displaying a cold, obsolete first frame.
@@ -228,19 +233,22 @@ class EnhancementWorker:
                 started = time.monotonic()
                 frame = item.frame
                 rgb = compose(frame) if isinstance(frame, tuple) else frame
+                assembly_ms = (time.monotonic()-started)*1000
                 with self._cv:
                     if self._closed:
                         return
                     if generation != self._generation:
                         continue  # Canvas assembly also runs outside the control lock.
                 out, timing = model(rgb)
+                timing["assembly_ms"] = assembly_ms
                 timing["assembly_and_processing_ms"] = (time.monotonic()-started)*1000
                 timing["age_ms"] = (time.monotonic()-item.submitted_at)*1000
                 with self._cv:
                     if not self._closed and generation == self._generation and self._stats["state"] != "error":
                         self._result = EnhancedFrame(generation, key, out, timing)
                         self._stats.update(active=key, state="ready", last_ms=timing["assembly_and_processing_ms"],
-                                           age_ms=timing["age_ms"], device=getattr(model,"device",self.device))
+                                           age_ms=timing["age_ms"], device=getattr(model,"device",self.device),
+                                           timing_ms=dict(timing))
                         self._stats["processed"] += 1
                         self._latencies.append(timing["assembly_and_processing_ms"])
             except Exception as exc:
@@ -301,7 +309,7 @@ class EnhancementDisplay:
             self.renderer.upload_enhanced(rgb)
             # Controls stay responsive during potentially slow GPU allocation.
             # If selection/geometry changed during upload, bypass before draw.
-            if not self.worker.displayed(generation, key):
+            if not self.worker.displayed(generation, key, (time.perf_counter()-started)*1000):
                 self.renderer.clear_enhancement()
         except Exception as exc:
             log.exception("enhancement output upload failed")

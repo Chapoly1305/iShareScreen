@@ -7,6 +7,7 @@ dependencies are not included in the viewer wheel.
 - [Training](TRAINING.md): frozen data, five content folds, epoch training and recovery.
 - [Data curation](CURATION.md): paired extraction, similarity filtering and review.
 - [Results](RESULTS.md): the completed 1,500-epoch comparison and local viewing material.
+- [Inference performance](PERFORMANCE.md): M4 and RTX 4090 adapter latency.
 
 ## Environment
 
@@ -93,6 +94,104 @@ Image panels have separators; descriptive titles appear only in HTML.
 `compose_trained --output /path/to/comparison --refresh-gallery` restyles an
 existing gallery without model inference or video encoding.
 Viewing videos are lossy and are never metric inputs.
+
+For live comparisons, `export_live` installs inference-only bundles from audited
+completed trajectories without modifying training checkpoints or official
+weights. See [live comparison setup](../../docs/video-enhancement.md#live-comparison)
+for the fixed 540p connection profile and pretrained/fine-tuned switching.
+
+## Performance profiling
+
+Profile warmed inference at the intended input dimensions before training a new
+deployment candidate. The live dashboard exposes assembly, preparation, input,
+model, output and display-upload enqueue times after an enhanced frame completes.
+They are processing stages, not input-to-display latency. The reference adapter
+uses explicit device barriers to make its per-stage measurements meaningful.
+
+```sh
+python -m benchmarks.super_resolution.profile_live \
+  --images /path/to/540p-frame.png --models edsr imdn safmn \
+  --device mps --leaf-hotspots --output /path/to/fresh-profile.json
+```
+
+Stop competing GPU inference while measuring. The report separates model load,
+warm-up, raw stage samples, median and p95 latency. Optional leaf-module timings
+insert barriers and omit functional operations; use them to locate hotspots,
+not as additive production-latency estimates. A 30-FPS deployment needs roughly
+33 ms for the entire post-decode enhancement path, not just the model kernel.
+Reject an optimized backend if paired output quality changes unacceptably, even
+if its timing improves. Lower parameter count alone does not establish latency.
+
+### Lightweight candidate comparison
+
+Per-model runtime directories hold pinned asset metadata and deployment loaders;
+`setup_candidates` downloads and verifies assets without executing them.
+`convert_candidate` installs a Core ML conversion only after agreement checks
+against CPU FP32 on at least three distinct full-size inputs. See the
+[candidate installation guide](../../docs/video-enhancement.md#lightweight-model-candidates)
+for supported scales, precisions and licensing boundaries.
+
+```sh
+python -m benchmarks.super_resolution.setup_candidates
+python -m benchmarks.super_resolution.benchmark_candidates \
+  --prepared /path/to/prepared --output /path/to/fresh-comparison \
+  --device mps --warmup 5 --iterations 40 --lpips
+```
+
+The prepared directory contains `code/`, `terminal/` and `desktop/`, each with
+`low.png` (960×540 RGB) and `reference.png` (1920×1080 RGB). The probe saves
+reconstructed PNGs, input/reference hashes, source bindings, weight/backend
+identity, raw timing samples, p50/p95 and paired PSNR/SSIM/LPIPS. Bicubic is
+included as a baseline. Torch resident-forward timing is separate from complete
+adapter timing. Core ML prediction includes framework-managed I/O; it is not a
+resident GPU-only measurement. Native ×4 outputs are timed separately without
+paired quality scores because the input protocol has no 2160p ground truth.
+The JSON records unsupported and failed configurations explicitly; suite
+completion does not mean every backend passed. Use a quiet GPU for comparison.
+
+For a video-based latency comparison, use the same decoded recording frames
+for every model and precision:
+
+```sh
+python -m benchmarks.super_resolution.video_latency \
+  --video /path/to/960x540-recording.mkv --output /path/to/fresh-latency \
+  --device cuda --samples 120 --warmup 20
+# On Apple Silicon, include the installed fixed-resolution Core ML models:
+python -m benchmarks.super_resolution.video_latency \
+  --video /path/to/960x540-recording.mkv --output /path/to/fresh-mac-latency \
+  --device mps --backends torch coreml --samples 120 --warmup 20
+```
+
+The probe samples frames uniformly, separately measures decode/RGB conversion,
+then runs serial batch-one resident forwards with CUDA events (CUDA) or
+synchronized host wall time (MPS), and the actual
+complete adapters with synchronized stage timing. FP32 disables TF32; the second
+CUDA mode uses FP16 autocast with FP32 weights, not pure FP16. MPS uses FP32;
+Core ML uses each validated conversion's precision, with prediction API timing
+instead of resident-forward timing. cuDNN autotuning is
+enabled and warm-up calls are excluded. Output checks remain in the adapter
+measurement but outside resident event intervals. AMP differences on the first
+sample are recorded against CUDA FP32; this is not full quality validation.
+The JSON includes raw samples, frame identities, source/weight bindings and GPU
+identity. It does not claim TensorRT, live FPS or end-to-end display latency.
+
+For CPU-prohibited model inference, start with
+`ISS_SR_GPU_ONLY=1 PYTORCH_ENABLE_MPS_FALLBACK=0` and specify only learned Torch
+models (omit `bicubic` and `--backends coreml`). The Live evaluation profile sets
+these flags automatically. Core ML permits CPU in every public compute-unit
+configuration, so it is not eligible for this strict mode. `inspect_execution`
+audits model-forward tensor devices and records Core ML anticipated placement:
+
+```sh
+ISS_SR_GPU_ONLY=1 PYTORCH_ENABLE_MPS_FALLBACK=0 \
+  python -m benchmarks.super_resolution.inspect_execution \
+  --image /path/to/540p-frame.png --output /path/to/fresh-execution-audit.json
+```
+
+Core ML compute plans are not runtime hardware traces. The retained Instruments
+recording in the local performance artifacts separately demonstrates Neural
+Engine prediction activity for QuickSRNet. CPU preprocessing and output
+conversion are outside the GPU-only model-forward requirement.
 
 ## Code layout and checks
 

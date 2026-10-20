@@ -261,6 +261,37 @@ class DisplayRenderer:
         self.frames.append(self.rgb)
 
 
+def test_stage_timings_and_upload_cost_follow_the_current_generation():
+    class Fake:
+        def __init__(self, key, device):
+            pass
+
+        def __call__(self, image):
+            return image.repeat(2, 0).repeat(2, 1), {"total_ms": 2, "inference_ms": 1.5}
+
+    worker = EnhancementWorker(factory=Fake)
+    renderer = DisplayRenderer()
+    display = EnhancementDisplay(worker, renderer, 8, 8, 1)
+    try:
+        worker.select("bicubic")
+        display.update_tile(0, tile(), 8)
+        display.step()
+        wait_until(lambda: worker.snapshot()["processed"] == 1)
+        assert display.step()
+        status = worker.snapshot()
+        assert status["timing_ms"]["inference_ms"] == 1.5
+        assert status["timing_ms"]["assembly_ms"] >= 0
+        assert status["display_upload_ms"] >= 0
+        status["timing_ms"].clear()
+        assert worker.snapshot()["timing_ms"]["inference_ms"] == 1.5
+        generation = worker.snapshot()["generation"]
+        worker.select("off")
+        assert not worker.displayed(generation, "bicubic", 1000)
+        assert worker.snapshot()["timing_ms"] == {} and worker.snapshot()["display_upload_ms"] is None
+    finally:
+        worker.close()
+
+
 @pytest.mark.parametrize("change", ["off", "bilinear", "resize", "close"])
 @pytest.mark.parametrize("boundary", ["after_poll", "during_upload"])
 def test_late_selection_change_never_presents_obsolete_output(monkeypatch, change, boundary):

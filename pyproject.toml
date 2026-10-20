@@ -62,7 +62,9 @@ dependencies = [
 # no real decode and no network. `pip install -e .[test]` then `pytest`.
 test = ["pytest>=8"]
 # Optional native-viewer upscalers; the ordinary viewer does not import these.
-enhancement = ["torch>=2.6,<3", "einops>=0.8", "opencv-python-headless>=4.11"]
+enhancement = ["torch>=2.6,<3", "torchvision>=0.21", "einops>=0.8", "opencv-python-headless>=4.11"]
+# Validated Core ML playback on macOS; no PyTorch inference required.
+enhancement-coreml = ["coremltools>=9,<10; sys_platform == 'darwin'", "opencv-python-headless>=4.11"]
 
 [project.scripts]
 iss = "isharescreen.tui.entry:main"

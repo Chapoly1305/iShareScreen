@@ -232,8 +232,27 @@ def _browser_is_safari(ua: str) -> bool:
                    ("chrome", "chromium", "crios", "edg", "fxios", "android", "opr"))
 
 
+def _evaluation_values(values: dict) -> dict:
+    """Enforce the comparison profile independently of disabled form fields."""
+    values = dict(values)
+    if values.get("sr_evaluation") == "on":
+        from isharescreen.proxy.media.registry import select
+        decoder = select("hevc")
+        if decoder is None:
+            raise ValueError("Super-resolution evaluation requires an HEVC decoder")
+        values.update(frontend="desktop", advertise="960x540", scale="1.0",
+                      decoder=decoder.name, audio="off", curtain="on")
+    return values
+
+
 def _launch(values: dict) -> None:
     global _PROC, _LAST, _LAUNCH_N
+    try:
+        values = _evaluation_values(values)
+    except ValueError as error:
+        _emit("log", f"[gui] {error}")
+        return
+    evaluation = values.get("sr_evaluation") == "on"
     host = values.get("host", "").strip()
     user = values.get("user", "").strip()
     password = values.get("password", "")
@@ -251,7 +270,10 @@ def _launch(values: dict) -> None:
     _free_bridge_port(_BRIDGE_PORT)
     _LAST = dict(values)
     frontend = values.get("frontend", "browser")
-    _STATE.update(host=host, frontend=frontend, status="connecting")
+    with _LOCK:
+        _LATEST.clear()
+        _HELLO.clear()
+    _STATE.update(host=host, frontend=frontend, status="connecting", evaluation=evaluation)
     _emit("status", dict(_STATE))
 
     _LAUNCH_N += 1
@@ -264,6 +286,8 @@ def _launch(values: dict) -> None:
         "--frontend", frontend, "--control-socket", sock_path,
         "--log-file", log_path,
     ]
+    if evaluation:
+        cmd += ["--codec", "hevc", "--no-dynamic", "--hidpi", "off", "--display", "combined", "--curtain"]
     # Resolution = the encoded BACKING (bandwidth); Display scale = UI size.
     # For a fixed resolution we advertise logical points = backing ÷ scale, so
     # the host encodes exactly the chosen backing while drawing the UI at
@@ -313,6 +337,10 @@ def _launch(values: dict) -> None:
         cmd.append("--trust-cert-for-safari")
 
     env = dict(os.environ)
+    if evaluation:
+        env["ISS_SR_PRECISION"] = "fp32"
+        env["ISS_SR_GPU_ONLY"] = "1"
+        env["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
     if _GUI_PORT:
         # iss POSTs here (blocking) to ask share-vs-alt when a different user is
         # at the console; the /session-choice handler answers from the modal.
@@ -376,6 +404,8 @@ _FORM = """<!doctype html><html><head><title>iShareScreen — Connect</title>__H
   <label>Host</label><input type="text" name="host" placeholder="Mac hostname or IP" value="__HOST__" autofocus>
   <label>User</label><input type="text" name="user" placeholder="macOS account" value="__USER__">
   <label>Password</label><input type="password" name="password" placeholder="password">
+  <div class="row"><input type="checkbox" name="sr_evaluation" id="sr-evaluation" onchange="evaluationMode()"><label for="sr-evaluation" style="margin:0">Super-resolution evaluation</label></div>
+  <p id="evaluation-settings" hidden style="font-size:13px;color:#9aa0a6">Locked: Desktop · 960×540 input · 100% scale · HEVC · GPU-only PyTorch FP32 · CPU fallback disabled · dynamic resolution off · audio off · private virtual display (blanks the host screen). Only the display model changes during comparison.</p>
   <label>Frontend</label>
   <select name="frontend"><option value="browser" __BROWSER_SEL__>browser (WebTransport + WebCodecs)</option><option value="desktop" __DESKTOP_SEL__>desktop (native window)</option></select>
   <label>Resolution</label>
@@ -392,6 +422,7 @@ _FORM = """<!doctype html><html><head><title>iShareScreen — Connect</title>__H
    <option value="1366x768">1366 × 768 (WXGA)</option>
    <option value="1280x720">1280 × 720 (HD)</option>
    <option value="1024x768">1024 × 768 (XGA)</option>
+   <option value="960x540">960 × 540 (540p, ×2 to 1080p)</option>
    <option value="800x600">800 × 600 (SVGA)</option>
   </select>
   <label>Display scale</label>
@@ -413,11 +444,29 @@ _FORM = """<!doctype html><html><head><title>iShareScreen — Connect</title>__H
   <button type="submit">Connect</button>
  </form>
  <script>
+ function evaluationMode(){
+   const enabled=document.getElementById('sr-evaluation').checked;
+   const decoder=document.querySelector('[name=decoder]');
+   const hevc=Array.from(decoder.options).find(option=>option.value.includes('hevc'));
+   const fixed={frontend:'desktop',advertise:'960x540',scale:'1.0',decoder:hevc?hevc.value:'auto',audio:false,curtain:true};
+   for(const [name,value] of Object.entries(fixed)){
+     const field=document.querySelector(`[name=${name}]`), checkbox=field.type==='checkbox';
+     if(enabled&&!field.disabled) field.dataset.beforeEvaluation=checkbox?String(field.checked):field.value;
+     if(enabled){ if(checkbox) field.checked=value; else field.value=value; }
+     else if(field.dataset.beforeEvaluation!==undefined){
+       if(checkbox) field.checked=field.dataset.beforeEvaluation==='true'; else field.value=field.dataset.beforeEvaluation;
+       delete field.dataset.beforeEvaluation;
+     }
+     field.disabled=enabled;
+   }
+   document.getElementById('evaluation-settings').hidden=!enabled;
+ }
+ window.addEventListener('pageshow', evaluationMode);
  // Open the video tab DURING the Connect click (a real user gesture, so no
  // popup-block) — but the URL doesn't exist yet, so point it at a local
  // "Connecting…" page that polls for the real URL and redirects itself. Only
  // for the browser frontend; the desktop frontend has no video page.
- function prepVideo(){ try{ var f=document.querySelector('[name=frontend]');
+ function prepVideo(){ evaluationMode(); try{ var f=document.querySelector('[name=frontend]');
    if(f&&f.value==='browser') window.open('/video-wait','_blank'); }catch(e){} return true; }
  </script></body></html>"""
 
@@ -476,6 +525,7 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
   <a id="videobtn" class="btn primary" style="display:none;text-decoration:none" target="_blank" rel="noopener" title="Open the live video stream in a new tab — in this same browser.">▶ Open video</a>
   <a class="new" href="/new">+ new connection</a></div>
  <div class="cards">
+  <div class="card" id="evaluation-profile" hidden style="border-color:#4f8cff"></div>
   <div class="card" id="enhancement-card" hidden>
    <h3>Video enhancement</h3>
    <label for="enhancement-model">Display model</label>
@@ -483,6 +533,8 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
      style="width:100%;margin:8px 0;padding:8px;background:#141518;color:#dfe1e4;border:1px solid #3a3d42;border-radius:6px"
      onchange="setEnhancement(this.value)"></select>
    <div id="enhancement-status" style="font-size:13px;color:#9aa0a6" role="status"></div>
+   <div id="enhancement-details" style="font-size:12px;color:#9aa0a6;overflow-wrap:anywhere"></div>
+   <div id="enhancement-timing" style="font-size:12px;color:#9aa0a6;overflow-wrap:anywhere"></div>
   </div>
   <div class="card"><h3 title="What's being streamed and how it's decoded.">Stream</h3>
    <div class="kv" data-tip="Session lifecycle: connecting → running → ended. Stuck on 'connecting' → check the host address / username / password, or a firewall blocking TCP 5900. 'ended' unexpectedly → see the log below.">
@@ -573,13 +625,37 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
    menu.value=state.selected||'off';
    const processing=state.p50_ms==null?'':` · ${state.p50_ms.toFixed(1)} ms processing`;
    const dropped=state.dropped?` · ${state.dropped} superseded frames`:'';
-   set('enhancement-status', state.error||(`${state.state} · displaying ${state.displayed||'off'}`+processing+dropped));
+   const displayed=(state.options||[]).find(model=>model.id===state.displayed);
+   set('enhancement-status', state.error||(`${state.state} · displaying ${displayed?displayed.label:'Original'}`+processing+dropped));
+   const provenance=state.provenance||{}, details=$('enhancement-details');
+   details.textContent=state.error?'':[
+     provenance.device||'', provenance.precision||'',
+     provenance.checkpoint_sha256?`weights ${provenance.checkpoint_sha256.slice(0,12)}`:''
+   ].filter(Boolean).join(' · ');
+   details.title=provenance.checkpoint||'';
+   const timing=state.timing_ms||{}, stages=[
+     ['assembly_ms','assemble'],['prepare_ms','prepare'],['upload_ms','input'],
+     ['inference_ms','model'],['download_ms','output']
+   ].filter(([key])=>timing[key]!=null).map(([key,label])=>`${label} ${timing[key].toFixed(1)} ms`);
+   if(state.display_upload_ms!=null) stages.push(`display enqueue ${state.display_upload_ms.toFixed(1)} ms`);
+   set('enhancement-timing', state.error?'':stages.join(' · '));
+ }
+ let evaluation=false, evaluationCanvas=null;
+ function evaluationProfile(){
+   const profile=$('evaluation-profile'); profile.hidden=!evaluation;
+   if(!evaluation) return;
+   const matched=evaluationCanvas&&evaluationCanvas.w===960&&evaluationCanvas.h===540;
+   profile.textContent='Super-resolution evaluation · fixed 960×540 input → ×2 reconstruction · HEVC · GPU-only PyTorch FP32 · CPU fallback disabled · dynamic resolution off · audio off'
+     +(evaluationCanvas?(matched?' · canvas verified':` · WARNING: received ${evaluationCanvas.w}×${evaluationCanvas.h}; input does not match the profile`):' · awaiting canvas verification');
+   profile.style.borderColor=evaluationCanvas&&!matched?'#e06c75':'#4f8cff';
  }
  const es = new EventSource('/events');
  es.addEventListener('status', e => { const s=JSON.parse(e.data);
    $('dot').className='dot '+(s.status||'idle'); set('s_status', s.status);
+   evaluation=!!s.evaluation; if(s.status==='connecting') evaluationCanvas=null; evaluationProfile();
    set('host', (s.host||'') + (s.frontend?' · '+s.frontend:'') + (s.pid?'  (pid '+s.pid+')':'')); });
  es.addEventListener('hello', e => { const h=JSON.parse(e.data);
+   evaluationCanvas=h.canvas||null; evaluationProfile();
    if(h.canvas) set('s_canvas', h.canvas.w+'×'+h.canvas.h + (h.canvas.tiles?'  ·  '+h.canvas.tiles+' tiles':''));
    if(h.decoder){ set('decoder', h.decoder); set('s_dec', h.decoder); } });
  es.addEventListener('snapshot', e => { const d=JSON.parse(e.data), rx=d.rx||{}, uq=d.udp_q||{};

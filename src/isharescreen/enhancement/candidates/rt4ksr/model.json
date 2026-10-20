@@ -1,0 +1,30 @@
+{
+  "id": "rt4ksr",
+  "label": "RT4KSR-S",
+  "scale": 2,
+  "repo": "eduardzamfir/RT4KSR",
+  "revision": "fd6627a48d789adf5d9aad29f02ab2a3d2a25296",
+  "license_id": "Apache-2.0",
+  "files": {
+    "source/model/arch.py": {
+      "url": "https://raw.githubusercontent.com/eduardzamfir/RT4KSR/fd6627a48d789adf5d9aad29f02ab2a3d2a25296/code/model/arch.py",
+      "sha256": "79b604979fb90611f5d484b4541c67f92974f83185fcbc95011a2865c41d0abf"
+    },
+    "source/model/modules.py": {
+      "url": "https://raw.githubusercontent.com/eduardzamfir/RT4KSR/fd6627a48d789adf5d9aad29f02ab2a3d2a25296/code/model/modules.py",
+      "sha256": "fa6261eba7106886de050ac55668bff858a7b32e0a6c97f43633311569c324ee"
+    },
+    "source/model/utils/rep_utils.py": {
+      "url": "https://raw.githubusercontent.com/eduardzamfir/RT4KSR/fd6627a48d789adf5d9aad29f02ab2a3d2a25296/code/model/utils/rep_utils.py",
+      "sha256": "2c8ed76bdd8c17f436b52e7c3face4e6cf452dc7a1683bcf616c459f0de0cf4a"
+    },
+    "LICENSE": {
+      "url": "https://raw.githubusercontent.com/eduardzamfir/RT4KSR/fd6627a48d789adf5d9aad29f02ab2a3d2a25296/LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    "weights.pth": {
+      "url": "https://raw.githubusercontent.com/eduardzamfir/RT4KSR/fd6627a48d789adf5d9aad29f02ab2a3d2a25296/code/checkpoints/rt4ksr_x2.pth",
+      "sha256": "9ec7500092848a480e058a9c703e4b2254bc0cc97928c076bba272177752124f"
+    }
+  }
+}

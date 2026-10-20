@@ -28,7 +28,7 @@ def test_native_original_path_without_torch_or_opencv():
         import importlib.util
         import sys
 
-        blocked = {"torch", "cv2"}
+        blocked = {"torch", "cv2", "coremltools"}
         class NoML(importlib.abc.MetaPathFinder):
             def find_spec(self, fullname, path=None, target=None):
                 if fullname.split(".")[0] in blocked:

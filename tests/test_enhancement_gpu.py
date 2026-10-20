@@ -8,7 +8,11 @@ import pytest
 pytestmark = pytest.mark.skipif(os.environ.get("ISS_TEST_GPU") != "1",reason="Set ISS_TEST_GPU=1 for real GPU readback")
 
 
-def test_enhanced_rgb_bypass_crop_and_cursor():
+@pytest.mark.parametrize("fallback", [False, True])
+def test_enhanced_rgb_bypass_crop_and_cursor(monkeypatch, fallback):
+    if fallback:
+        import sys
+        monkeypatch.setitem(sys.modules, "cv2", None)
     import wgpu
     from isharescreen.frontend.desktop.gpu import Renderer
     from isharescreen.proxy.media.tiles import TileFrame
@@ -29,6 +33,15 @@ def test_enhanced_rgb_bypass_crop_and_cursor():
     enhanced=read()
     np.testing.assert_allclose(enhanced[16,8,:3],[17,83,149],atol=1)
     np.testing.assert_allclose(enhanced[16,56,:3],[40,180,20],atol=1)
+    staging = renderer._rgb_staging
+    replacement = rgb.copy()
+    replacement[:] = [90, 40, 170]
+    renderer.upload_enhanced(replacement)
+    assert renderer._rgb_staging is staging
+    replacement[:] = 0  # Upload must not retain caller-owned pixels.
+    np.testing.assert_allclose(read()[16,32,:3], [90,40,170], atol=1)
+    assert (staging[...,3] == 255).all()
+    renderer.upload_enhanced(rgb)
     renderer.set_source_rect((4,0,4,8))
     np.testing.assert_allclose(read()[16,32,:3],[40,180,20],atol=1)
     renderer.set_source_rect(None)
@@ -83,3 +96,68 @@ def test_real_hevc444_decoder_canvas_matches_original_shader(tmp_path):
     actual = np.frombuffer(device.queue.read_texture(
         {"texture":target}, {"bytes_per_row":256}, (64,64,1)), np.uint8).reshape(64,64,4)[...,:3]
     np.testing.assert_allclose(actual, expected, atol=1)
+
+
+@pytest.mark.skipif(os.environ.get("ISS_TEST_COREML") != "1", reason="Set ISS_TEST_COREML=1 for installed Core ML inference")
+@pytest.mark.parametrize("key,gpu_only", [(key, False) for key in ("quicksrnet", "plainusr-coreml", "rt4ksr-coreml", "efrlfn-coreml")]
+                         + [(key, True) for key in ("quicksrnet-torch", "plainusr", "rt4ksr", "efrlfn")])
+def test_real_model_worker_to_metal_renderer(key, gpu_only, monkeypatch):
+    """Exercise real canvas assembly, inference, upload/readback, and bypass."""
+    import time
+    import wgpu
+    from isharescreen.enhancement import coreml, variants
+    from isharescreen.enhancement.live import EnhancementDisplay, EnhancementWorker
+    from isharescreen.frontend.desktop.gpu import Renderer
+    from isharescreen.proxy.media.tiles import TileFrame
+
+    if gpu_only:
+        monkeypatch.setenv("ISS_SR_GPU_ONLY", "1")
+        monkeypatch.setenv("PYTORCH_ENABLE_MPS_FALLBACK", "0")
+    option = next(row for row in variants.availability() if row["id"] == key)
+    if not option["available"]:
+        pytest.skip(option["reason"])
+    adapter = variants.load(key)
+    captured = []
+
+    class Capture:
+        device, provenance = adapter.device, adapter.provenance
+
+        def __call__(self, rgb):
+            output, timing = adapter(rgb)
+            captured.append(output.copy())
+            return output, timing
+
+    device = wgpu.gpu.request_adapter_sync(power_preference="high-performance").request_device_sync()
+    renderer = Renderer(device, "rgba8unorm", 960, 540)
+    y = np.full((540, 960), 90, np.uint8).tobytes()
+    uv = np.full((540, 960), 128, np.uint8).tobytes()
+    tile = TileFrame(y, uv, uv, 960, 540, 960, 960, 960, 540)
+    renderer.upload_tile(0, tile, 540)
+    target = device.create_texture(size=(1920, 1080, 1), format="rgba8unorm",
+                                   usage=wgpu.TextureUsage.RENDER_ATTACHMENT | wgpu.TextureUsage.COPY_SRC)
+
+    def read():
+        renderer.draw(target.create_view(), 1920, 1080)
+        return np.frombuffer(device.queue.read_texture(
+            {"texture": target}, {"bytes_per_row": 1920*4}, (1920, 1080, 1)), np.uint8).reshape(1080, 1920, 4).copy()
+
+    baseline = read()
+    worker = EnhancementWorker(factory=lambda *args, **kwargs: Capture())
+    display = EnhancementDisplay(worker, renderer, 960, 540, 1)
+    try:
+        worker.select(key)
+        display.update_tile(0, tile, 540)
+        deadline = time.monotonic() + 30
+        while worker.snapshot()["displayed"] != key and time.monotonic() < deadline:
+            display.step()
+            assert worker.snapshot()["state"] != "error", worker.snapshot()["error"]
+            time.sleep(0.002)
+        assert worker.snapshot()["displayed"] == key
+        np.testing.assert_allclose(read()[..., :3], captured[-1], atol=1)
+        assert worker.snapshot()["timing_ms"]["assembly_ms"] >= 0
+        assert worker.snapshot()["display_upload_ms"] >= 0
+        worker.select("off")
+        display.step()
+        np.testing.assert_array_equal(read(), baseline)
+    finally:
+        worker.close()

@@ -1,0 +1,30 @@
+{
+  "id": "quicksrnet",
+  "label": "QuickSRNet-Small",
+  "scale": 2,
+  "repo": "quic/aimet-model-zoo",
+  "revision": "1bd2bf5b17cdda9251437c444009b29e1a25054b",
+  "license_id": "BSD-3-Clause",
+  "files": {
+    "source/models.py": {
+      "url": "https://raw.githubusercontent.com/quic/aimet-model-zoo/1bd2bf5b17cdda9251437c444009b29e1a25054b/aimet_zoo_torch/quicksrnet/model/models.py",
+      "sha256": "d79642c3d2580631f11e027ce3817d34551ce154d789812cf04aa0d4a5ccc189"
+    },
+    "source/blocks.py": {
+      "url": "https://raw.githubusercontent.com/quic/aimet-model-zoo/1bd2bf5b17cdda9251437c444009b29e1a25054b/aimet_zoo_torch/quicksrnet/model/blocks.py",
+      "sha256": "2d058eb1a78da4302a19139bc7631097a23c997597343065b0974562165f7885"
+    },
+    "source/imresize.py": {
+      "url": "https://raw.githubusercontent.com/quic/aimet-model-zoo/1bd2bf5b17cdda9251437c444009b29e1a25054b/aimet_zoo_torch/quicksrnet/model/imresize.py",
+      "sha256": "8ce78439e4fae1f47364130548ec9afae5f0f73518513c809ce57c0575e62a7f"
+    },
+    "LICENSE": {
+      "url": "https://raw.githubusercontent.com/quic/aimet-model-zoo/1bd2bf5b17cdda9251437c444009b29e1a25054b/LICENSE.md",
+      "sha256": "3d7f7841688ba4c69892be4df5dd7a2c114d3ac8b2113953a6e3a35d7f86c657"
+    },
+    "weights.pth": {
+      "url": "https://github.com/quic/aimet-model-zoo/releases/download/phase_2_january_artifacts/quicksrnet_small_2x_checkpoint_float32.pth.tar",
+      "sha256": "d95d70f1d2366cb9c28d99f8c7aa5bb07e1ffeaf5d7e30d9c66ab0fa28c6d0f8"
+    }
+  }
+}

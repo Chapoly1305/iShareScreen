@@ -1,0 +1,22 @@
+{
+  "id": "casr",
+  "label": "CASR",
+  "scale": 4,
+  "repo": "rlghksdbs/CASR",
+  "revision": "2b0554a3a045edd0217bc8a41e8481620003396b",
+  "license_id": "Unspecified",
+  "files": {
+    "source/source/models/RepNetworkPlain.py": {
+      "url": "https://raw.githubusercontent.com/rlghksdbs/CASR/2b0554a3a045edd0217bc8a41e8481620003396b/source/models/RepNetworkPlain.py",
+      "sha256": "7e73391e97ee303cde2bbcfcc33a2df5ed72026143095eafe58bd16971da0fea"
+    },
+    "source/source/models/RepConv_block.py": {
+      "url": "https://raw.githubusercontent.com/rlghksdbs/CASR/2b0554a3a045edd0217bc8a41e8481620003396b/source/models/RepConv_block.py",
+      "sha256": "1cb452f08945be00f802690bebce0f2db593d0c4d3c1db9316956d2372164db3"
+    },
+    "weights.pth": {
+      "url": "https://raw.githubusercontent.com/rlghksdbs/CASR/2b0554a3a045edd0217bc8a41e8481620003396b/pretrained_models/finetune_22_8118/RepNetwork_V012_BestStruct_x4_p384_m1_c32_gelu_l2_adamw_lr5e-05_e800_t2024-0328-0147_26_7332/models/model_x4_best_submission_deploy.pt",
+      "sha256": "98e3460e7b91bfed57b1cddeea505b8a24db228caf3fd47d73323fa40ee97fa5"
+    }
+  }
+}

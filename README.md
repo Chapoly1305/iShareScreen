@@ -118,11 +118,20 @@ echo "$PASSWORD" | iss --headless --host mac.local -u me --password-stdin --auto
 
 ## Optional video enhancement
 
-The native desktop viewer can apply pretrained ×2 upscaling after decoding.
+The native desktop viewer can apply pretrained or fine-tuned ×2 upscaling after decoding.
 After connecting, use **Video enhancement → Display model** in Diagnostics to
 select an installed model or return to **Original (native scaling)**.
 Enhancement dependencies and model downloads are optional; browser playback and
 the ordinary viewer installation are unchanged.
+
+Enable **Super-resolution evaluation** in the connection form for a fixed 540p
+input with dynamic resolution disabled and GPU-only PyTorch inference. CPU
+fallback, CPU baselines and Core ML are disabled in this profile. Switch
+pretrained and installed fine-tuned variants without reconnecting; see the setup
+guide for weight export.
+On macOS, optional QuickSRNet-Small, PlainUSR-U, RT4KSR-S and EfRLFN backends
+provide lightweight pretrained alternatives, including validated Core ML
+conversions for non-strict fixed-540p sessions; see the same setup guide.
 
 See [setup and runtime architecture](docs/video-enhancement.md) and the
 [recorded-video evaluation tools](benchmarks/super_resolution/README.md).
