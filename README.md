@@ -127,8 +127,8 @@ the ordinary viewer installation are unchanged.
 See [setup and runtime architecture](docs/video-enhancement.md) and the
 [recorded-video evaluation tools](benchmarks/super_resolution/README.md).
 Evaluation uses paired PSNR, SSIM and LPIPS; offline timings are not client FPS.
-See the [pretrained evaluation results](benchmarks/super_resolution/RESULTS.md)
-for complete recorded-video comparisons and hardware-specific processing times.
+See the [fine-tuning results](benchmarks/super_resolution/RESULTS.md)
+for pretrained/fine-tuned quality scores, curves and comparison media.
 
 ## License
 

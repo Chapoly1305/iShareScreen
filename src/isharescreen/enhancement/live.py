@@ -6,12 +6,39 @@ import logging
 import os
 import threading
 import time
+from typing import NamedTuple
 
 import numpy as np
 
 from .models import Upscaler, availability
+from ..proxy.media.tiles import TileFrame
 
 log = logging.getLogger(__name__)
+
+
+class CanvasSnapshot(NamedTuple):
+    """Immutable tile references captured on the render thread."""
+
+    width: int
+    height: int
+    tiles: tuple[tuple[TileFrame, int], ...]
+
+
+class FrameRequest(NamedTuple):
+    """One replaceable request, owned by a control/geometry generation."""
+
+    generation: int
+    submitted_at: float
+    frame: CanvasSnapshot | np.ndarray
+
+
+class EnhancedFrame(NamedTuple):
+    """CPU RGB result; only the render thread may upload it to a texture."""
+
+    generation: int
+    model: str
+    rgb: np.ndarray
+    timing: dict[str, float]
 
 
 def tile_rgb(tile):
@@ -49,7 +76,7 @@ class TileCanvas:
     def snapshot(self):
         if len(self.tiles) != self.num_tiles:
             return None
-        return (self.width, self.height, tuple(self.tiles[i] for i in range(self.num_tiles)))
+        return CanvasSnapshot(self.width, self.height, tuple(self.tiles[i] for i in range(self.num_tiles)))
 
 
 def compose(snapshot):
@@ -64,10 +91,17 @@ def compose(snapshot):
 
 
 class EnhancementWorker:
+    """Single inference thread with one pending request and one consumable result.
+
+    Model selection, canvas replacement and shutdown invalidate generations.
+    Neither late results nor late errors may affect a newer generation. Model
+    construction and inference never hold the control condition lock.
+    """
+
     def __init__(self, device="auto", factory=Upscaler):
         self.device, self.factory = device, factory
         self._cv = threading.Condition()
-        self._selected, self._epoch, self._pending, self._result = "off", 0, None, None
+        self._selected, self._generation, self._pending, self._result = "off", 0, None, None
         self._closed = False
         self._options = availability()
         self._stats = {"selected":"off", "active":"off", "displayed":"off", "state":"bypass",
@@ -85,7 +119,7 @@ class EnhancementWorker:
             if key == self._selected:
                 return
             self._selected = key
-            self._epoch += 1
+            self._generation += 1
             self._pending = self._result = None
             self._latencies.clear()
             self._stats.update(selected=key, active="off", displayed="off",
@@ -96,7 +130,7 @@ class EnhancementWorker:
     def invalidate(self):
         """Discard in-flight old-geometry output after a canvas rebuild."""
         with self._cv:
-            self._epoch += 1
+            self._generation += 1
             self._pending = self._result = None
             self._latencies.clear()
             self._stats.update(displayed="off",last_ms=None,age_ms=None)
@@ -109,43 +143,46 @@ class EnhancementWorker:
             if self._pending is not None:
                 self._stats["dropped"] += 1
             # TileFrames own immutable byte buffers; retaining a snapshot is cheap.
-            self._pending = (self._epoch, time.monotonic(), frame)
+            self._pending = FrameRequest(self._generation, time.monotonic(), frame)
             self._stats["submitted"] += 1
             self._cv.notify_all()
 
     def poll(self):
         with self._cv:
             result, self._result = self._result, None
-            if result is None or result[0] != self._epoch:
+            if result is None or result.generation != self._generation:
                 return None
             return result
 
-    def displayed(self, epoch, key):
+    def displayed(self, generation, key):
         """Confirm presentation only if the control state still owns this output."""
         with self._cv:
-            if (not self._closed and epoch == self._epoch and key == self._selected
+            if (not self._closed and generation == self._generation and key == self._selected
                     and self._stats["state"] != "error"):
                 self._stats["displayed"] = key
                 return True
             return False
 
-    def fail(self, error):
-        """Render-thread upload failure also restores the original path."""
+    def fail(self, error, generation=None):
+        """Fail only the generation that owns a render-thread upload error."""
         with self._cv:
-            self._epoch += 1
+            if self._closed or (generation is not None and generation != self._generation):
+                return False
+            self._generation += 1
             self._pending = self._result = None
             self._stats.update(state="error",active="off",displayed="off",error=str(error))
+            return True
 
     def snapshot(self):
         with self._cv:
-            return dict(self._stats, options=self._options, pending=int(self._pending is not None),
-                        generation=self._epoch,
+            return dict(self._stats, options=[dict(option) for option in self._options], pending=int(self._pending is not None),
+                        generation=self._generation,
                         p50_ms=float(np.median(self._latencies)) if self._latencies else None)
 
     def close(self):
         with self._cv:
             self._closed = True
-            self._epoch += 1
+            self._generation += 1
             self._pending = self._result = None
             self._stats.update(state="closed", active="off", displayed="off")
             self._cv.notify_all()
@@ -158,7 +195,7 @@ class EnhancementWorker:
                 self._cv.wait_for(lambda: self._closed or self._pending is not None or self._selected != loaded)
                 if self._closed:
                     return
-                epoch, key = self._epoch, self._selected
+                generation, key = self._generation, self._selected
                 item, self._pending = self._pending, None
             try:
                 if key != loaded:
@@ -172,7 +209,7 @@ class EnhancementWorker:
                     with self._cv:
                         if self._closed:
                             return
-                        if epoch == self._epoch:
+                        if generation == self._generation:
                             self._stats.update(active=key, state="bypass" if key == "off" else "ready")
                             # Loading may take seconds. Start with the latest
                             # canvas that arrived during loading, rather than
@@ -181,27 +218,27 @@ class EnhancementWorker:
                                 if item is not None:
                                     self._stats["dropped"] += 1
                                 item, self._pending = self._pending, None
-                if item is None or key == "off" or item[0] != epoch:
+                if item is None or key == "off" or item.generation != generation:
                     continue
                 with self._cv:
                     if self._closed:
                         return
-                    if epoch != self._epoch:
+                    if generation != self._generation:
                         continue  # Selection/geometry changed during cold loading.
                 started = time.monotonic()
-                frame = item[2]
+                frame = item.frame
                 rgb = compose(frame) if isinstance(frame, tuple) else frame
                 with self._cv:
                     if self._closed:
                         return
-                    if epoch != self._epoch:
+                    if generation != self._generation:
                         continue  # Canvas assembly also runs outside the control lock.
                 out, timing = model(rgb)
                 timing["assembly_and_processing_ms"] = (time.monotonic()-started)*1000
-                timing["age_ms"] = (time.monotonic()-item[1])*1000
+                timing["age_ms"] = (time.monotonic()-item.submitted_at)*1000
                 with self._cv:
-                    if not self._closed and epoch == self._epoch and self._stats["state"] != "error":
-                        self._result = (epoch, key, out, timing)
+                    if not self._closed and generation == self._generation and self._stats["state"] != "error":
+                        self._result = EnhancedFrame(generation, key, out, timing)
                         self._stats.update(active=key, state="ready", last_ms=timing["assembly_and_processing_ms"],
                                            age_ms=timing["age_ms"], device=getattr(model,"device",self.device))
                         self._stats["processed"] += 1
@@ -209,7 +246,7 @@ class EnhancementWorker:
             except Exception as exc:
                 log.exception("enhancement %s failed", key)
                 with self._cv:
-                    if not self._closed and epoch == self._epoch:
+                    if not self._closed and generation == self._generation:
                         # Do not spin/retry a broken model on every render iteration.
                         self._stats.update(state="error", active="off", displayed="off", error=str(exc))
                         self._pending = self._result = None
@@ -217,7 +254,7 @@ class EnhancementWorker:
 
 
 class EnhancementDisplay:
-    """Render-thread bridge shared by the real session and offline preview."""
+    """Render-thread bridge between decoded tiles, inference and presentation."""
 
     def __init__(self, worker, renderer, width, height, num_tiles):
         self.worker, self.renderer = worker, renderer
@@ -255,8 +292,8 @@ class EnhancementDisplay:
         result = self.worker.poll()
         if result is None:
             return selection_changed or error_changed
-        epoch, key, rgb, timing = result
-        if self.worker.snapshot()["generation"] != epoch:
+        generation, key, rgb, timing = result
+        if self.worker.snapshot()["generation"] != generation:
             self.renderer.clear_enhancement()
             return True
         started = time.perf_counter()
@@ -264,12 +301,12 @@ class EnhancementDisplay:
             self.renderer.upload_enhanced(rgb)
             # Controls stay responsive during potentially slow GPU allocation.
             # If selection/geometry changed during upload, bypass before draw.
-            if not self.worker.displayed(epoch, key):
+            if not self.worker.displayed(generation, key):
                 self.renderer.clear_enhancement()
         except Exception as exc:
             log.exception("enhancement output upload failed")
             self.renderer.clear_enhancement()
-            self.worker.fail(exc)
+            self.worker.fail(exc, generation=generation)
         log.debug("enhancement %s processing %.2fms, display upload enqueue %.2fms",
                   key, timing["assembly_and_processing_ms"],
                   (time.perf_counter() - started) * 1000)

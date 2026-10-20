@@ -18,7 +18,7 @@ import av
 import numpy as np
 import torch
 
-from benchmarks.super_resolution.benchmark import metrics
+from benchmarks.super_resolution.metrics import metrics
 from benchmarks.super_resolution.video_report import audit
 from isharescreen.enhancement.models import sha256
 
@@ -349,9 +349,8 @@ def main():
         (args.output/"summary.json").write_text(json.dumps(summary,indent=2))
         audit_scores(list(csv.DictReader((args.output/"quality.csv").open())),
                      json.loads((args.output/"summary.json").read_text()),expected_by_key)
-        lines=["# Recorded-video reconstruction quality", "", "## Material Passport", "",
-            "- Version Label: recorded_video_rgb_lpips_v1", "", "## Experiment Result", "",
-            "- Type: analysis", "- Status: completed", f"- Command: `{' '.join(sys.argv)}`",
+        lines=["# Recorded-video reconstruction quality", "", "## Evaluation", "",
+            f"- Command: `{' '.join(sys.argv)}`",
             f"- Device for metric computation: {device}; not the SR producer's performance device.",
             f"- Coverage: {len(manifest['clips'])} complete clips; {len(rows)} sampled model/frame measurements.",
             "- No SR model was rerun. Every output was decoded in full for count/timestamp checks.",

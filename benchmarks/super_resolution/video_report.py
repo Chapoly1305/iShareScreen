@@ -97,9 +97,7 @@ def main():
             print(f"COMPARISON {output}",flush=True)
         (args.comparisons/"manifest.json").write_text(json.dumps(comparisons,indent=2))
     models=[m for m,s in done["status"].items() if s["state"]=="completed"]
-    lines=["# Complete recorded-video pretrained comparison", "", "## Material Passport", "",
-           "- Verification Status: ANALYZED (complete video outputs and sampled metrics audited)",
-           "- Version Label: recorded_video_full709_v1", "",
+    lines=["# Complete recorded-video pretrained comparison", "",
            f"Input clips: {len(manifest['clips'])}; source frames: {sum(c['frames'] for c in manifest['clips'])}.",
            f"All clips are complete 1920×1080 recordings at native frame rates. LR input is continuous",
            "960×540 HEVC RExt 4:4:4 CRF 28 with inter-frame prediction, full-range BT.709, Lanczos reduction.",

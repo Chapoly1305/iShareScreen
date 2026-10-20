@@ -1,0 +1,8 @@
+# Optional local dataset-curation environment; not a viewer dependency.
+fiftyone==1.22.1
+torch==2.6.0
+torchvision==0.21.0
+numpy==1.26.4
+Pillow==12.2.0
+av==18.1.0
+pytest>=8,<9

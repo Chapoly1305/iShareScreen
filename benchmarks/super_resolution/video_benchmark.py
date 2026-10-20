@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 import torch
 
-from benchmarks.super_resolution.benchmark import metrics
+from benchmarks.super_resolution.metrics import metrics
 from isharescreen.enhancement.models import Upscaler, availability, REPOS, project_home, sha256
 
 

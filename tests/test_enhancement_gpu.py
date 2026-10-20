@@ -47,7 +47,8 @@ def test_real_hevc444_decoder_canvas_matches_original_shader(tmp_path):
     import subprocess
     Image = pytest.importorskip("PIL.Image")
     import wgpu
-    from benchmarks.super_resolution.preview import load_preview_tile
+    import av
+    from isharescreen.proxy.media.decode_common import _av_frame_to_tile
     from isharescreen.enhancement.live import TileCanvas, compose
     from isharescreen.frontend.desktop.gpu import Renderer
     ffmpeg = shutil.which("ffmpeg")
@@ -64,7 +65,11 @@ def test_real_hevc444_decoder_canvas_matches_original_shader(tmp_path):
         "-c:v", "libx265", "-pix_fmt", "yuv444p", "-crf", "18",
         "-x265-params", "pools=1:frame-threads=1:log-level=error", str(encoded),
     ], check=True, capture_output=True)
-    tile = load_preview_tile(encoded)
+    with av.open(str(encoded)) as container:
+        frame = next(container.decode(video=0))
+        assert frame.colorspace == 1 and frame.color_range == 2
+        tile, had_error = _av_frame_to_tile(frame, [None], set())
+    assert tile is not None and not had_error
     assert tile.is_yuv444 and (tile.width, tile.height) == (64, 64)
     canvas = TileCanvas(64, 64, 1)
     canvas.update(0, tile, 64)
