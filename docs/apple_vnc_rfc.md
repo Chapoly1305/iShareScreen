@@ -240,14 +240,31 @@ The record layer is AES-128 throughout. The `conf+int=ChaCha20-Poly1305` token i
 
 #### 4.2.5 Type 35: Kerberos GSS-API
 
-Not present in available captures; the framing below is a revision gap pending a type-35 capture.
+Not present in available captures. iShareScreen now implements this branch
+following `Chapoly1305/libvncserver`'s `HandleARDAuth35`; full interoperability
+remains unverified pending a type-35 capture/live connection.
 
 - **Selector / branch entry**: `0x23` followed by a 32-bit zero word; the server replies with a 32-bit word.
 - **Transcript**: client length-prefixed GSS `AP-REQ` token (Kerberos V5 GSS mechanism OID `1.2.840.113554.1.2.2`, inner `APPLICATION 14`); server length-prefixed `AP-REP` (`APPLICATION 15`); server short per-message token with wrap prefix `05 04`.
-- **Completion order**: a branch-local terminal 32-bit zero word, then the standard RFB `SecurityResult` (`u32 = 0`), then ClientInit. The terminal zero word does **not** replace SecurityResult.
+- **Completion order**: the reference implementation reads one standard RFB `SecurityResult` (`u32 = 0`) after the wrap token, then sends ClientInit. iShareScreen follows that sequence. The earlier hypothesis of an additional terminal zero word is not supported by this reference and remains unverified on the wire.
 - **Key derivation / initial wrap key**: on Kerberos success the server **generates a fresh random 16-byte AES key** (`AuthGetRandomBytes` ← `/dev/random`), installs it as the record-layer key, and **sends it to the viewer over the GSS-protected channel** (logged `CCCryptorCreate AESkeySend`); it does **not** derive the key from the GSS context. The GSS handling consumes an already-established/imported context (`KerberosServerAuthenticate`, `sub_10004b86c` → `gss_export_sec_context` + `bootstrap_look_up com.apple.RemoteDesktop.PrivilegeHelper`); there is no live `gss_accept_sec_context` in screensharingd. The bracketing zero-words / SecurityResult placement remain a revision gap.
 - **Token framing note**: the bracketing 32-bit zero words are application-level framing, not GSS-API protocol elements; the server-side division of labor between the VNC server process and any system GSS service is not characterized here.
 - **Error behavior**: MUST close on GSS failure or non-zero SecurityResult.
+
+The client first tries cached initiating credentials. On macOS, if these are
+unavailable and a password was supplied, it calls `gss_aapl_initial_cred`
+with `kGSSICLKDCHostname` set to the original hostname. Linux uses the system
+GSS library and requires cached tickets. Unlike the reference's lucid-key
+fallback, iShareScreen accepts only a confidential GSS wrap containing the
+16-byte server-generated key; a Kerberos context key is not substituted for
+the Apple record-layer key.
+
+With a short username and no explicit realm or qualified principal, the
+client discovers the target's LKDC realm using a canonicalizing AS-REQ for
+`WELLKNOWN:COM.APPLE.LKDC` on TCP/UDP 88. Apple's KDC responds with
+`KDC_ERR_WRONG_REALM` (68) and the real realm in `KRB-ERROR.crealm`. No
+password is included in this probe. The discovered realm is then used for
+the client principal and default `vnc/REALM@REALM` service principal.
 
 #### 4.2.6 Type 36: Direct SRP
 

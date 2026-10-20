@@ -2,7 +2,7 @@
 
 Sequence (per Apple HP-mode RE):
     1. Open TCP, run version + security-types preamble
-    2. Auth: SRP with non-SRP RSA1+AES fallback
+    2. Auth: SRP with non-SRP RSA1+AES fallback, or explicit Kerberos
     3. ClientInit + ServerInit
     4. Plaintext: ViewerInfo + Apple 0x12 follow-up
     5. Plaintext: VirtualDisplay + first SetEncodings
@@ -222,7 +222,7 @@ _AuthFunc = Callable[[socket.socket, str, str], bytes]
 
 
 def _open_socket_and_handshake(
-    host: str, port: int, recorder=None,
+    host: str, port: int, recorder=None, security_type: int = 33,
 ) -> socket.socket:
     """TCP connect + RFB version + security-types preamble. Leaves the socket
     positioned right before c2s1.
@@ -236,16 +236,34 @@ def _open_socket_and_handshake(
         sock = recorder.wrap_tcp(sock)
     sock.settimeout(15)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    do_protocol_handshake(sock)
+    try:
+        offered = do_protocol_handshake(sock)
+        if security_type not in offered:
+            raise AuthError(f"Server does not offer RFB security type {security_type}")
+    except Exception:
+        sock.close()
+        raise
     return sock
 
 
 def _phase_auth(
     host: str, port: int, username: str, password: str, mode: str,
-    recorder=None,
+    recorder=None, *, krb_host="", krb_realm="", krb_principal="", krb_service="",
 ) -> tuple[socket.socket, bytes]:
     """Open TCP, run auth (with fallback on AuthError), return live socket
     and the 16-byte enc1103 master key."""
+    if mode == "kerberos":
+        from .kerberos import do_kerberos_auth
+        sock = _open_socket_and_handshake(host, port, recorder, security_type=35)
+        try:
+            key = do_kerberos_auth(sock, username, password, host=krb_host or host,
+                                    realm=krb_realm, principal=krb_principal, service=krb_service)
+            return sock, key
+        except Exception:
+            sock.close()
+            raise
+    if mode not in ("srp", "nonsrp"):
+        raise AuthError(f"Unknown authentication mode: {mode}")
     primary, fallback = (
         (do_srp_auth, do_nonsrp_auth) if mode == "srp"
         else (do_nonsrp_auth, do_srp_auth)
@@ -260,9 +278,16 @@ def _phase_auth(
             primary.__name__, e, fallback.__name__,
         )
         sock.close()
+    except Exception:
+        sock.close()
+        raise
 
     sock = _open_socket_and_handshake(host, port, recorder)
-    return sock, fallback(sock, username, password)
+    try:
+        return sock, fallback(sock, username, password)
+    except Exception:
+        sock.close()
+        raise
 
 
 # ── phase 2: ClientInit + ServerInit ──────────────────────────────────
@@ -675,6 +700,10 @@ def connect_and_negotiate(
     password: str,
     *,
     auth_mode: str = "srp",
+    krb_host: str = "",
+    krb_realm: str = "",
+    krb_principal: str = "",
+    krb_service: str = "",
     advertise: Optional[AdvertiseDims] = None,
     hdr: bool = False,
     curtain: bool = True,
@@ -714,8 +743,10 @@ def connect_and_negotiate(
 
     advertise = advertise or AdvertiseDims()
 
+    auth_options = dict(krb_host=krb_host, krb_realm=krb_realm,
+                        krb_principal=krb_principal, krb_service=krb_service)
     sock, ecb_key = _phase_auth(host, port, username, password, auth_mode,
-                                recorder)
+                                recorder, **auth_options)
     server_w, server_h = _phase_client_init(sock)
 
     # Auto-detect the SessionSelect prompt rather than requiring a pre-set
@@ -747,13 +778,17 @@ def connect_and_negotiate(
         # cmd=0 share-console only needs one TCP — no encrypted creds
         # to worry about — so it skips this dance.
         if alt_session:
+            if not password:
+                sock.close()
+                raise AuthError("Starting a separate user session requires a password; "
+                                "enter one or save it in the system credential store")
             log.info("alt-session: closing conn1, opening conn2 for cmd=2")
             try:
                 sock.close()
             except Exception:
                 pass
             sock, ecb_key = _phase_auth(host, port, username, password,
-                                        auth_mode, recorder)
+                                        auth_mode, recorder, **auth_options)
             server_w, server_h = _phase_client_init(sock)
 
         # Read the (re-)issued SessionSelect prompt and send our cmd

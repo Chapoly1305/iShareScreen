@@ -97,7 +97,9 @@ Opens the terminal UI: a connect form for host / username / password
 (masked) and resolution, then a live session view with per-tile fps and
 loss, throughput, UDP queue health, and a log tail. The actual screen
 streams in a separate window. Last-session values pre-fill the form on
-the next launch; passwords are never persisted.
+the next launch. Passwords are saved only when you enable **Remember password
+in system credential store**, and are kept in the OS credential store rather
+than the connection profile. Leave the password blank on later connections.
 
 Any flag accepted by `iss --headless` also pre-fills the form, so
 launchers can do:
@@ -115,6 +117,69 @@ For CI / scripted use:
 ```sh
 echo "$PASSWORD" | iss --headless --host mac.local -u me --password-stdin --auto-quit-secs 30
 ```
+
+### Saved passwords and Kerberos
+
+To save a password after the first successful connection, then reuse it:
+
+```sh
+iss --host mac.local -u me --remember-password  # prompts once in a terminal
+iss --host mac.local -u me                    # reads the saved password
+iss --host mac.local -u me --forget-password  # deletes this endpoint/account's password
+```
+
+The store is macOS Keychain, Windows Credential Manager, or Linux Secret
+Service (for example GNOME Keyring, with an unlocked desktop D-Bus session).
+There is no plaintext-file fallback. Entries are scoped to host, TCP port and
+username; hostname and IP aliases remain separate entries. `--password-stdin`
+overrides a saved password, and `--no-keyring` bypasses the store entirely.
+First access or a locked store may require a system authorization prompt.
+Replacing an outdated saved password requires entering the new password and
+enabling **Remember password** again.
+
+The **Authentication** selector also supports **Kerberos**, using Apple RFB
+security type 35. It reuses cached tickets first. On macOS, supplying a
+password also permits initial ticket acquisition through Apple's
+`gss_aapl_initial_cred` / LKDC API, following the
+[libvncserver example](https://github.com/Chapoly1305/libvncserver/blob/applevnchp-dev/examples/client/applehpdebug.c)
+and its [authentication implementation](https://github.com/Chapoly1305/libvncserver/blob/applevnchp-dev/src/libvncclient/ard.c).
+
+```sh
+# Existing Kerberos tickets; no password or credential-store access:
+iss --host mac.example.com -u me --auth kerberos --no-keyring \
+    --krb-realm EXAMPLE.COM --krb-service vnc/mac.example.com@EXAMPLE.COM
+
+# macOS LKDC: first connection; discover the realm and acquire tickets.
+# At a terminal --password-stdin prompts without echoing the password.
+iss --host mac.local -u me --auth kerberos \
+    --password-stdin --remember-password
+
+# Later connections: reuse tickets, or reacquire using the saved password.
+iss --host mac.local -u me --auth kerberos
+```
+
+`--krb-principal` overrides the client identity (otherwise `user@realm`). The
+default service is `vnc@host`, or `vnc/REALM@REALM` for an LKDC realm. The
+original hostname is retained for service identity even when transport uses
+a resolved IPv4 address. With a short username and no explicit realm/principal,
+the client discovers the remote Mac's LKDC realm via a password-free AS-REQ
+to TCP/UDP 88, before acquiring credentials. No SSH or prior desktop login is
+needed. In the connect form, enter the host, username and Mac account
+password on the first connection; realm and principal configuration is automatic.
+Fully qualified client/service principals or an explicit realm override
+discovery; use these for conventional domain KDCs. If cached credentials
+cannot produce a service ticket, macOS retries acquisition once with an
+available password before sending the RFB AP-REQ. Linux Kerberos
+requires `libgssapi-krb5` and tickets acquired beforehand, such as with
+`kinit`; this Kerberos backend is unavailable on Windows. Kerberos failures
+do not fall back to password authentication. Starting a separate user's
+desktop still requires a password for Apple's SessionSelect message, even
+when Kerberos authenticates the connection.
+
+Validation covers the native macOS credential-store round trip, native GSS
+library/name handling, live remote LKDC realm discovery, and simulated
+type-35 framing and error paths. A full
+Kerberos connection to a real Screen Sharing host remains to be verified.
 
 ## License
 

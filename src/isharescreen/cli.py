@@ -15,7 +15,7 @@ Modes:
 Password input, in order of precedence:
   ``--password-stdin`` (read the first line of stdin — the
   recommended unattended path: ``echo "$PW" | iss ... --password-stdin``).
-  Otherwise the connect prompt asks for it interactively via getpass.
+  Otherwise try the system credential store, then getpass on a terminal.
 
 There is no ``-p`` / ``--password`` flag on purpose — anything in argv
 shows up in ``ps`` and shell history.
@@ -99,11 +99,21 @@ def _make_parser() -> argparse.ArgumentParser:
         "--password-stdin", action="store_true",
         help="read password from the first line of stdin",
     )
+    secrets = g.add_mutually_exclusive_group()
+    secrets.add_argument("--remember-password", action="store_true",
+                         help="save password in the system credential store after successful login")
+    secrets.add_argument("--no-keyring", action="store_true",
+                         help="do not read or write the system credential store")
+    secrets.add_argument("--forget-password", action="store_true",
+                         help="delete the saved password for host/port/user and exit")
     g.add_argument("--port", type=int, default=5900, help="TCP port (default 5900)")
     g.add_argument(
-        "--auth", choices=("srp", "nonsrp"), default="srp",
-        help="authentication mode (default srp; falls back to nonsrp on rejection)",
+        "--auth", choices=("srp", "nonsrp", "kerberos"), default="srp",
+        help="srp (default), nonsrp, or kerberos (cached tickets; no password fallback)",
     )
+    g.add_argument("--krb-realm", default="", help="Kerberos realm; omitted = discover the target Mac's LKDC realm")
+    g.add_argument("--krb-principal", default="", help="Kerberos client principal; defaults to user[@realm]")
+    g.add_argument("--krb-service", default="", help="Kerberos service principal; defaults to vnc@host or vnc/REALM@REALM for LKDC")
     g.add_argument(
         "--frontend", choices=("browser", "desktop"), default="browser",
         help="browser = WebTransport+WebCodecs in a browser tab, H.264 "
@@ -357,12 +367,22 @@ def _setup_logging(args: argparse.Namespace) -> None:
 # ── config build ─────────────────────────────────────────────────────
 
 def _build_session_config(args: argparse.Namespace) -> SessionConfig:
-    """Build a SessionConfig from CLI flags. Requires every input to come
-    from a flag (no stdin/terminal prompts) -- this entry point serves
-    `iss --headless` (CI / scripted smoke) and the TUI's spawned child
-    viewer, both of which always pass the full set of flags. Interactive
-    use goes through `isharescreen.tui` instead."""
+    """Resolve CLI input or saved credentials. Prompt only on a terminal,
+    when password authentication was requested without --password-stdin."""
+    from . import credentials
+    if not args.host or not args.user:
+        raise SystemExit("--host and -u/--user are required (run plain `iss` for the connect GUI)")
+    if not 1 <= args.port <= 65535:
+        raise SystemExit("--port must be between 1 and 65535")
     cli_password = _password_from_args(args)
+    if not cli_password and not args.no_keyring:
+        try:
+            cli_password = credentials.get_password(args.host, args.port, args.user)
+        except credentials.CredentialStoreError as error:
+            log.warning("%s", error)
+    if not cli_password and args.auth != "kerberos" and not args.password_stdin and sys.stdin.isatty():
+        import getpass
+        cli_password = getpass.getpass("password: ")
     cli_advertise = _parse_advertise(args.advertise)
     # For a fixed --advertise WxH, the --hidpi mode determines the backing
     # scale. 'on'/'off' are display-independent so we resolve them here
@@ -388,21 +408,19 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
     dynamic_resolution = (
         args.dynamic if args.dynamic is not None else cli_advertise is None
     )
-    missing = [
-        label for label, value in
-        (("--host", args.host), ("-u/--user", args.user),
-         ("--password-stdin", cli_password))
-        if not value
-    ]
-    if missing:
+    if not cli_password and args.auth != "kerberos":
         raise SystemExit(
-            "missing required arg(s): " + ", ".join(missing) +
-            " (run plain `iss` for the interactive connect GUI)"
+            "No password supplied or saved; enter one, use --password-stdin, "
+            "or run plain `iss` for the connect GUI"
         )
     return SessionConfig(
         host=args.host, port=args.port,
         username=args.user, password=cli_password or "",
         auth_mode=args.auth,
+        krb_realm=args.krb_realm, krb_principal=args.krb_principal, krb_service=args.krb_service,
+        on_authenticated=(credentials.save_after_auth(
+            args.host, args.port, args.user, cli_password
+        ) if args.remember_password and cli_password else None),
         advertise=cli_advertise,
         dynamic_resolution=dynamic_resolution,
         hdr=args.hdr,
@@ -524,6 +542,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         from .proxy.media import registry
         print(registry.describe())
         return 0
+    if args.forget_password:
+        from . import credentials
+        if not args.host or not args.user:
+            raise SystemExit("--forget-password requires --host and -u/--user")
+        if not 1 <= args.port <= 65535:
+            raise SystemExit("--port must be between 1 and 65535")
+        try:
+            credentials.delete_password(args.host, args.port, args.user)
+        except credentials.CredentialStoreError as error:
+            log.error("%s", error)
+            return 1
+        log.info("Saved password removed (if present)")
+        return 0
     # `--decoder` feeds the registry override via the env var session.py reads
     # (keeps the protocol layer free of a CLI dependency).
     if getattr(args, "decoder", "auto") and args.decoder != "auto":
@@ -566,7 +597,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         # no traceback even in --verbose, distinct exit code.
         from isharescreen.proxy.protocol.auth import AuthError
         if isinstance(e, AuthError):
-            log.error("authentication failed — check username and password")
+            log.error("authentication failed: %s", e)
             return 2
         log.error("fatal: %s", e)
         if args.verbose:

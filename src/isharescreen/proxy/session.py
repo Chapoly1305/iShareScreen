@@ -215,7 +215,7 @@ class SessionConfig:
     username: str
     password: str
     port: int = 5900
-    auth_mode: Literal["srp", "nonsrp"] = "srp"
+    auth_mode: Literal["srp", "nonsrp", "kerberos"] = "srp"
     advertise: Optional[AdvertiseDims] = None
     hdr: bool = False
     audio: bool = True
@@ -309,6 +309,13 @@ class SessionConfig:
     # Editable startup offer. None uses the existing ISS_* environment choices.
     # Session snapshots it at construction; this is not a live control API.
     media_offer: Optional[MediaOfferConfig] = field(default=None, kw_only=True)
+
+    # Credential persistence is supplied by the launcher, after successful
+    # negotiation. These remain last to preserve existing positional callers.
+    on_authenticated: Optional[Callable[[], None]] = None
+    krb_realm: str = ""
+    krb_principal: str = ""
+    krb_service: str = ""
 
 # ── internal RTP packet group ────────────────────────────────────────
 
@@ -1412,6 +1419,8 @@ class Session:
         self._negotiation = connect_and_negotiate(
             self._dest_host, cfg.port, cfg.username, cfg.password,
             auth_mode=cfg.auth_mode,
+            krb_host=cfg.host, krb_realm=cfg.krb_realm,
+            krb_principal=cfg.krb_principal, krb_service=cfg.krb_service,
             advertise=cfg.advertise,
             hdr=cfg.hdr,
             curtain=cfg.curtain,
@@ -1422,6 +1431,8 @@ class Session:
             on_session_choice=cfg.on_session_choice,
             recorder=self._recorder,
         )
+        if cfg.on_authenticated is not None:
+            cfg.on_authenticated()
 
         # Persist the post-auth transport key next to the pcap (sibling
         # `.key` file) so the recorded session decodes without a wrapper.
