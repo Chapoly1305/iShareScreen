@@ -112,17 +112,24 @@ class SRTPDecryptor:
                 self._counts.pop(s, None)
                 self._states.pop(s, None)
 
-    def get_primary_ssrc_group(self, tier: int = 0) -> set[int]:
+    def get_primary_ssrc_group(
+        self, tier: int = 0, *, group_size: Optional[int] = None,
+    ) -> set[int]:
         """Return one of the consecutive-SSRC groups Apple emits per tier (one
         SSRC per tile; group size = the tilesPerFrame we offered, default 4).
         Tier 0 = the highest-quality (most-packets) group."""
         if not self._counts:
             return set()
         import os
-        try:
-            grp = max(1, int(os.environ.get("ISS_TILES_PER_FRAME", "4")))
-        except ValueError:
-            grp = 4
+        if group_size is None:
+            try:
+                grp = max(1, int(os.environ.get("ISS_TILES_PER_FRAME", "4")))
+            except ValueError:
+                grp = 4
+        else:
+            if isinstance(group_size, bool) or not isinstance(group_size, int) or group_size < 1:
+                raise ValueError("group_size must be a positive integer")
+            grp = group_size
         sorted_ssrcs = sorted(self._counts.keys())
         groups: list[list[int]] = [[sorted_ssrcs[0]]]
         for s in sorted_ssrcs[1:]:

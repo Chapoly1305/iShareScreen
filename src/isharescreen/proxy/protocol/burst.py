@@ -68,6 +68,7 @@ def gather_initial_burst(
     decryptor: SRTPDecryptor,
     *,
     quality_tier: int = 0,
+    tile_group_size: Optional[int] = None,
     settle_seconds: float = 0.3,
     deadline_seconds: float = 2.0,
     min_packets: int = 100,
@@ -92,7 +93,8 @@ def gather_initial_burst(
     processed = 0
 
     def _refresh_ssrc_map() -> None:
-        primary = decryptor.get_primary_ssrc_group(tier=quality_tier)
+        primary = decryptor.get_primary_ssrc_group(
+            tier=quality_tier, group_size=tile_group_size)
         if not primary:
             return
         sorted_ssrcs = sorted(primary)

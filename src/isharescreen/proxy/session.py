@@ -32,7 +32,8 @@ import sys
 import threading
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, field
 from typing import Callable, Literal, Optional
 
 import numpy as np
@@ -56,7 +57,7 @@ from .protocol.negotiation import (
     NegotiationResult,
     connect_and_negotiate,
 )
-from .protocol.offers import extract_offer_ssrc, create_offers
+from .protocol.offers import MediaOfferConfig, extract_offer_ssrc, create_offers
 from .protocol.rfb import warmup_tcp, parse_apple_display_layout, DisplayRect
 from .protocol.rtcp import (
     build_empty_sr,
@@ -305,6 +306,9 @@ class SessionConfig:
     # of the config to the desktop viewer. Off ⇒ classic fixed canvas
     # (the window just stretches the stream on resize).
     dynamic_resolution: bool = False
+    # Editable startup offer. None uses the existing ISS_* environment choices.
+    # Session snapshots it at construction; this is not a live control API.
+    media_offer: Optional[MediaOfferConfig] = field(default=None, kw_only=True)
 
 # ── internal RTP packet group ────────────────────────────────────────
 
@@ -321,13 +325,17 @@ class Session:
 
     def __init__(self, config: SessionConfig) -> None:
         self._config = config
+        self._media_offer_config = (
+            deepcopy(config.media_offer) if config.media_offer is not None
+            else MediaOfferConfig.from_environment()
+        )
+        self._media_offer_config.validate()
 
         # Connection state — None when disconnected.
         self._negotiation: Optional[NegotiationResult] = None
-        # Video codec: 'avc' (H.264 4:2:0) when ISS_VIDEO_CODEC=avc is offered,
-        # else 'hevc' (the byte-identical default the server answers with HEVC).
+        # Match the decoder to the same configuration used by the offer.
         self._video_codec = (
-            "avc" if os.environ.get("ISS_VIDEO_CODEC", "").lower() == "avc"
+            "avc" if self._media_offer_config.video.codec == "avc"
             else "hevc"
         )
         # AVC hardware-decode periodic IDR re-anchor (d3d11va POC-wrap
@@ -515,7 +523,7 @@ class Session:
         # negotiation instead of advertising a capability AVC cannot complete.
         self._ltr_enabled = (
             self._video_codec == "hevc"
-            and os.environ.get("ISS_LTRP", "1") != "0"
+            and self._media_offer_config.video.effective_ltrp_enabled
         )
         self._ltr_last_acked: int = 0
         self._ltr_acks_sent: int = 0
@@ -930,7 +938,8 @@ class Session:
             return observed
         n = self._negotiation
         from .protocol.offers import tiles_per_frame
-        return n.canvas_tiles if n and n.canvas_tiles else tiles_per_frame()
+        return n.canvas_tiles if n and n.canvas_tiles else tiles_per_frame(
+            getattr(self, "_media_offer_config", None))
 
     @property
     def hw_accel(self) -> Optional[str]:
@@ -1144,7 +1153,8 @@ class Session:
 
         # 7) Decoder init.
         from .protocol.offers import tiles_per_frame
-        num_tiles = self._negotiation.canvas_tiles or tiles_per_frame()
+        num_tiles = self._negotiation.canvas_tiles or tiles_per_frame(
+            self._media_offer_config)
         # Size per-tile loss counters now that num_tiles is known.
         self._lost_pkts_per_tile = [0] * num_tiles
         self._last_profile_lost_per_tile = [0] * num_tiles
@@ -1386,7 +1396,8 @@ class Session:
         False we additionally gate the server's audio transmitter off via the
         audio-description field4 (see offers._build_mediablob) so no audio
         flows on the wire — not just skipping local decode + playback."""
-        video_offer, audio_offer = create_offers(audio_enabled=cfg.audio)
+        video_offer, audio_offer = create_offers(
+            audio_enabled=cfg.audio, config=self._media_offer_config)
         # Stash for mid-session 0x1c re-offers (dynamic resolution).
         self._video_offer = video_offer
         self._audio_offer = audio_offer
@@ -1443,6 +1454,8 @@ class Session:
         return gather_initial_burst(
             burst_buf, self._video_decryptor, quality_tier=cfg.quality_tier,
             codec=self._video_codec,
+            tile_group_size=self._negotiation.canvas_tiles or tiles_per_frame(
+                self._media_offer_config),
             min_packets=400 if _is_avc else 100,
         )
 
@@ -2859,7 +2872,7 @@ class Session:
             and counts[s] >= _DYNAMIC_SSRC_PACKET_THRESHOLD
         )
         from .protocol.offers import tiles_per_frame
-        want = tiles_per_frame()  # SSRCs per group = tilesPerFrame we offered
+        want = tiles_per_frame(getattr(self, "_media_offer_config", None))
         if len(candidates) < want:
             return
         # Apple emits `want` CONSECUTIVE SSRCs per tile group (one SSRC per
@@ -3447,7 +3460,8 @@ class Session:
             vo = getattr(self, '_video_offer', None)
             ao = getattr(self, '_audio_offer', None)
             if vo is None or ao is None:
-                vo, ao = create_offers(audio_enabled=self._config.audio)
+                vo, ao = create_offers(
+                    audio_enabled=self._config.audio, config=self._media_offer_config)
             msg_1c = build_0x1c(
                 ao, vo, neg.keys,
                 alt_session=self._config.alt_session,
