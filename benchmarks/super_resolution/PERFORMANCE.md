@@ -6,20 +6,20 @@ Apple M4 and NVIDIA RTX 4090. All values are adapter latency in milliseconds,
 
 | Model | Scale | Fine-tuned | M4 adapter | RTX 4090 adapter |
 | --- | --- | :---: | ---: | ---: |
-| QuickSRNet-Small | ×2 | | 19.92 / 21.14 | 2.40 / 2.43 |
-| PlainUSR-U | ×2 | | 19.66 / 23.42 | 2.62 / 2.65 |
-| RT4KSR-S | ×2 | | 24.24 / 26.25 | 2.62 / 2.66 |
-| CASR | ×4 | | 26.72 / 28.13 | 4.42 / 4.48 |
-| SPANV2-ESR C2 | ×4 | | 109.87 / 115.38 | 8.34 / 8.39 |
-| EfRLFN | ×2 | | 262.28 / 273.48 | 21.09 / 21.12 |
+| QuickSRNet-Small | ×2 | ✓ | 19.92 / 21.14 | 2.40 / 2.43 |
+| PlainUSR-U | ×2 | ✓ | 19.66 / 23.42 | 2.62 / 2.65 |
+| RT4KSR-S | ×2 | ✓ | 24.24 / 26.25 | 2.62 / 2.66 |
+| CASR | ×4 | ✓ | 26.72 / 28.13 | 4.42 / 4.48 |
+| SPANV2-ESR C2 | ×4 | ✓ | 109.87 / 115.38 | 8.34 / 8.39 |
+| EfRLFN | ×2 | ✓ | 262.28 / 273.48 | 21.09 / 21.12 |
 | IMDN | ×2 | ✓ | 385.42 / 409.91 | 28.43 / 28.49 |
 | EDSR-baseline | ×2 | ✓ | 509.26 / 541.04 | 35.87 / 35.91 |
 | SAFMN | ×2 | ✓ | 445.74 / 453.77 | 45.64 / 45.67 |
 
-**Fine-tuned** indicates that a project fine-tuned variant is available, not
-that it was used in this latency measurement. Every row above was measured
-with official pretrained weights. The current training runner supports EDSR,
-IMDN and SAFMN; the six new candidates are inference integrations only.
+**Fine-tuned** indicates that a project fine-tuned checkpoint is available,
+not that it was used in this latency measurement. Every row above was measured
+with official pretrained weights. The training runner supports the original
+models and all six lightweight candidates.
 
 Precision: M4 uses PyTorch MPS FP32 with CPU fallback disabled. RTX 4090 uses
 CUDA AMP FP16 with FP32 weights, except RT4KSR, which uses FP32 because its
@@ -30,6 +30,23 @@ Native ×4 models output 3840×2160; ×2 models output 1920×1080. Their measure
 times are sorted together for convenience, not as equivalent-resolution tasks.
 CASR assets have no identified upstream license and remain private evaluation
 assets, outside the repository and distribution.
+
+## Fine-tuning protocol
+
+Every model family is fine-tuned as five grouped folds for 1,500 complete
+epochs per fold. The frozen paired desktop-frame manifest, grouping, batch
+size, crop size, optimizer, validation cadence and checkpoint policy are held
+constant across families. Checkpoint selection uses fixed held-out anchors;
+full held-out validation is recorded every 50 epochs. PSNR, SSIM and LPIPS,
+per-update L1 loss, selection snapshots and final completion receipts are
+saved for every fold.
+
+The latency table is intentionally separate from this quality protocol:
+fine-tuned quality is evaluated with the saved development-fold trajectories,
+whereas latency remains an adapter measurement of official pretrained weights.
+Use `candidate_epoch_report.py` only after all five completion receipts for a
+candidate are present; it rejects missing or duplicate folds before producing
+cross-fold curves and CSV files.
 
 ## Measurement protocol
 
