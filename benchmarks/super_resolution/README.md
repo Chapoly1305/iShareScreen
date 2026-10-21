@@ -93,6 +93,22 @@ The compositor writes a viewing video, lossless detail PNGs and an HTML gallery.
 Image panels have separators; descriptive titles appear only in HTML.
 `compose_trained --output /path/to/comparison --refresh-gallery` restyles an
 existing gallery without model inference or video encoding.
+
+`render_candidate_media compose-matrix` creates a unified comparison from native
+×2 candidate reconstructions. Model columns stay fixed: Original, the unenhanced
+540p input and the four pretrained models on top; Bicubic, the same input and
+their fine-tuned counterparts below. Input panels use nearest-neighbor display
+scaling. Original-size 960×540 PNGs and lossless input videos are retained as artifacts,
+without a separate input-image section in the gallery.
+Videos and detail PNGs retain per-panel model/variant headers and separators.
+The HTML page provides buttons for each overview and detail chapter.
+
+For screenshot-only scene extensions, use `review_recordings` to inspect source
+recordings and save a selected-frame plan, then `candidate_stills render` to
+reconstruct those frames with each capture's held-out fold. `candidate_stills
+compose` appends enlarged, labeled detail crops to an existing
+gallery. It preserves the existing images and presents scene navigation without
+rendering or embedding a new video. Original-size 540p inputs remain available.
 Viewing videos are lossy and are never metric inputs.
 
 For live comparisons, `export_live` installs inference-only bundles from audited

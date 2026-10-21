@@ -12,5 +12,7 @@ def test_performance_table_order_and_finetuned_availability():
     p95 = [float(row[-1].split("/")[1]) for row in data]
     assert p95 == sorted(p95)
     checked = {row[0].strip() for row in data if row[2].strip() == "✓"}
-    assert checked == {"EDSR-baseline", "IMDN", "SAFMN"}
-    assert "official pretrained" in text and "not\nthat it was used" in text
+    assert checked == {"EDSR-baseline", "IMDN", "SAFMN", "QuickSRNet-Small", "PlainUSR-U",
+                       "RT4KSR-S", "CASR", "SPANV2-ESR C2", "EfRLFN"}
+    prose = " ".join(text.split())
+    assert "official pretrained" in prose and "not that it was used" in prose

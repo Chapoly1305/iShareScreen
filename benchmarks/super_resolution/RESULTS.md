@@ -1,63 +1,43 @@
 # Fine-tuning results
 
-All three models completed 1,500 epochs across five content folds, totaling
-2,344,500 optimizer updates. The [training protocol](TRAINING.md) defines the
-shared data, recipe and checkpoint selection.
-
-Scores use 683 held-out frames from 24 recordings: frames are averaged within
-each recording, then recordings are weighted equally.
+Four lightweight candidates with official native ×2 pretrained weights completed
+1,500 epochs across five grouped content folds. Scores below average the five
+held-out folds. `Before` is the epoch-zero full validation; `After` is the
+selected checkpoint's full validation from the same fold.
 
 | Method | PSNR (dB), higher | SSIM, higher | LPIPS, lower |
 |---|---:|---:|---:|
-| Bicubic | 26.019 | 0.92118 | 0.14649 |
-| EDSR pretrained | 28.738 | 0.94877 | 0.05493 |
-| EDSR fine-tuned | 35.633 | 0.98501 | 0.01289 |
-| IMDN pretrained | 28.597 | 0.94736 | 0.05031 |
-| IMDN fine-tuned | 34.322 | 0.98241 | 0.01491 |
-| SAFMN pretrained | 28.591 | 0.94766 | 0.05629 |
-| SAFMN fine-tuned | 32.594 | 0.97509 | 0.02153 |
+| PlainUSR, before → after | 27.759 → 29.205 | 0.9408 → 0.9549 | 0.0740 → 0.0525 |
+| QuickSRNet, before → after | 28.049 → **30.044** | 0.9439 → **0.9629** | 0.0671 → **0.0354** |
+| RT4KSR, before → after | 27.087 → 27.436 | 0.9314 → 0.9370 | 0.0884 → 0.0822 |
+| EfRLFN, before → after | 25.625 → 27.098 | 0.9122 → 0.9318 | 0.1577 → 0.0858 |
 
-| Model | Selected epochs, folds 0-4 |
-|---|---|
-| EDSR | 1480, 1500, 1500, 1490, 1500 |
-| IMDN | 1500, 1490, 1500, 1490, 1500 |
-| SAFMN | 1000, 1500, 1500, 1500, 1500 |
-
-Selection chooses each trajectory's highest fixed-subset PSNR; the last epoch is
-not necessarily best. The comparison media instead use exact CURRENT epoch-1,500
-weights to show the same budget across models.
+CASR and SPANV2 are evaluated separately: their public weights are native ×4,
+so their deterministic ×4-to-×2 initialization is not presented as a
+pretrained ×2 baseline.
 
 ## Local material
 
-Generated material is ignored by Git and available in the original workspace:
+Generated material is ignored by Git and remains in the local workspace:
 
-- [Viewing gallery](artifacts/epoch-1500-comparison/training-comparison/index.html)
-- [Media description](artifacts/epoch-1500-comparison/README.md)
-- [Validation curves](artifacts/epochs-1500-v1-plots-v3/full_curves.png)
-- [Checkpoint selection curves](artifacts/epochs-1500-v1-plots-v3/selection_curves.png)
-- [Training L1 curves](artifacts/epochs-1500-v1-plots-v3/loss_curves.png)
-- [Unrounded validation data](artifacts/epochs-1500-v1-report/curves.csv)
-- [Unrounded epoch losses](artifacts/epochs-1500-v1-report/losses.csv)
-- [Saved-artifact audit](artifacts/epochs-1500-v1-report/audit.json)
-- [Trained checkpoints](artifacts/epochs-1500-v1-completed/)
+- [Aggregate curves and fold-level data](artifacts/candidate-training-1500-report/)
+- [Unified candidate-model comparison](artifacts/candidate-pretrained-vs-finetuned-v1/comparison-v2/index.html)
+- [Original-model comparison gallery](artifacts/epoch-1500-comparison/training-comparison/index.html)
+- [Cross-device latency measurements](artifacts/cross-device-video-latency/)
 
-The audit checked 2,344,500 update records, 546 aggregate validation observations
-and 22,500 per-fold epoch-loss records, plus checkpoint identities, selection
-and coverage. It reconstructed summaries from saved per-frame scores without
-rerunning model inference or recomputing pixel metrics.
+The unified gallery preserves the original code, terminal and desktop crops and
+adds selected light-theme interfaces, web content, charts, document text and
+video texture as still-image comparisons. Each model stays in a fixed column,
+with pretrained above fine-tuned; Original/Bicubic and the unenhanced 540p input
+provide shared references. Fine-tuned panels use the selected checkpoint from
+the completed 1,500-epoch held-out fold trajectory.
 
-Between epochs 1,450 and 1,500, mean full-validation PSNR increased by 0.0327 dB
-for EDSR, 0.0314 dB for IMDN and 0.0204 dB for SAFMN.
+- [All recording previews and scene review](artifacts/recording-midpoint-review/index.html)
 
 ## Interpretation
 
 These are development-validation scores, not independent-test performance.
-Recorded content shares a capture environment; content folds do not establish
-session independence. Curation was not compared with uniform sampling in a
-separate controlled training experiment. References preserve decoded recording
-pixels, not lossless acquisition.
-
-This is a collection of five fold-specific checkpoints per model, not one final
-all-data model. Quality scores and offline videos do not establish live latency,
-FPS, temporal stability or text correctness. Live testing and a separately
-recorded evaluation set remain separate next steps.
+The data use grouped content folds but share a capture environment. Quality
+scores and offline videos do not establish live latency, FPS, temporal
+stability or text correctness. Live testing and a separately recorded
+evaluation set remain separate next steps.
