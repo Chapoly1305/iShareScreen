@@ -10,6 +10,7 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import logging
 from pathlib import Path, PurePosixPath
 import re
 import time
@@ -19,6 +20,7 @@ import numpy as np
 from ..models import project_home, sha256
 
 IDS = ("plainusr", "quicksrnet", "rt4ksr", "efrlfn", "casr", "spanv2")
+log = logging.getLogger(__name__)
 
 
 def specification(key: str) -> dict:
@@ -111,16 +113,27 @@ class TorchUpscaler:
         self.model, self.spec = load_network(key, home)
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-        if precision not in ("fp32", "fp16", "amp-fp16") or (precision != "fp32" and not device.startswith("cuda")):
-            raise ValueError("Use FP32 on CPU/MPS; FP16 and AMP require CUDA")
+        mps_half = key == "quicksrnet" and device == "mps" and precision == "fp16"
+        if precision not in ("fp32", "fp16", "amp-fp16") or (precision != "fp32" and not device.startswith("cuda") and not mps_half):
+            raise ValueError("Use FP32 on CPU/MPS; only validated QuickSRNet 540p supports MPS FP16; AMP requires CUDA")
         self.device, self.precision = device, precision
         self.dtype = torch.float16 if precision == "fp16" else torch.float32
         self.model.to(device=device, dtype=self.dtype)
+        self._mps_packer = None
+        if mps_half:
+            from ..mps_output import MPSRGBPacker
+            try:
+                self._mps_packer = MPSRGBPacker()
+            except RuntimeError:
+                # Keep the existing GPU tensor conversion on older compilers.
+                log.debug("MPS RGB shader unavailable", exc_info=True)
         self.provenance = dict(id=torch_id(key), label=self.spec["label"], variant="pretrained",
             backend="pytorch", device=device, precision=precision, scale=self.spec["scale"],
             parameters=sum(p.numel() for p in self.model.parameters()), source_revision=self.spec["revision"],
             checkpoint=str(asset_home(key, home)/"weights.pth"),
             checkpoint_sha256=self.spec["files"]["weights.pth"]["sha256"])
+        if mps_half:
+            self.provenance["output_conversion"] = "metal-fused" if self._mps_packer else "torch-mps"
 
     def sync(self):
         if self.device == "mps":
@@ -134,20 +147,44 @@ class TorchUpscaler:
         import torch
         if not isinstance(rgb, np.ndarray) or rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3:
             raise ValueError("Expected H×W×3 RGB uint8")
+        if self.device == "mps" and self.precision == "fp16" and rgb.shape != (540,960,3):
+            raise ValueError("Validated QuickSRNet MPS FP16 requires RGB uint8 960×540 input")
         self.sync()
         t0 = time.perf_counter()
-        x = torch.from_numpy(np.ascontiguousarray((rgb.astype(np.float32)/255).transpose(2, 0, 1)[None]))
+        mps_half = self.device == "mps" and self.precision == "fp16"
+        if mps_half:
+            # Transfer bytes, then normalize on MPS. For every uint8 value this
+            # produces the same FP16 input as CPU FP32 division followed by cast.
+            x = torch.from_numpy(np.ascontiguousarray(rgb))
+        else:
+            x = torch.from_numpy(np.ascontiguousarray((rgb.astype(np.float32)/255).transpose(2, 0, 1)[None]))
         t1 = time.perf_counter()
         x = x.to(device=self.device, dtype=self.dtype)
+        if mps_half:
+            x = x.permute(2, 0, 1)[None].contiguous().div_(255)
         self.sync()
         t2 = time.perf_counter()
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16, enabled=self.precision == "amp-fp16"):
             output = self.model(x)
-        if output.shape != (1, 3, rgb.shape[0]*self.spec["scale"], rgb.shape[1]*self.spec["scale"]) or not torch.isfinite(output).all().item():
+        if output.shape != (1, 3, rgb.shape[0]*self.spec["scale"], rgb.shape[1]*self.spec["scale"]):
             raise ValueError("Candidate model returned invalid pixels")
+        packed = None
+        packer = getattr(self, "_mps_packer", None)
+        if packer is not None and output.dtype == torch.float16 and output.is_contiguous():
+            packed = packer(output)
+        else:
+            # MPS amax propagates NaN; abs exposes either sign of infinity.
+            # Reduce first to avoid several full-resolution masks.
+            finite = (torch.isfinite(output.abs().amax()).item() if self.device == "mps"
+                      else torch.isfinite(output).all().item())
+            if not finite:
+                raise ValueError("Candidate model returned invalid pixels")
         self.sync()
         t3 = time.perf_counter()
-        out = (output[0].float()*255).round().clamp(0, 255).to(torch.uint8).permute(1, 2, 0).contiguous().cpu().numpy()
+        if packed is not None:
+            out = packed.cpu().numpy()
+        else:
+            out = (output[0].float()*255).round().clamp(0, 255).to(torch.uint8).permute(1, 2, 0).contiguous().cpu().numpy()
         t4 = time.perf_counter()
         return out, dict(prepare_ms=(t1-t0)*1000, upload_ms=(t2-t1)*1000, inference_ms=(t3-t2)*1000,
                          download_ms=(t4-t3)*1000, total_ms=(t4-t0)*1000)

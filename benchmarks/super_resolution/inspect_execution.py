@@ -45,21 +45,21 @@ def main():
             self.operations[str(func)] += 1
             return output
 
-    for key in (*candidates.IDS, "edsr", "imdn", "safmn"):
+    for key in (*candidates.IDS, variants.MPS_FP16_ID, "edsr", "imdn", "safmn"):
         adapter = (candidates.TorchUpscaler(key, device="mps") if key in candidates.IDS
                    else variants.load(key, device="mps"))
         execution.validate_adapter(adapter)
         array = rgb.astype(np.float32)
         if key != "edsr":
             array /= 255
-        value = torch.from_numpy(np.ascontiguousarray(array.transpose(2,0,1)[None])).to("mps")
+        value = torch.from_numpy(np.ascontiguousarray(array.transpose(2,0,1)[None])).to("mps",dtype=adapter.dtype)
         audit = GPUAudit()
         with torch.inference_mode(), audit:
             output = adapter.model(value)
         torch.mps.synchronize()
         if not torch.isfinite(output).all().item():
             raise ValueError(f"Nonfinite output: {key}")
-        row = dict(model=key, device=str(output.device), operations=dict(audit.operations),
+        row = dict(model=key, device=str(output.device), input_dtype=str(value.dtype), output_dtype=str(output.dtype), operations=dict(audit.operations),
                    cpu_tensor_operations=0, provenance=adapter.provenance)
         report["torch_forwards"].append(row)
         print(f"GPU VERIFIED {key}: {sum(audit.operations.values())} operations, no CPU tensors", flush=True)

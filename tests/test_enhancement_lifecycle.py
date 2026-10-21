@@ -1,4 +1,5 @@
 """Control/render races without model assets, OpenCV, GPU or a remote host."""
+import threading
 import time
 
 import numpy as np
@@ -81,3 +82,53 @@ def test_diagnostic_options_are_not_mutable_worker_state(worker):
     status["options"].clear()
     assert len(worker.snapshot()["options"]) == 3
     worker.select("off")
+
+
+def test_only_current_generation_wakes_renderer(monkeypatch):
+    monkeypatch.setattr(live, "availability", lambda: [dict(id="bicubic", available=True)])
+    entered = [threading.Event(), threading.Event()]
+    release = [threading.Event(), threading.Event()]
+    ready = threading.Event()
+
+    class Model:
+        def __call__(self, rgb):
+            index = int(rgb[0, 0, 0])
+            entered[index].set()
+            assert release[index].wait(3)
+            return rgb, {"total_ms": 0}
+
+    backend = live.EnhancementWorker(factory=lambda *args, **kwargs: Model(), wakeup=ready.set)
+    try:
+        backend.select("bicubic")
+        backend.submit(np.zeros((8, 8, 3), np.uint8))
+        assert entered[0].wait(2)
+        backend.invalidate()
+        backend.submit(np.ones((8, 8, 3), np.uint8))
+        release[0].set()
+        assert entered[1].wait(2)  # The obsolete call has already been discarded.
+        assert not ready.is_set()
+        release[1].set()
+        assert ready.wait(2)
+        result = backend.poll()
+        assert result is not None and result.generation == backend.snapshot()["generation"]
+    finally:
+        for event in release:
+            event.set()
+        backend.close()
+
+
+def test_model_failure_wakes_renderer_for_original_bypass(monkeypatch):
+    monkeypatch.setattr(live, "availability", lambda: [dict(id="bicubic", available=True)])
+    ready = threading.Event()
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("incompatible weights")
+
+    backend = live.EnhancementWorker(factory=broken, wakeup=ready.set)
+    try:
+        backend.select("bicubic")
+        assert ready.wait(2)
+        assert backend.snapshot()["state"] == "error"
+        assert backend.poll() is None
+    finally:
+        backend.close()

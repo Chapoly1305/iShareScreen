@@ -439,7 +439,7 @@ _FORM = """<!doctype html><html><head><title>iShareScreen — Connect</title>__H
   <button type="button" onclick="forgetPassword()" style="background:#2b2d31;font-size:13px;margin-bottom:14px">Forget saved password</button>
   <p id="credential-status" role="status" style="font-size:13px;color:#9aa0a6"></p>
   <div class="row"><input type="checkbox" name="sr_evaluation" id="sr-evaluation" onchange="evaluationMode()"><label for="sr-evaluation" style="margin:0">Super-resolution evaluation</label></div>
-  <p id="evaluation-settings" hidden style="font-size:13px;color:#9aa0a6">Locked: Desktop · 960×540 input · 100% scale · HEVC · GPU-only PyTorch FP32 · CPU fallback disabled · dynamic resolution off · audio off · private virtual display (blanks the host screen). Only the display model changes during comparison.</p>
+  <p id="evaluation-settings" hidden style="font-size:13px;color:#9aa0a6">Locked: Desktop · 960×540 input · 100% scale · HEVC · GPU-only PyTorch · precision shown per model · CPU fallback disabled · dynamic resolution off · audio off · private virtual display (blanks the host screen). Only the display model changes during comparison.</p>
   <label>Frontend</label>
   <select name="frontend"><option value="browser" __BROWSER_SEL__>browser (WebTransport + WebCodecs)</option><option value="desktop" __DESKTOP_SEL__>desktop (native window)</option></select>
   <label>Resolution</label>
@@ -689,7 +689,7 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
    const profile=$('evaluation-profile'); profile.hidden=!evaluation;
    if(!evaluation) return;
    const matched=evaluationCanvas&&evaluationCanvas.w===960&&evaluationCanvas.h===540;
-   profile.textContent='Super-resolution evaluation · fixed 960×540 input → ×2 reconstruction · HEVC · GPU-only PyTorch FP32 · CPU fallback disabled · dynamic resolution off · audio off'
+   profile.textContent='Super-resolution evaluation · fixed 960×540 input → ×2 reconstruction · HEVC · GPU-only PyTorch · precision shown per model · CPU fallback disabled · dynamic resolution off · audio off'
      +(evaluationCanvas?(matched?' · canvas verified':` · WARNING: received ${evaluationCanvas.w}×${evaluationCanvas.h}; input does not match the profile`):' · awaiting canvas verification');
    profile.style.borderColor=evaluationCanvas&&!matched?'#e06c75':'#4f8cff';
  }

@@ -8,7 +8,9 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+import platform
 import re
+import sys
 
 from . import models
 from . import coreml
@@ -18,6 +20,8 @@ from . import execution
 log = logging.getLogger(__name__)
 MODELS = ("edsr", "imdn", "safmn")
 SCHEMA = "isharescreen_live_weights_v1"
+MPS_FP16_ID = "quicksrnet-mps-fp16"
+MPS_FP16_LABEL = "QuickSRNet-Small - Pretrained ×2 (PyTorch MPS FP16, 540p)"
 
 
 def bundle_name(model: str, fold: int, epoch: int, role: str) -> str:
@@ -59,6 +63,13 @@ def availability(home: Path | None = None) -> list[dict]:
     choices.append(coreml.availability(home))
     choices.extend(candidates.availability(home))
     choices.extend(coreml.availability(home, key) for key in coreml.CANDIDATE_IDS)
+    # Metadata-only discovery: constructing the selected model verifies its
+    # official source/weights again and requires an actual MPS device.
+    quick = next(item for item in choices if item["id"] == "quicksrnet-torch")
+    reason = quick["reason"]
+    if sys.platform != "darwin" or platform.machine() != "arm64":
+        reason = "QuickSRNet MPS FP16 requires Apple Silicon macOS"
+    choices.append(dict(id=MPS_FP16_ID,label=MPS_FP16_LABEL,available=not reason,reason=reason))
     base = {item["id"]: item for item in choices}
     root = home / "fine-tuned"
     if not root.exists():
@@ -90,6 +101,18 @@ def load(key: str, device: str = "auto", home: Path | None = None, precision: st
 def _load(key: str, device: str, home: Path | None, precision: str):
     """Use the shared adapter's preprocessing with a strictly identified state."""
     home = home or models.project_home()
+    if key == MPS_FP16_ID:
+        if device not in ("auto", "mps"):
+            raise ValueError("QuickSRNet MPS FP16 requires the MPS GPU")
+        if sys.platform != "darwin" or platform.machine() != "arm64":
+            raise ValueError("QuickSRNet MPS FP16 requires Apple Silicon macOS")
+        if precision not in ("fp32", "fp16"):
+            raise ValueError("QuickSRNet MPS FP16 has fixed FP16 GPU execution")
+        # Precision is bound to this explicit choice, like the Core ML variants.
+        # The ordinary Torch IDs continue to use their requested precision.
+        adapter = candidates.TorchUpscaler("quicksrnet",device="mps",home=home,precision="fp16")
+        adapter.provenance.update(id=MPS_FP16_ID,label=MPS_FP16_LABEL,input_shape=[540,960,3])
+        return adapter
     if key == coreml.MODEL_ID:
         return coreml.CoreMLUpscaler(device=device, home=home, precision=precision)
     if key.endswith("-coreml") and key.removesuffix("-coreml") in coreml.CANDIDATE_IDS:

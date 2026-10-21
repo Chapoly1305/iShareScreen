@@ -138,6 +138,28 @@ not as additive production-latency estimates. A 30-FPS deployment needs roughly
 Reject an optimized backend if paired output quality changes unacceptably, even
 if its timing improves. Lower parameter count alone does not establish latency.
 
+To check the complete serial processing budget, use decoded full-range BT.709
+YUV444 960×540 clips. This probe includes tile composition, the real adapter,
+texture upload and drawing, with an ordered one-pixel readback to wait for GPU
+completion. Its full-image renderer correctness check is outside the timer.
+
+```sh
+ISS_SR_GPU_ONLY=1 PYTORCH_ENABLE_MPS_FALLBACK=0 \
+  python -m benchmarks.super_resolution.profile_postdecode \
+  --videos /path/to/code-540p-hevc.mp4 /path/to/terminal-540p-hevc.mp4 \
+  --models quicksrnet-torch plainusr rt4ksr efrlfn \
+  --samples 120 --warmup 20 --budget-ms 33 --output /path/to/fresh-report.json
+```
+
+The report preserves raw samples, input/weight/source hashes, p50/p95, maximum
+time, and every sample exceeding the budget. A p95 pass does not mean every
+frame passed. Decode, live worker queueing, competing GPU work, display pacing
+and scanout remain outside this serial probe; live latency needs separate
+verification. Clips are sampled before timing and inputs are never resized.
+For the fixed-540p Apple Silicon FP16 deployment choice, pass
+`--models quicksrnet-mps-fp16`. This is separate from the FP32 reference IDs
+used in the maintained cross-device latency comparison.
+
 ### Lightweight candidate comparison
 
 Per-model runtime directories hold pinned asset metadata and deployment loaders;

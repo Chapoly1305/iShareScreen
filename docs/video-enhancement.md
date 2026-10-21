@@ -95,6 +95,49 @@ source-bound checkpoints are unchanged.
 | CASR | ×4 | Offline PyTorch only | — |
 | SPANV2-ESR C2 | ×4 | Offline PyTorch only | — |
 
+On Apple Silicon, **QuickSRNet-Small - Pretrained ×2 (PyTorch MPS FP16,
+540p)** is a separate GPU-only deployment choice. It uses the same pinned
+official pretrained weights and fixed 960×540 input, with FP16 MPS execution
+and FP32 output scaling before uint8 quantization. The ordinary PyTorch choice
+remains the FP32 reference. The diagnostics identity explicitly reports FP16;
+CPU and other-device substitution are rejected. Select this named option for
+the faster path; selecting it does not require a global precision change.
+
+Input normalization runs on MPS. When its shader compiler is available, the
+output path combines nonfinite detection, FP32 scaling, round-to-even and RGB
+packing in one Metal kernel; provenance reports `output_conversion=metal-fused`.
+Every finite FP16 value was checked against the preceding tensor conversion.
+The existing MPS tensor path remains available if compilation is unsupported.
+For the fused path, `inference_ms` includes validation and packing, while
+`download_ms` measures the resulting uint8 transfer to CPU.
+
+The FP16 path was checked on 600 sampled frames from five project recordings
+against MPS FP32, plus 15 full-size CPU FP32 anchors, within one RGB level.
+This is a bounded conversion check, not a guarantee for arbitrary images or
+other checkpoints. Other MPS candidates remain FP32.
+
+The October 20, 2026 M4 check used 120 frames per recording, 20 excluded warm-up
+frames, and viewer-default CPU thread settings. The measured path includes
+original tile upload, worker scheduling, canvas conversion, inference, enhanced
+upload and completed GPU rendering. Network, decode, window presentation and
+scanout are outside this processing budget. The acceptance criterion is
+**p95 <33 ms** for each recording.
+
+| Recording | Processing p50 | Processing p95 |
+| --- | ---: | ---: |
+| Code | 18.61 ms | 29.54 ms |
+| Terminal | 17.62 ms | 19.81 ms |
+| Web | 18.23 ms | 20.48 ms |
+| Paper | 17.68 ms | 24.95 ms |
+| Markdown | 17.72 ms | 20.40 ms |
+
+Across all 600 samples, p50 was 17.92 ms and p95 was 23.08 ms. Six samples
+exceeded 33 ms, with a maximum of 56.33 ms; this is a p95 pass, not a hard
+per-frame deadline. These observations use PyTorch 2.6, the explicit MPS FP16
+choice and fused output conversion. They do not establish the same performance
+for EfRLFN or the other model choices. Raw reports and source hashes are in
+`benchmarks/super_resolution/artifacts/m4-diagnosis-20261020/worker-fused-output-*.json`.
+
 Install the pinned source files and weights explicitly:
 
 ```sh
@@ -131,7 +174,8 @@ installed PyTorch candidate in the same Display model dropdown. This profile
 requires GPU-only execution and excludes Core ML. Outside the strict profile,
 leave `ISS_SR_DEVICE` unset or `auto` when using Core ML: explicit `mps` applies
 only to PyTorch. Core ML versions require fixed 540p input; PyTorch candidates
-use FP32 on MPS. Native ×4 weights are not relabeled or resized to pretend they
+use FP32 on MPS except the explicitly labeled fixed-540p QuickSRNet FP16 choice.
+Native ×4 weights are not relabeled or resized to pretend they
 are ×2 models, and remain unavailable in Live.
 
 ## Live comparison
@@ -142,7 +186,8 @@ form. Enter the host Mac's address and account credentials. The profile locks:
 - Native desktop frontend and a single combined display window.
 - 960×540 encoded input, 100% host UI scale, and dynamic resolution disabled.
 - HEVC with the client's best available HEVC decoder and audio off.
-- PyTorch FP32 on MPS/CUDA only; CPU fallback and Core ML are disabled.
+- GPU-only PyTorch, with FP32 reference choices and a separately labeled
+  QuickSRNet MPS FP16 deployment choice; CPU fallback and Core ML are disabled.
 - A private virtual display (Curtain), which blanks the host's physical screen.
 
 The launcher enforces these settings even if disabled form controls are omitted
@@ -165,6 +210,16 @@ model execution, output conversion/transfer, and display-upload enqueue time.
 Display enqueue time is a CPU submission measurement, not GPU completion or
 input-to-display latency. Restart an already-running viewer after code updates
 to use new diagnostics.
+
+Canvas conversion quantizes contiguous RGB planes before byte interleaving,
+combining rounding and saturation in one pass while preserving the previous
+FP32 BT.709 and round-to-even results exactly. For a
+33 ms processing-budget check that includes completed rendering, use the
+[`profile_postdecode` probe](../benchmarks/super_resolution/README.md#performance-profiling).
+Its p95 gate and individual over-budget counts are separate from live latency.
+Completed enhancement results and current-generation errors wake the native
+render loop through its existing event, without waiting for another decoded
+tile or the polling timeout. Obsolete generations do not request a repaint.
 
 This profile requests a low-resolution virtual desktop directly; it is not a
 downsampled copy of a simultaneously captured 1080p reference. Live interaction

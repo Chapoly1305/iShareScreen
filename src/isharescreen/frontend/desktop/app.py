@@ -431,7 +431,10 @@ def run(
     )
 
     renderer = Renderer(device, surface_format, canvas_w, canvas_h)
-    enhancement = EnhancementWorker(device=os.environ.get("ISS_SR_DEVICE", "auto"))
+    # The same event already wakes this consumer for tiles and disconnects.
+    # An enhanced result must also wake it, even when no new tile arrives.
+    enhancement = EnhancementWorker(device=os.environ.get("ISS_SR_DEVICE", "auto"),
+                                    wakeup=session._fresh_evt.set)
     session._enhancement_backend = enhancement
     sr_display = EnhancementDisplay(enhancement, renderer, canvas_w, canvas_h, num_tiles)
 

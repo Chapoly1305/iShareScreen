@@ -8,6 +8,72 @@ import pytest
 pytestmark = pytest.mark.skipif(os.environ.get("ISS_TEST_GPU") != "1",reason="Set ISS_TEST_GPU=1 for real GPU readback")
 
 
+@pytest.fixture(scope="module")
+def mps_rgb_packer():
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS is unavailable")
+    from isharescreen.enhancement.mps_output import MPSRGBPacker
+    return MPSRGBPacker()
+
+
+def test_mps_packer_preserves_every_finite_float16_value(mps_rgb_packer):
+    import torch
+    values = np.arange(65536, dtype=np.uint16).view(np.float16)
+    values = values[np.isfinite(values)]
+    planes = np.stack((values, np.roll(values,17), values[::-1]))
+    output = torch.from_numpy(planes[None,:,None,:]).to("mps")
+    expected = np.clip(np.rint(planes.astype(np.float32)*255),0,255).astype(np.uint8).T[None]
+    actual = mps_rgb_packer(output)
+    np.testing.assert_array_equal(actual.cpu().numpy(), expected)
+    mps_rgb_packer(torch.zeros_like(output))
+    np.testing.assert_array_equal(actual.cpu().numpy(), expected)
+
+
+@pytest.mark.parametrize("strided", [False, True])
+def test_mps_half_input_preserves_every_byte_value(strided, mps_rgb_packer):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS is unavailable")
+    from isharescreen.enhancement.candidates import TorchUpscaler
+    base = np.arange(540*1920*3, dtype=np.uint8).reshape(540,1920,3)
+    rgb = base[:,::2] if strided else base[:,:960].copy()
+    expected = torch.from_numpy(np.ascontiguousarray(
+        (rgb.astype(np.float32)/255).transpose(2,0,1)[None])).half()
+    seen = []
+
+    def model(x):
+        seen.append(x.cpu())
+        return torch.full((1,3,1080,1920), .5, device="mps", dtype=torch.float16)
+
+    adapter = object.__new__(TorchUpscaler)
+    adapter.device, adapter.precision, adapter.dtype = "mps", "fp16", torch.float16
+    adapter.spec, adapter.model = {"scale":2}, model
+    adapter._mps_packer = mps_rgb_packer
+    pixels, _ = adapter(rgb)
+    assert torch.equal(seen[0], expected)
+    assert seen[0].is_contiguous()
+    assert pixels.shape == (1080,1920,3) and (pixels == 128).all()
+
+
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("position", [0, 3*1080*1920//2, 3*1080*1920-1])
+def test_mps_candidate_rejects_nonfinite_output_anywhere(dtype, bad, position, mps_rgb_packer):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS is unavailable")
+    from isharescreen.enhancement.candidates import TorchUpscaler
+    output = torch.zeros((1,3,1080,1920), dtype=getattr(torch,dtype), device="mps")
+    output.reshape(-1)[position] = bad
+    adapter = object.__new__(TorchUpscaler)
+    adapter.device, adapter.precision, adapter.dtype = "mps", "fp16", torch.float16
+    adapter.spec, adapter.model = {"scale":2}, lambda x:output
+    adapter._mps_packer = mps_rgb_packer
+    with pytest.raises(ValueError, match="invalid pixels"):
+        adapter(np.zeros((540,960,3),np.uint8))
+
+
 @pytest.mark.parametrize("fallback", [False, True])
 def test_enhanced_rgb_bypass_crop_and_cursor(monkeypatch, fallback):
     if fallback:
@@ -100,7 +166,7 @@ def test_real_hevc444_decoder_canvas_matches_original_shader(tmp_path):
 
 @pytest.mark.skipif(os.environ.get("ISS_TEST_COREML") != "1", reason="Set ISS_TEST_COREML=1 for installed Core ML inference")
 @pytest.mark.parametrize("key,gpu_only", [(key, False) for key in ("quicksrnet", "plainusr-coreml", "rt4ksr-coreml", "efrlfn-coreml")]
-                         + [(key, True) for key in ("quicksrnet-torch", "plainusr", "rt4ksr", "efrlfn")])
+                         + [(key, True) for key in ("quicksrnet-torch", "quicksrnet-mps-fp16", "plainusr", "rt4ksr", "efrlfn")])
 def test_real_model_worker_to_metal_renderer(key, gpu_only, monkeypatch):
     """Exercise real canvas assembly, inference, upload/readback, and bypass."""
     import time

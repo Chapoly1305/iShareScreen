@@ -56,8 +56,22 @@ def tile_rgb(tile):
         u = cv2.resize(u, (tile.width,tile.height), interpolation=cv2.INTER_LINEAR)
         v = cv2.resize(v, (tile.width,tile.height), interpolation=cv2.INTER_LINEAR)
     yf, cb, cr = y.astype(np.float32)/255, u.astype(np.float32)/255-0.5, v.astype(np.float32)/255-0.5
-    rgb = np.stack((yf+1.5748*cr, yf-0.187324*cb-0.468124*cr, yf+1.8556*cb), axis=-1)
-    return np.clip(np.rint(rgb*255), 0,255).astype(np.uint8)
+    # Keep contiguous planes through quantization, then interleave bytes.
+    # Interleaving FP32 first creates several full RGB temporaries per tile.
+    # Preserve the shader's FP32 operation order and round-to-even convention.
+    rgb = np.empty((3, tile.height, tile.width), np.float32)
+    np.multiply(cr, 1.5748, out=rgb[0])
+    np.add(yf, rgb[0], out=rgb[0])
+    np.multiply(cb, 0.187324, out=rgb[1])
+    np.subtract(yf, rgb[1], out=rgb[1])
+    np.subtract(rgb[1], 0.468124*cr, out=rgb[1])
+    np.multiply(cb, 1.8556, out=rgb[2])
+    np.add(yf, rgb[2], out=rgb[2])
+    np.multiply(rgb, 255, out=rgb)
+    # Saturating conversion rounds and clips in one pass. Keep the multiply
+    # above in FP32: folding its scale into OpenCV changes half-way rounding.
+    packed = cv2.add(rgb.reshape(-1, tile.width), 0, dtype=cv2.CV_8U)
+    return cv2.merge(tuple(packed.reshape(rgb.shape)))
 
 
 class TileCanvas:
@@ -98,8 +112,9 @@ class EnhancementWorker:
     construction and inference never hold the control condition lock.
     """
 
-    def __init__(self, device="auto", factory=load):
+    def __init__(self, device="auto", factory=load, wakeup=None):
         self.device, self.factory = device, factory
+        self._wakeup = wakeup
         self._cv = threading.Condition()
         self._selected, self._generation, self._pending, self._result = "off", 0, None, None
         self._closed = False
@@ -192,6 +207,13 @@ class EnhancementWorker:
             self._cv.notify_all()
         self._thread.join(timeout=2)
 
+    def _wake_renderer(self):
+        if self._wakeup is not None:
+            try:
+                self._wakeup()
+            except Exception:
+                log.exception("enhancement renderer wakeup failed")
+
     def _run(self):
         model, loaded = None, "off"
         while True:
@@ -243,6 +265,7 @@ class EnhancementWorker:
                 timing["assembly_ms"] = assembly_ms
                 timing["assembly_and_processing_ms"] = (time.monotonic()-started)*1000
                 timing["age_ms"] = (time.monotonic()-item.submitted_at)*1000
+                published = False
                 with self._cv:
                     if not self._closed and generation == self._generation and self._stats["state"] != "error":
                         self._result = EnhancedFrame(generation, key, out, timing)
@@ -251,14 +274,21 @@ class EnhancementWorker:
                                            timing_ms=dict(timing))
                         self._stats["processed"] += 1
                         self._latencies.append(timing["assembly_and_processing_ms"])
+                        published = True
+                if published:
+                    self._wake_renderer()
             except Exception as exc:
                 log.exception("enhancement %s failed", key)
+                failed = False
                 with self._cv:
                     if not self._closed and generation == self._generation:
                         # Do not spin/retry a broken model on every render iteration.
                         self._stats.update(state="error", active="off", displayed="off", error=str(exc))
                         self._pending = self._result = None
                         loaded = key
+                        failed = True
+                if failed:
+                    self._wake_renderer()
 
 
 class EnhancementDisplay:
