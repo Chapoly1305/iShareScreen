@@ -58,3 +58,11 @@ def test_native_error_does_not_expose_password(backend):
     with pytest.raises(AuthError) as error:
         gss.start("mac", "alice", "secret", "REALM", "", "")
     assert "secret" not in str(error.value)
+
+
+def test_diagnostic_reports_only_numeric_native_status():
+    from isharescreen.proxy.protocol.kerberos_spnego import _diagnostic_code
+    error = RuntimeError("password-must-not-appear")
+    error.base_error = SimpleNamespace(winerror=-2146893042)
+    assert _diagnostic_code(error) == " (SSPI 0x8009030E)"
+    assert _diagnostic_code(RuntimeError("secret")) == ""

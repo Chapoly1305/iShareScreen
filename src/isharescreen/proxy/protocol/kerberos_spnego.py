@@ -3,6 +3,15 @@ from .auth import AuthError
 from .lkdc import discover_lkdc_realm
 
 
+def _diagnostic_code(error):
+    """Expose numeric SSPI status only, never native exception text or secrets."""
+    native = getattr(error, "base_error", None)
+    code = getattr(native, "winerror", None)
+    if not isinstance(code, int):
+        code = getattr(error, "winerror", None)
+    return f" (SSPI 0x{code & 0xffffffff:08X})" if isinstance(code, int) else ""
+
+
 class SpnegoGSS:
     def __init__(self):
         try:
@@ -40,17 +49,17 @@ class SpnegoGSS:
             return self.step()
         except AuthError:
             raise
-        except Exception:
+        except Exception as error:
             # Do not expose library exception text: it may contain credential data.
-            raise AuthError("Windows Kerberos could not acquire credentials; check the account and realm configuration") from None
+            raise AuthError("Windows Kerberos could not acquire credentials" + _diagnostic_code(error) + "; check the account and realm configuration") from None
 
     def step(self, token=None):
         try:
             output = self.context.step(token)
-        except self.api.exceptions.NoCredentialError:
-            raise AuthError("Windows Kerberos has no usable credentials. Enter the Mac account password; an LKDC realm may also require Windows KDC configuration.") from None
-        except Exception:
-            raise AuthError("Windows Kerberos ticket exchange failed; SSPI may need a configured KDC mapping for the Mac's LKDC realm. Use SRP until that setup is verified.") from None
+        except self.api.exceptions.NoCredentialError as error:
+            raise AuthError("Windows Kerberos has no usable credentials" + _diagnostic_code(error) + ". Enter the Mac account password; an LKDC realm may also require Windows KDC configuration.") from None
+        except Exception as error:
+            raise AuthError("Windows Kerberos ticket exchange failed" + _diagnostic_code(error) + "; check KDC routing, account credentials and service identity. The status code is needed to distinguish these causes.") from None
         if token is not None:
             if not self.context.complete or self.context.negotiated_protocol != "kerberos":
                 raise AuthError("Windows Kerberos context did not complete")
