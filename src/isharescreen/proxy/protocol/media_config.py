@@ -351,6 +351,16 @@ class MediaOfferConfig:
         if codec not in ("both", "hevc", "avc"):
             codec = "both"
         config = cls(video=VideoSettings(codec=codec))
+        chroma = os.environ.get("ISS_VIDEO_CHROMA", "auto")
+        if chroma not in ("auto", "444", "420"):
+            raise ValueError("video chroma must be auto, 444 or 420")
+        if chroma == "444":
+            if codec == "avc":
+                raise ValueError("H.264 4:4:4 is not supported by this client")
+            config.video.codec = "hevc"
+            config.video.pixel_formats = PixelFormat.YUV444_8_FULL | PixelFormat.YUV444_8_VIDEO
+        elif chroma == "420":
+            config.video.pixel_formats = PixelFormat.YUV420_8_FULL | PixelFormat.YUV420_8_VIDEO
         config.video.ltrp_enabled = codec != "avc" and os.environ.get("ISS_LTRP", "1") != "0"
         if "ISS_TILES_PER_FRAME" in os.environ:
             try:

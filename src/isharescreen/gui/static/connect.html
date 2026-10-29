@@ -40,9 +40,15 @@
 </div></div>
   <label for="codec">Video codec</label><select name="codec" id="codec">
    <option value="auto">Auto — choose for this viewer</option>
-   <option value="hevc">HEVC — full-color 4:4:4 desktop path</option>
-   <option value="avc">H.264 — compatible 4:2:0 path</option>
+   <option value="hevc">HEVC (H.265)</option>
+   <option value="avc">H.264 (AVC)</option>
   </select>
+  <label for="chroma">Chroma sampling</label><select name="chroma" id="chroma">
+   <option value="auto">Auto — negotiate with the Mac</option>
+   <option value="444">4:4:4 — full color detail</option>
+   <option value="420">4:2:0 — reduced color detail</option>
+  </select>
+  <p class="hint">Codec controls compression. Chroma controls color detail. This client currently supports H.264 with 4:2:0; HEVC can request either. The Mac determines the negotiated stream.</p>
   <p class="hint" id="video-hint">Browser viewing uses H.264. Choose Desktop for HEVC and manual decoder selection.</p>
   <label>Resolution</label>
   <select name="advertise" title="The encoded pixel resolution = how much bandwidth you use. Higher = sharper + more bandwidth. UI size is set separately by Display scale.">
@@ -85,7 +91,7 @@
 
  const form = document.querySelector('form');
  const storageKey = 'isharescreen.connection.v1';
- const fields = ['host','user','port','auth','frontend','codec','decoder','advertise','scale','audio','curtain','remember_password'];
+ const fields = ['host','user','port','auth','frontend','codec','chroma','decoder','advertise','scale','audio','curtain','remember_password'];
  const status = document.getElementById('settings-status');
  function saveSettings(){
    const settings = {};
@@ -109,6 +115,9 @@
    const browser=form.elements.frontend.value==='browser';
    for(const option of form.elements.codec.options) option.disabled=browser&&option.value==='hevc';
    if(browser && form.elements.codec.value==='hevc')form.elements.codec.value='auto';
+   const only420=browser||form.elements.codec.value==='avc';
+   form.elements.chroma.querySelector('[value="444"]').disabled=only420;
+   form.elements.chroma.setCustomValidity(only420&&form.elements.chroma.value==='444'?'Choose Auto or 4:2:0 for H.264/browser, or choose Desktop with HEVC.':'');
    form.elements.decoder.disabled=browser;
    for(const option of form.elements.decoder.options){
      option.disabled=form.elements.codec.value!=='auto' && !!option.dataset.codec && option.dataset.codec!==form.elements.codec.value;
@@ -122,7 +131,7 @@
  document.getElementById('advanced').addEventListener('toggle',saveSettings);
  document.getElementById('reset-settings').addEventListener('click',()=>{
    form.reset();form.elements.password.value='';
-   form.elements.codec.value='auto';form.elements.decoder.value='auto';
+   form.elements.codec.value='auto';form.elements.chroma.value='auto';form.elements.decoder.value='auto';
    form.elements.auth.value='kerberos';form.elements.remember_password.checked=false;
    document.getElementById('advanced').open=false;updateVideo();saveSettings();
  });

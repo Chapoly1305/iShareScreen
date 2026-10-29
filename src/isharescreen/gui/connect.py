@@ -259,16 +259,21 @@ def _launch(values: dict) -> None:
     codec = values.get("codec", "auto").strip() or "auto"
     decoder = values.get("decoder", "auto").strip() or "auto"
     frontend = values.get("frontend", "browser")
+    chroma = values.get("chroma", "auto")
     names = {spec.name for spec in all_specs()}
     normalized = normalize_override(decoder, codec if codec != "auto" else "hevc")
+    if chroma not in ("auto", "444", "420") or (chroma == "444" and (codec == "avc" or frontend == "browser")):
+        _emit("log", "[gui] 4:4:4 requires Desktop with HEVC or Auto codec")
+        return
     if (frontend not in ("browser", "desktop") or codec not in ("auto", "avc", "hevc")
             or (normalized is not None and normalized not in names)
             or (frontend == "browser" and codec == "hevc")):
         _emit("log", "[gui] invalid video settings; browser viewing requires H.264 or Auto")
         return
-    if codec != "auto" and normalized is not None:
+    effective_codec = "hevc" if chroma == "444" and codec == "auto" else codec
+    if effective_codec != "auto" and normalized is not None:
         spec = next(spec for spec in all_specs() if spec.name == normalized)
-        if spec.codec != codec:
+        if spec.codec != effective_codec:
             _emit("log", "[gui] selected decoder does not support the selected codec; choose Auto or a matching decoder")
             return
     _kill_current()            # Reconnect / new connection replaces the old one
@@ -315,7 +320,7 @@ def _launch(values: dict) -> None:
         cmd += ["--hidpi", scale]
     decoder = values.get("decoder", "auto").strip() or "auto"
     codec = values.get("codec", "auto").strip() or "auto"
-    cmd += ["--decoder", decoder, "--codec", codec]
+    cmd += ["--decoder", decoder, "--codec", codec, "--chroma", chroma]
     if values.get("curtain") != "on":
         cmd.append("--no-curtain")
     if values.get("audio") != "on":

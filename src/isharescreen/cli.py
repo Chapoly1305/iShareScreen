@@ -189,6 +189,8 @@ def _make_parser() -> argparse.ArgumentParser:
             "see the matrix and which are available on this machine."
         ),
     )
+    g.add_argument("--chroma", choices=["auto", "444", "420"], default=None,
+                   help="chroma sampling preference, independent of codec (H.264 4:4:4 is not supported)")
     g.add_argument(
         "--codec", choices=["auto", "hevc", "avc"], default=None,
         help=(
@@ -552,7 +554,17 @@ def _apply_video_overrides(args: argparse.Namespace) -> None:
                 "for supported names (for H.264 use libav-avc420)"
             )
 
-    for name, value in (("ISS_DECODER", decoder), ("ISS_VIDEO_CODEC", args.codec)):
+    chroma = args.chroma
+    effective_chroma = chroma if chroma is not None else os.environ.get("ISS_VIDEO_CHROMA", "auto")
+    effective_codec = args.codec if args.codec is not None else os.environ.get("ISS_VIDEO_CODEC", "auto")
+    if effective_chroma == "444" and (effective_codec == "avc" or args.frontend == "browser"):
+        raise ValueError("4:4:4 requires the desktop HEVC path; H.264/browser 4:4:4 is not supported")
+    effective_decoder = decoder if decoder is not None else os.environ.get("ISS_DECODER", "auto")
+    decoder_id = registry.normalize_override(effective_decoder, "hevc")
+    if effective_chroma == "444" and any(spec.name == decoder_id and spec.codec == "avc" for spec in registry.all_specs()):
+        raise ValueError("4:4:4 requires an HEVC decoder; choose Auto or an HEVC decoder")
+    codec = "hevc" if effective_chroma == "444" and effective_codec in ("auto", "both") else args.codec
+    for name, value in (("ISS_DECODER", decoder), ("ISS_VIDEO_CODEC", codec), ("ISS_VIDEO_CHROMA", chroma)):
         if value == "auto":
             os.environ.pop(name, None)
         elif value is not None:
