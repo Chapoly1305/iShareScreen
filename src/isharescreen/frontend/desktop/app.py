@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import sys
 import threading
 import time
 from typing import Optional
@@ -69,6 +70,25 @@ _WHEEL_MULT = 12.0
 _MIN_ADVERTISE_H = 480
 _MAX_ADVERTISE_W = 1920  # server backing 3840 / mode-table ratio 2
 _MAX_ADVERTISE_H = 1080
+
+
+def _set_window_identity() -> None:
+    """Set Linux compositor hints when the loaded GLFW library supports them."""
+    if sys.platform != "linux" or not glfw.init():
+        return
+    hint_string = getattr(glfw, "window_hint_string", None)
+    if hint_string is None:
+        return
+    hints = ["X11_CLASS_NAME", "X11_INSTANCE_NAME"]
+    if glfw.get_version() >= (3, 4, 0):
+        hints.append("WAYLAND_APP_ID")
+    for name in hints:
+        hint = getattr(glfw, name, None)
+        if hint is not None:
+            try:
+                hint_string(hint, "isharescreen")
+            except Exception as exc:
+                log.debug("window identity hint %s unavailable: %s", name, exc)
 
 
 def _even(n: int) -> int:
@@ -362,12 +382,9 @@ def run(
     # Give the window a stable identity (Wayland app_id / X11 WM_CLASS).
     # GLFW leaves both empty by default, so compositors and window rules
     # (Hyprland windowrules, keybind-passthrough tools, etc.) can only
-    # match iss by its title, which changes per session. rendercanvas never
-    # resets window hints, so these carry through to every window it builds.
-    glfw.init()
-    glfw.window_hint_string(glfw.WAYLAND_APP_ID, "isharescreen")
-    glfw.window_hint_string(glfw.X11_CLASS_NAME, "isharescreen")
-    glfw.window_hint_string(glfw.X11_INSTANCE_NAME, "isharescreen")
+    # match iss by its title, which changes per session. Apply these before
+    # each window, including the secondary windows below.
+    _set_window_identity()
     window = RenderCanvas(title=title, size=(win_w, win_h), max_fps=120)
     glfw_window = window._window  # for raw glfw input callbacks only
     # Lock the window to the content's aspect ratio so the stream always fills
@@ -747,6 +764,7 @@ def run(
         base = min(rw0, 1280) or 1280
         win_w2 = max(1, base)
         win_h2 = max(1, int(base * rh0 / rw0)) if rw0 else base
+        _set_window_identity()
         w2 = RenderCanvas(title=title_s, size=(win_w2, win_h2), max_fps=120)
         gw2 = w2._window
         try:

@@ -60,6 +60,9 @@ def test_other_platforms_still_use_16(monkeypatch):
 
 def test_vt_refusal_uses_software_without_disabling_hardware(monkeypatch):
     monkeypatch.setattr(avc.sys, "platform", "darwin")
+    # PR #27 filters against the build's actual device types. Simulate a
+    # macOS PyAV build as well as its platform when running on Windows/Linux.
+    monkeypatch.setattr(avc, "_h264_hwaccels", lambda: ("videotoolbox",))
     decoder = AvcDecoder(1)
     decoder._sps = SPS_12_REFS
     decoder._pps = PPS
