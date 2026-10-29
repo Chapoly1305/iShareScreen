@@ -179,6 +179,38 @@ def test_avc_never_advertises_unsupported_ltrp():
         config.validate()
 
 
+@pytest.mark.parametrize("codec", ["avc", "hevc", "both"])
+def test_empty_pixel_format_offer_rejected(codec):
+    config = MediaOfferConfig()
+    config.video.codec = codec
+    config.video.pixel_formats = PixelFormat(0)
+    with pytest.raises(ValueError, match="at least one format"):
+        config.validate()
+
+
+@pytest.mark.parametrize("formats", [
+    PixelFormat.YUV444_8_FULL,
+    PixelFormat.YUV444_8_VIDEO | PixelFormat.YUV444_10_FULL,
+    PixelFormat.YUV420_10_VIDEO,
+])
+def test_avc_requires_supported_chroma_and_bit_depth(formats):
+    config = MediaOfferConfig()
+    config.video.codec = "avc"
+    config.video.pixel_formats = formats
+    with pytest.raises(ValueError, match="8-bit YUV420"):
+        config.validate()
+
+
+@pytest.mark.parametrize("formats", [
+    PixelFormat.YUV420_8_FULL, PixelFormat.YUV420_8_VIDEO, PixelFormat.ALL,
+])
+def test_avc_accepts_compatible_pixel_format_sets(formats):
+    config = MediaOfferConfig()
+    config.video.codec = "avc"
+    config.video.pixel_formats = formats
+    config.validate()
+
+
 def test_explicit_audio_capability_override_preserves_legacy_precedence():
     config = MediaOfferConfig()
     config.audio.payload_flags = 12345
@@ -213,6 +245,40 @@ def test_session_sends_snapshot_and_aligns_decoder_and_ltrp(monkeypatch):
         session._negotiate_and_burst(session._config)
 
 
+@pytest.mark.parametrize("codec,offered,negotiated,expected", [
+    ("hevc", None, 0, 4),
+    ("avc", None, 0, 1),
+    ("hevc", 2, 0, 2),
+    ("hevc", 4, 2, 2),
+])
+def test_initial_burst_tile_count_fallback(monkeypatch, codec, offered, negotiated, expected):
+    config = MediaOfferConfig()
+    config.video.codec = codec
+    config.video.tiles_per_frame = offered
+    session = Session(SessionConfig(
+        host="example.invalid", username="user", password="unused", media_offer=config,
+    ))
+    negotiation = SimpleNamespace(
+        canvas_tiles=negotiated, video_decryptor=object(),
+        keys=SimpleNamespace(audio_key_s=b"", video_key_s=b"", video_key_v=b""),
+    )
+    monkeypatch.setattr(session_module, "connect_and_negotiate", lambda *a, **kw: negotiation)
+    monkeypatch.setattr(session_module, "extract_offer_ssrc", lambda *a, **kw: None)
+    for cls in (session_module.SRTPDecryptor, session_module.SRTCPDecryptor,
+                session_module.SRTCPEncryptor):
+        monkeypatch.setattr(cls, "from_blob", lambda *a: object())
+    monkeypatch.setattr(session, "_drain_socket_into", lambda *a, **kw: None)
+    burst = object()
+
+    def gather(packets, decryptor, **kwargs):
+        assert kwargs["tile_group_size"] == expected
+        assert kwargs["codec"] == codec
+        return burst
+
+    monkeypatch.setattr(session_module, "gather_initial_burst", gather)
+    assert session._negotiate_and_burst(session._config) is burst
+
+
 def test_resize_fallback_keeps_configured_offer(monkeypatch):
     config = MediaOfferConfig().set_video_bitrate(30_000_000)
     session = Session(SessionConfig(
@@ -239,3 +305,12 @@ def test_srtp_grouping_accepts_offered_tile_count_without_global_environment(mon
     decryptor._counts.update({100: 10, 101: 20, 102: 30, 103: 40})
     assert decryptor.get_primary_ssrc_group(group_size=1) == {103}
     assert decryptor.get_primary_ssrc_group(group_size=4) == {100, 101, 102, 103}
+
+
+def test_environment_bandwidth_reaches_serialized_offers(monkeypatch):
+    monkeypatch.setenv("ISS_VIDEO_BITRATE_BPS", "25000000")
+    video, audio = offers.create_offers()
+    assert _desktop_caps(_blob(video)) == [25_000_000]
+    assert _desktop_caps(_blob(audio)) == [25_000_000]
+    monkeypatch.delenv("ISS_VIDEO_BITRATE_BPS")
+    assert MediaOfferConfig.from_environment().bandwidth == MediaOfferConfig().bandwidth

@@ -9,8 +9,10 @@ on the render thread.
 from __future__ import annotations
 
 import dataclasses
+from contextlib import ExitStack
 import logging
 import os
+import sys
 import threading
 import time
 from typing import Optional
@@ -23,7 +25,7 @@ from ...proxy.protocol.negotiation import AdvertiseDims
 from ...proxy.session import Session, SessionConfig
 from .audio_sink import make_audio_sink
 from .gpu import Renderer
-from .keymap import GLFW_KEY_TO_X11, glfw_button_to_rfb_bit
+from .keymap import GLFW_KEY_TO_X11, OPTION_TYPES_TEXT, glfw_button_to_rfb_bit
 from ...enhancement.live import EnhancementDisplay, EnhancementWorker
 
 
@@ -70,6 +72,25 @@ _WHEEL_MULT = 12.0
 _MIN_ADVERTISE_H = 480
 _MAX_ADVERTISE_W = 1920  # server backing 3840 / mode-table ratio 2
 _MAX_ADVERTISE_H = 1080
+
+
+def _set_window_identity() -> None:
+    """Set Linux compositor hints when the loaded GLFW library supports them."""
+    if sys.platform != "linux" or not glfw.init():
+        return
+    hint_string = getattr(glfw, "window_hint_string", None)
+    if hint_string is None:
+        return
+    hints = ["X11_CLASS_NAME", "X11_INSTANCE_NAME"]
+    if glfw.get_version() >= (3, 4, 0):
+        hints.append("WAYLAND_APP_ID")
+    for name in hints:
+        hint = getattr(glfw, name, None)
+        if hint is not None:
+            try:
+                hint_string(hint, "isharescreen")
+            except Exception as exc:
+                log.debug("window identity hint %s unavailable: %s", name, exc)
 
 
 def _even(n: int) -> int:
@@ -192,9 +213,10 @@ def _resolve_hidpi_request(
     return req_w, req_h, scale
 
 
-def run(
+def _run_viewer(
     config: SessionConfig,
     *,
+    resources: ExitStack,
     title: str = "iShareScreen",
     auto_quit_secs: int = 0,
     display: int = -1,
@@ -263,7 +285,10 @@ def run(
         log.info("fixed advertise %dx%d @%gx (rendering the picked resolution)",
                  config.advertise.width, config.advertise.height,
                  config.advertise.hidpi_scale)
+    window_resources = resources.enter_context(ExitStack())
     session = Session(config)
+    # Stop frame producers before closing their native window consumers.
+    resources.callback(session.close)
     session.connect()
 
     # Audio playback. `make_audio_sink()` returns None when the OS
@@ -273,6 +298,7 @@ def run(
     # render thread never touches it.
     audio_sink = make_audio_sink() if config.audio else None
     if audio_sink is not None:
+        resources.callback(audio_sink.stop)
         session.set_audio_callback(audio_sink.feed)
 
     # Clipboard sync (both directions) lives in Session — every frontend
@@ -360,7 +386,14 @@ def run(
     adv = config.advertise
     win_w = (adv.width if adv else 0) or scaled_w or canvas_w
     win_h = (adv.height if adv else 0) or scaled_h or canvas_h
+    # Give the window a stable identity (Wayland app_id / X11 WM_CLASS).
+    # GLFW leaves both empty by default, so compositors and window rules
+    # (Hyprland windowrules, keybind-passthrough tools, etc.) can only
+    # match iss by its title, which changes per session. Apply these before
+    # each window, including the secondary windows below.
+    _set_window_identity()
     window = RenderCanvas(title=title, size=(win_w, win_h), max_fps=120)
+    window_resources.callback(window.close)
     glfw_window = window._window  # for raw glfw input callbacks only
     # Lock the window to the content's aspect ratio so the stream always fills
     # it edge-to-edge with no letterbox side-bars (restores pre-merge behavior;
@@ -435,6 +468,8 @@ def run(
     # An enhanced result must also wake it, even when no new tile arrives.
     enhancement = EnhancementWorker(device=os.environ.get("ISS_SR_DEVICE", "auto"),
                                     wakeup=session._fresh_evt.set)
+    resources.callback(enhancement.close)
+    resources.callback(setattr, session, "_enhancement_backend", None)
     session._enhancement_backend = enhancement
     sr_display = EnhancementDisplay(enhancement, renderer, canvas_w, canvas_h, num_tiles)
 
@@ -672,6 +707,8 @@ def run(
             # raw ASCII letter / digit. X11 keysyms for A–Z and 0–9
             # are just their ASCII codepoints.
             held = mods & (glfw.MOD_CONTROL | glfw.MOD_SUPER | glfw.MOD_ALT)
+            if held == glfw.MOD_ALT and OPTION_TYPES_TEXT:
+                return  # Option + key types a character; on_char sends it
             if held and glfw.KEY_A <= key <= glfw.KEY_Z:
                 keysym = ord("a") + (key - glfw.KEY_A)
             elif held and glfw.KEY_0 <= key <= glfw.KEY_9:
@@ -714,6 +751,7 @@ def run(
             glfw_window,
             key_sender=lambda is_down, ks: session.input.key_event(is_down, ks),
         )
+        resources.callback(kbd_grab.disable)
         # Initial enable if window already focused at startup.
         if glfw.get_window_attrib(glfw_window, glfw.FOCUSED):
             kbd_grab.enable()
@@ -743,7 +781,9 @@ def run(
         base = min(rw0, 1280) or 1280
         win_w2 = max(1, base)
         win_h2 = max(1, int(base * rh0 / rw0)) if rw0 else base
+        _set_window_identity()
         w2 = RenderCanvas(title=title_s, size=(win_w2, win_h2), max_fps=120)
+        window_resources.callback(w2.close)
         gw2 = w2._window
         try:
             glfw.set_window_aspect_ratio(gw2, rw0, rh0)
@@ -827,6 +867,8 @@ def run(
             keysym = GLFW_KEY_TO_X11.get(key, 0)
             if keysym == 0:
                 held = mods & (glfw.MOD_CONTROL | glfw.MOD_SUPER | glfw.MOD_ALT)
+                if held == glfw.MOD_ALT and OPTION_TYPES_TEXT:
+                    return
                 if held and glfw.KEY_A <= key <= glfw.KEY_Z:
                     keysym = ord("a") + (key - glfw.KEY_A)
                 elif held and glfw.KEY_0 <= key <= glfw.KEY_9:
@@ -1411,6 +1453,11 @@ def run(
             sr_display.update_tile(ti, tf, slot_h)
             any_fresh = True
 
+        # Flush staged uploads every frame; without a draw (e.g. window hidden)
+        # they pile up and flood the GPU driver on the next submit.
+        if any_fresh:
+            device.queue.submit([])
+
         # Model switching also repaints static screens. Retain just one pending
         # canvas while inference runs; stale work from prior selections/resizes
         # is rejected by the worker's generation counter.
@@ -1440,32 +1487,22 @@ def run(
             _cursor_dirty["v"] = False
 
     log.info("desktop frontend closing")
-    session._enhancement_backend = None
-    enhancement.close()
-    for sv in secondaries:
-        try:
-            sv.window.close()
-        except Exception:
-            pass
-    if kbd_grab is not None:
-        kbd_grab.disable()
-    if audio_sink is not None:
-        audio_sink.stop()
-    session.close()
-    # Explicit window close — triggers orderly wgpu cleanup. Without
-    # this we'd rely on __del__ when locals fall out of scope, and the
-    # interpreter's GC ordering can deadlock the wgpu native poller
-    # (observed: main thread stuck in wgpu _release proxy_func at exit).
-    try:
-        window.close()
-    except Exception as e:
-        log.debug("window.close() failed: %s", e)
-    # Fail-safe: bypass Python's interpreter-shutdown phase. We've
-    # already released the network sockets, audio device, and X11
-    # grab; anything left to clean up belongs to the kernel and gets
-    # reclaimed by the process exit. Avoids the rare wgpu-__del__
-    # deadlock at scope unwind that leaves the process hung.
-    os._exit(0)
+    return 0
+
+
+def run(config: SessionConfig, *, exit_process: bool = False, **options) -> int:
+    """Run a viewer with deterministic resource ownership.
+
+    Only the CLI requests the native process-exit workaround. Embedders and
+    tests receive a normal return after resources have been released.
+    """
+    with ExitStack() as resources:
+        result = _run_viewer(config, resources=resources, **options)
+    if exit_process:
+        # Retain the existing workaround for native destructor crashes at exit.
+        os._exit(result)
+    return result
+
 
 
 __all__ = ["run"]

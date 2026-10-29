@@ -24,7 +24,7 @@ def main() -> int:
     # A connection / session on the command line (`--host …`), or the
     # script/help flags, run the cli directly with no GUI — this is also how
     # the GUI form launches the actual session under the hood.
-    if "--host" in argv or any(a in _CLI_ROUTING_FLAGS for a in argv):
+    if any(a == "--host" or a.startswith("--host=") for a in argv) or any(a in _CLI_ROUTING_FLAGS for a in argv):
         from isharescreen.cli import main as cli_main
         return cli_main()
     # Default: the browser connect form + live diagnostics dashboard.

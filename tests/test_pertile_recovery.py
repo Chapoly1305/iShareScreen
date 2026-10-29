@@ -73,6 +73,7 @@ def _make_decoder(num_tiles: int = 4, *, with_codec: bool = False) -> HevcDecode
     # State touched by `_decode_one`'s IDR / packet paths.
     d._codec = _StubCodec() if with_codec else None
     d._codec_lock = threading.Lock()
+    d._lifecycle_lock = threading.RLock()
     d._next_pts = 0
     d._pts_to_tile = {}
     d._pts_submit_t = {}
@@ -101,7 +102,8 @@ def _publish_into(d: HevcDecoder, tile_idx: int) -> None:
     """Drop a fresh decoded frame into a tile slot, as `_publish_frame`
     would, so the next `get_frame(tile_idx)` has something to evaluate."""
     slot = d._tiles[tile_idx]
-    slot.raw_frame = _tiny_frame()
+    from isharescreen.proxy.media.decode_common import _av_frame_to_tile
+    slot.raw_frame, slot.prepared_error = _av_frame_to_tile(_tiny_frame(), [None], set())
     slot.good_count += 1
 
 

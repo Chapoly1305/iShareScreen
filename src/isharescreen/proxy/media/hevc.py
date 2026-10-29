@@ -34,6 +34,7 @@ import os
 import queue
 import sys
 import threading
+import time
 from typing import Callable, Optional
 
 
@@ -56,6 +57,8 @@ from .decode_common import (
     _CODEC_FLAG2_FAST,
     _TileSlot,
     _HW_FRAME_FORMATS,
+    available_hwaccels,
+    context_is_hwaccel,
     _av_frame_to_tile,
 )
 
@@ -92,6 +95,8 @@ _PERTILE_RECOVERY = os.environ.get("ISS_PERTILE_RECOVERY", "1") != "0"
 # Decode-worker queue + lifecycle.
 _QUEUE_MAX = 512                           # NALUs in flight to the decoder
 _WORKER_DEQUEUE_TIMEOUT_S = 0.5
+_AMD_DOWNLOAD_BATCH_MAX = 4
+_AMD_DOWNLOAD_WAIT_S = 0.004
 _WORKER_JOIN_TIMEOUT_S = 2.0
 
 # HW-accel fallback thresholds — empirical (Windows D3D11VA, Linux iGPU
@@ -132,7 +137,8 @@ _PLATFORM_HWACCELS: dict[str, tuple[str, ...]] = {
 
 
 def _platform_hwaccels() -> tuple[str, ...]:
-    return _PLATFORM_HWACCELS.get(sys.platform, _PLATFORM_HWACCELS["*"])
+    return available_hwaccels(
+        _PLATFORM_HWACCELS.get(sys.platform, _PLATFORM_HWACCELS["*"]))
 
 
 # `_TileSlot`, `_HW_FRAME_FORMATS`, and `_av_frame_to_tile` now live in
@@ -170,6 +176,7 @@ class HevcDecoder:
         num_tiles: int,
         *,
         prefer_hwaccel: bool = True,
+        amd_only: bool = False,
         enable_quality_gate: bool = True,
         on_frame_published: Optional[Callable[[int], None]] = None,
     ) -> None:
@@ -177,6 +184,10 @@ class HevcDecoder:
             raise ValueError("num_tiles must be positive")
         self.num_tiles = num_tiles
         self._prefer_hwaccel = prefer_hwaccel
+        self._amd_only = amd_only
+        # At most four GPU outputs; only the decode producer owns this.
+        self._pending_downloads: list[tuple[int, av.VideoFrame, bool]] = []
+        self._pending_since = 0.0
         self._on_frame_published = on_frame_published
 
         self._codec: Optional[av.codec.context.CodecContext] = None
@@ -187,6 +198,10 @@ class HevcDecoder:
         # SEGVs on the next dereference. We've seen this crash named
         # `libavcodec...+0x43a9d0` from the `hevc-decode` thread.
         self._codec_lock = threading.Lock()
+        # Serialize complete lifecycle transitions, including worker shutdown.
+        # The decode worker only takes _codec_lock, so joining it while holding
+        # this separate lock does not block the worker's exit.
+        self._lifecycle_lock = threading.RLock()
         self._reformatter: list[Optional[av.video.reformatter.VideoReformatter]] = [None]
         self._seen_fmts: set[str] = set()
         self._gate = FrameQualityGate(num_tiles, enabled=enable_quality_gate)
@@ -299,7 +314,8 @@ class HevcDecoder:
         first `feed_nalu` outside burst mode."""
         if not (self._vps and self._sps and self._all_pps):
             raise RuntimeError("set_params() must be called before start()")
-        self._create_codec(force_software=False)
+        with self._lifecycle_lock:
+            self._create_codec(force_software=False)
 
     # -- decoder feed --------------------------------------------------
 
@@ -386,6 +402,7 @@ class HevcDecoder:
                         self._fallback_to_software(tile_nalu_cache)
                         return
         finally:
+            self._flush_downloads()
             self._sync_decode_mode = False
 
         good = sum(t.good_count for t in self._tiles)
@@ -499,6 +516,12 @@ class HevcDecoder:
         tile; its healthy siblings keep publishing from their own intact
         DPB history.
         """
+        # All backends return CPU tiles prepared by the decode producer.
+        # Serialize consumption with lifecycle resets, never with GPU work.
+        with self._lifecycle_lock:
+            return self._get_frame_locked(tile_idx)
+
+    def _get_frame_locked(self, tile_idx: int) -> Optional[TileFrame]:
         if not self._dpb_has_idr:
             return None
         if _PERTILE_RECOVERY and tile_idx in self._tiles_await_idr:
@@ -506,15 +529,14 @@ class HevcDecoder:
         slot = self._tiles[tile_idx]
         with slot.lock:
             frame = slot.raw_frame
+            prepared_error = slot.prepared_error
             count = slot.good_count
             already_evaluated = count <= slot.last_evaluated_count
 
         if frame is None or already_evaluated:
             return None
 
-        tile_frame, had_decode_error = _av_frame_to_tile(
-            frame, self._reformatter, self._seen_fmts,
-        )
+        tile_frame, had_decode_error = frame, prepared_error
         with slot.lock:
             slot.last_evaluated_count = count
 
@@ -592,13 +614,15 @@ class HevcDecoder:
 
         Skips rebuild if `set_params` was never called — restart on an
         unconfigured decoder is just a teardown."""
-        self._teardown()
-        if self._vps and self._sps and self._all_pps:
-            self._create_codec(force_software=self._hw_failed)
+        with self._lifecycle_lock:
+            self._teardown()
+            if self._vps and self._sps and self._all_pps:
+                self._create_codec(force_software=self._hw_failed)
 
     def close(self) -> None:
         """Permanent shutdown. Stops the worker, releases the codec context."""
-        self._teardown()
+        with self._lifecycle_lock:
+            self._teardown()
 
     # -- internals: decode --------------------------------------------
 
@@ -742,14 +766,19 @@ class HevcDecoder:
     def _publish_frame(self, frame: av.VideoFrame) -> None:
         """Map `frame.pts` back to its source tile and update that slot."""
         # One-time HW-binding truthfulness check: if we requested a hwaccel
-        # but the output is a software pixel format, the accel never bound
-        # (e.g. D3D11VA on a 4:4:4 stream) — relabel as software so the
+        # but it never bound (e.g. D3D11VA on a 4:4:4 stream) — judged by
+        # `is_hwaccel` where PyAV has it, else by a software output pixel
+        # format — relabel as software so the
         # profile log / `hw_accel` are honest and downstream stops assuming
         # a GPU surface. The decode itself is unaffected; only the label.
         if not self._hw_verified:
             self._hw_verified = True
-            if (self._hw_name is not None
-                    and frame.format.name not in _HW_FRAME_FORMATS):
+            # is_hwaccel is authoritative where PyAV has it: a bound NVDEC
+            # context still returns yuv444p after the hwdownload.
+            bound = context_is_hwaccel(self._codec)
+            if bound is None:
+                bound = frame.format.name in _HW_FRAME_FORMATS
+            if self._hw_name is not None and not bound:
                 log.warning(
                     "hwaccel %r did not bind for this stream (output=%s); "
                     "decoding in software", self._hw_name, frame.format.name,
@@ -776,9 +805,45 @@ class HevcDecoder:
         flg = getattr(frame, "flags", 0)
         had_error = bool(err) or bool(flg & 0x01)
 
+        if self._amd_only:
+            if not self._pending_downloads:
+                self._pending_since = time.perf_counter()
+            self._pending_downloads.append((ti, frame, had_error))
+            if len(self._pending_downloads) >= min(self.num_tiles, _AMD_DOWNLOAD_BATCH_MAX):
+                self._flush_downloads()
+            return
+        self._prepare_frame(ti, frame, had_error)
+
+    def _flush_downloads(self) -> None:
+        # Submit several decode operations before waiting on their readbacks.
+        # The decode producer is the only GPU-frame consumer; the window sees
+        # CPU-owned bytes only. Do not hold a codec/lifecycle lock while joining
+        # this producer during shutdown.
+        pending, self._pending_downloads = self._pending_downloads, []
+        for ti, frame, had_error in pending:
+            self._prepare_frame(ti, frame, had_error)
+
+    def _prepare_frame(self, ti: int, frame: av.VideoFrame, had_error: bool) -> None:
+        # Run on the decode producer, before notifying the display thread.
+        # Non-AMD backends publish immediately; they do not inherit AMD's
+        # hardware-specific batching delay.
+        try:
+            tile, conversion_error = _av_frame_to_tile(
+                frame, self._reformatter, self._seen_fmts,
+            )
+        except Exception:
+            log.exception("HEVC frame preparation failed for tile %d", ti)
+            return
+        if tile is not None:
+            self._store_frame(ti, tile, had_error or conversion_error)
+
+    def _store_frame(
+        self, ti: int, frame: TileFrame, had_error: bool,
+    ) -> None:
         slot = self._tiles[ti]
         with slot.lock:
             slot.raw_frame = frame
+            slot.prepared_error = had_error
             slot.good_count += 1
             if not had_error:
                 slot.clean_count += 1
@@ -947,6 +1012,7 @@ class HevcDecoder:
         try:
             for frame in codec.decode(None):
                 self._publish_frame(frame)
+            self._flush_downloads()
         except Exception as e:
             log.debug("drain_codec_to_slots: %s", e)
 
@@ -988,14 +1054,21 @@ class HevcDecoder:
             return
         while not self._stop.is_set():
             try:
-                item = q.get(timeout=_WORKER_DEQUEUE_TIMEOUT_S)
+                timeout = _WORKER_DEQUEUE_TIMEOUT_S
+                if self._pending_downloads:
+                    # Never wait indefinitely for a quiet or unchanged tile.
+                    timeout = max(0.0, _AMD_DOWNLOAD_WAIT_S - (time.perf_counter() - self._pending_since))
+                item = q.get(timeout=timeout)
             except queue.Empty:
+                self._flush_downloads()
                 continue
             if item is None:
                 break
             nalu, tile_idx = item
             try:
                 self._decode_one(nalu, tile_idx)
+                if self._pending_downloads and time.perf_counter() - self._pending_since >= _AMD_DOWNLOAD_WAIT_S:
+                    self._flush_downloads()
             except Exception as e:
                 log.warning("hevc-decode worker swallowed error: %s", e)
 
@@ -1017,10 +1090,10 @@ class HevcDecoder:
         extradata = self._build_extradata()
 
         if not force_software and self._prefer_hwaccel and not self._hw_failed:
-            for hw_type in _platform_hwaccels():
+            for hw_type in (("d3d11va",) if self._amd_only else _platform_hwaccels()):
                 ctx = self._try_hwaccel(hw_type, extradata)
                 if ctx is not None:
-                    self._install_codec(ctx, hw_name=hw_type)
+                    self._install_codec(ctx, hw_name="AMD d3d11va" if self._amd_only else hw_type)
                     return
 
         self._install_codec(self._make_sw_context(extradata), hw_name=None)
@@ -1031,7 +1104,11 @@ class HevcDecoder:
         try:
             from av.codec.hwaccel import HWAccel
 
-            hw = HWAccel(device_type=hw_type)
+            if self._amd_only:
+                from .amd import hardware_accel
+                hw = hardware_accel(defer_download=True)
+            else:
+                hw = HWAccel(device_type=hw_type)
             c = av.CodecContext.create("hevc", "r", hwaccel=hw)
             c.extradata = extradata
             # SLICE threading (parallelise within a frame), all cores.
@@ -1046,6 +1123,13 @@ class HevcDecoder:
             # ignores this setting.
             c.thread_type = "SLICE"
             c.thread_count = 0
+            if self._amd_only:
+                # D3D11 uses a fixed surface pool. Leave room beyond the HEVC
+                # reference pictures for four published tiles and in-flight
+                # frames. Hardware provides parallelism; CPU slice workers
+                # must not inflate surface demand on this low-delay path.
+                c.thread_count = 1
+                c.options = {"extra_hw_frames": "16"}
             c.flags = _CODEC_FLAG_LOW_DELAY
             c.flags2 = _CODEC_FLAG2_FAST
             c.open()
@@ -1055,6 +1139,8 @@ class HevcDecoder:
             return None
 
     def _make_sw_context(self, extradata: bytes) -> av.codec.context.CodecContext:
+        if self._amd_only:
+            raise RuntimeError("AMD hardware could not decode this stream; choose another decoder or chroma setting")
         # Single shared context, SLICE threading across all cores. SLICE
         # parallelises within a single frame's CTU rows (no frame reordering,
         # no added latency), so the cross-tile/cross-frame DPB refs Apple's
@@ -1079,8 +1165,9 @@ class HevcDecoder:
         # _try_hwaccel labels the context with the REQUESTED hwaccel, but the
         # accel only binds in get_format. e.g. DXVA2/D3D11VA are never offered
         # for HEVC 4:4:4, so on Windows Apple's stream silently decodes in
-        # software through a context still labelled "d3d11va". Re-verify from
-        # the first real frame's pixel format (see _publish_frame).
+        # software through a context still labelled "d3d11va". Re-verify on
+        # the first real frame: `is_hwaccel` where PyAV has it, else the
+        # frame's pixel format (see _publish_frame).
         self._hw_verified = False
         self._reformatter[0] = None
         self._seen_fmts.clear()
@@ -1102,6 +1189,12 @@ class HevcDecoder:
     ) -> None:
         """Tear down the HW codec context, build SW one, optionally re-feed
         the burst NALUs."""
+        with self._lifecycle_lock:
+            self._fallback_to_software_locked(tile_nalu_cache)
+
+    def _fallback_to_software_locked(
+        self, tile_nalu_cache: Optional[dict[int, list[bytes]]],
+    ) -> None:
         log.warning("falling back from %s to software decode", self._hw_name)
         self._hw_failed = True
         self._teardown()
@@ -1133,6 +1226,7 @@ class HevcDecoder:
         can't be mid-decode when we null `_codec` — that's the path
         that produced SIGSEGV in libavcodec's HEVC decoder."""
         self._stop_worker()
+        self._pending_downloads.clear()
         with self._codec_lock:
             if self._codec is not None:
                 try:
@@ -1147,6 +1241,7 @@ class HevcDecoder:
         for slot in self._tiles:
             with slot.lock:
                 slot.raw_frame = None
+                slot.prepared_error = False
                 slot.good_count = 0
                 slot.clean_count = 0
                 slot.last_evaluated_count = 0

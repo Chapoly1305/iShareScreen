@@ -180,7 +180,7 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
     g.add_argument(
-        "--decoder", metavar="NAME", default="auto",
+        "--decoder", metavar="NAME", default=None,
         help=(
             "video decoder to use. 'auto' (default) picks the best available "
             "decoder for the negotiated codec; or force one by name — "
@@ -189,8 +189,10 @@ def _make_parser() -> argparse.ArgumentParser:
             "see the matrix and which are available on this machine."
         ),
     )
+    g.add_argument("--chroma", choices=["auto", "444", "420"], default=None,
+                   help="chroma sampling preference, independent of codec (H.264 4:4:4 is not supported)")
     g.add_argument(
-        "--codec", choices=["auto", "hevc", "avc"], default="auto",
+        "--codec", choices=["auto", "hevc", "avc"], default=None,
         help=(
             "video codec: 'auto' (default) probes GPU capability and picks "
             "HEVC 4:4:4 when available, else H.264 4:2:0; 'hevc' forces "
@@ -483,7 +485,7 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
         # HEVC HW is present we leave ISS_VIDEO_CODEC unset so the proven
         # "both"-bank offer (Apple-byte-identical → server sends HEVC) is
         # unchanged. An explicit --codec / --decoder still wins (env already set).
-        if args.codec == "auto" and "ISS_VIDEO_CODEC" not in os.environ:
+        if args.codec in (None, "auto") and "ISS_VIDEO_CODEC" not in os.environ:
             from .proxy.media.registry import resolve_codec
             if resolve_codec("auto") == "avc":
                 os.environ["ISS_VIDEO_CODEC"] = "avc"
@@ -509,12 +511,12 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
                     log.warning("--display %r not understood (want N, 'all', or "
                                 "'combined') — auto-opening one window per "
                                 "monitor", args.display)
-        return run_desktop(config, auto_quit_secs=args.auto_quit_secs,
+        return run_desktop(config, exit_process=True, auto_quit_secs=args.auto_quit_secs,
                            display=display_idx, display_all=display_all)
     # browser (default): H.264 pass-through needs the AVC codec path. The
     # Session reads ISS_VIDEO_CODEC at construction, so force it unless the
     # user explicitly chose a codec.
-    if args.codec == "auto":
+    if args.codec in (None, "auto") and "ISS_VIDEO_CODEC" not in os.environ:
         os.environ["ISS_VIDEO_CODEC"] = "avc"
     # Use the cursor pseudo-encoding (RFB enc 1104), same as the wgpu viewer:
     # the daemon does NOT bake the cursor into the framebuffer, it sends cursor
@@ -535,8 +537,49 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
 
 # ── entry point ──────────────────────────────────────────────────────
 
+def _apply_video_overrides(args: argparse.Namespace) -> None:
+    """Omitted CLI values inherit settings; explicit auto clears an override."""
+    from .proxy.media import registry
+
+    decoder = args.decoder
+    if decoder is not None:
+        decoder = decoder.strip().lower()
+        # Hardware APIs such as d3d11va are not decoder registry IDs.
+        normalized = registry.normalize_override(decoder, args.codec or "hevc")
+        if not decoder or (normalized is not None and normalized not in {
+            spec.name for spec in registry.all_specs()
+        }):
+            raise ValueError(
+                f"unknown decoder {args.decoder!r}; use --list-decoders "
+                "for supported names (for H.264 use libav-avc420)"
+            )
+
+    chroma = args.chroma
+    effective_chroma = chroma if chroma is not None else os.environ.get("ISS_VIDEO_CHROMA", "auto")
+    effective_codec = args.codec if args.codec is not None else os.environ.get("ISS_VIDEO_CODEC", "auto")
+    if effective_chroma == "444" and (effective_codec == "avc" or args.frontend == "browser"):
+        raise ValueError("4:4:4 requires the desktop HEVC path; H.264/browser 4:4:4 is not supported")
+    effective_decoder = decoder if decoder is not None else os.environ.get("ISS_DECODER", "auto")
+    decoder_id = registry.normalize_override(effective_decoder, "hevc")
+    if effective_chroma == "444" and any(spec.name == decoder_id and spec.codec == "avc" for spec in registry.all_specs()):
+        raise ValueError("4:4:4 requires an HEVC decoder; choose Auto or an HEVC decoder")
+    if decoder_id == "amd-hevc420":
+        if args.frontend == "browser" or effective_codec == "avc" or effective_chroma == "444":
+            raise ValueError("AMD HEVC requires Desktop, HEVC/Auto codec and 4:2:0/Auto chroma")
+        chroma = "420"
+        effective_codec = "hevc"
+        args.codec = "hevc"
+    codec = "hevc" if effective_chroma == "444" and effective_codec in ("auto", "both") else args.codec
+    for name, value in (("ISS_DECODER", decoder), ("ISS_VIDEO_CODEC", codec), ("ISS_VIDEO_CHROMA", chroma)):
+        if value == "auto":
+            os.environ.pop(name, None)
+        elif value is not None:
+            os.environ[name] = value
+
+
 def main(argv: Optional[list[str]] = None) -> int:
-    args = _make_parser().parse_args(argv)
+    parser = _make_parser()
+    args = parser.parse_args(argv)
     _setup_logging(args)
     if args.list_decoders:
         from .proxy.media import registry
@@ -555,13 +598,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 1
         log.info("Saved password removed (if present)")
         return 0
-    # `--decoder` feeds the registry override via the env var session.py reads
-    # (keeps the protocol layer free of a CLI dependency).
-    if getattr(args, "decoder", "auto") and args.decoder != "auto":
-        import os as _os
-        _os.environ["ISS_DECODER"] = args.decoder
-    if args.codec and args.codec != "auto":
-        os.environ["ISS_VIDEO_CODEC"] = args.codec
+    try:
+        _apply_video_overrides(args)
+    except ValueError as error:
+        parser.error(str(error))
     signal.signal(signal.SIGINT, signal.default_int_handler)
 
     # Surface tracebacks for any thread that crashes — without this,

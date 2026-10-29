@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import types
+import av
 
 from isharescreen.proxy.media.avc import AvcDecoder
 
@@ -20,7 +21,11 @@ class _FakeCodec:
 
     def decode(self, pkt):
         self.decode_calls += 1
-        return [types.SimpleNamespace(pts=pkt.pts)]
+        frame = av.VideoFrame(4, 4, "yuv420p")
+        frame.pts = pkt.pts
+        for plane in frame.planes:
+            plane.update(bytes([128]) * plane.buffer_size)
+        return [frame]
 
     def close(self) -> None:
         self.closed = True

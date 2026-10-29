@@ -113,12 +113,12 @@ struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
 };
-// Shares the same uniform buffer as the planar pipeline; reads only the first
-// two vec2s (uv_scale, uv_offset). Biplanar luma+chroma sample at the same uv,
-// so no separate chroma_scale/offset is needed here.
+// Shares planar geometry, including subsampled chroma coordinates.
 struct Uniforms {
     uv_scale: vec2<f32>,
     uv_offset: vec2<f32>,
+    chroma_scale: vec2<f32>,
+    chroma_offset: vec2<f32>,
 };
 @group(0) @binding(3) var<uniform> U: Uniforms;
 
@@ -148,7 +148,8 @@ fn vs(@builtin(vertex_index) i: u32) -> VsOut {
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let uv = in.uv * U.uv_scale + U.uv_offset;
     let y  = textureSample(y_tex, samp, uv).r;
-    let c  = textureSample(uv_tex, samp, uv);
+    let cuv = in.uv * U.chroma_scale + U.chroma_offset;
+    let c  = textureSample(uv_tex, samp, cuv);
     let cb = c.r - 0.5;
     let cr = c.g - 0.5;
     let r = y + 1.5748   * cr;
@@ -530,7 +531,11 @@ class Renderer:
         cw, ch = tile.chroma_width, tile.chroma_height
         # Same canvas-bound for chroma as for luma so the last tile's
         # padding chroma rows don't get uploaded.
-        chroma_rows = min(ch, slot_height, max(0, self._h - origin_y))
+        # Chroma is packed contiguously in its own subsampled canvas. Using
+        # the luma origin leaves gaps for 4:2:0 and miscolors every later tile.
+        chroma_origin_y = origin_y * ch // tile.height
+        chroma_rows = min(ch, (rows * ch + tile.height - 1) // tile.height)
+        chroma_origin = (0, chroma_origin_y, 0)
         if chroma_rows <= 0:
             return
 
@@ -542,7 +547,7 @@ class Renderer:
             uv = np.frombuffer(tile.u, dtype=np.uint8)
             uv = uv[: tile.uv_stride * ch].reshape(ch, tile.uv_stride)
             self._device.queue.write_texture(
-                {"texture": self._uv_tex, "origin": origin},
+                {"texture": self._uv_tex, "origin": chroma_origin},
                 np.ascontiguousarray(uv[:chroma_rows]),
                 {"offset": 0, "bytes_per_row": tile.uv_stride},
                 (cw, chroma_rows, 1),
@@ -558,13 +563,13 @@ class Renderer:
             u = u[: tile.uv_stride * ch].reshape(ch, tile.uv_stride)[:, :cw]
             v = v[: tile.uv_stride * ch].reshape(ch, tile.uv_stride)[:, :cw]
         self._device.queue.write_texture(
-            {"texture": self._u_tex, "origin": origin},
+            {"texture": self._u_tex, "origin": chroma_origin},
             np.ascontiguousarray(u[:chroma_rows]),
             {"offset": 0, "bytes_per_row": cw},
             (cw, chroma_rows, 1),
         )
         self._device.queue.write_texture(
-            {"texture": self._v_tex, "origin": origin},
+            {"texture": self._v_tex, "origin": chroma_origin},
             np.ascontiguousarray(v[:chroma_rows]),
             {"offset": 0, "bytes_per_row": cw},
             (cw, chroma_rows, 1),

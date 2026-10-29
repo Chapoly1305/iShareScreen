@@ -276,9 +276,16 @@ def _read_token(sock):
     return recv_exact(sock, length)
 
 
+def _gss_backend():
+    if sys.platform == "win32":
+        from .kerberos_spnego import SpnegoGSS
+        return SpnegoGSS()
+    return _NativeGSS()
+
+
 def do_kerberos_auth(sock, username, password, *, host, realm="", principal="", service=""):
     """Return the server-generated 16-byte Apple record-layer wrap key."""
-    with _NativeGSS() as gss:
+    with _gss_backend() as gss:
         request = gss.start(host, username, password, realm, principal, service)
         if not request or len(request) > _MAX_TOKEN:
             raise AuthError("Invalid Kerberos AP-REQ")

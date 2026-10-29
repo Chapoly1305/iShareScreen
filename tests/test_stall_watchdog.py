@@ -11,6 +11,7 @@ bad_streak) state. Asserts the loss-aware discriminator:
 from __future__ import annotations
 
 import time
+import threading
 import types
 
 from isharescreen.proxy.session import Session
@@ -42,6 +43,7 @@ def _make_session(*, gap, lost_pkts=0, loss_growing=False,
     s._loss_at_prev_stall_check = lost_pkts - (10 if loss_growing else 0)
     s._last_loss_growth_t = 0.0
     s._last_decoder_restart_t = 0.0
+    s._restart_guard = threading.Lock()
     s._last_stuck_tile_fir_t = 0.0
     s._last_stall_fir_t = 0.0
     s.fir_calls = 0

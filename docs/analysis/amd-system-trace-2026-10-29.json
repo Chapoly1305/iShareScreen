@@ -1,0 +1,301 @@
+{
+  "source_trace": "amd-lag.etl",
+  "trace_start_local": "2026-10-29 01:16:05.5660312 America/New_York",
+  "trace_duration_seconds": 73.2641746,
+  "lost_events": 0,
+  "viewer_pid": 24504,
+  "presentmon_version": "2.6.0",
+  "presentmon": {
+    "amd": {
+      "trace_seconds": [
+        25,
+        45
+      ],
+      "presents": 1183,
+      "dropped": 0,
+      "present_modes": {
+        "Hardware Composed: Independent Flip": 1183
+      },
+      "msBetweenPresents": {
+        "n": 1183,
+        "mean": 16.9031,
+        "p50": 16.6567,
+        "p95": 27.6644,
+        "p99": 33.0331,
+        "max": 40.2652
+      },
+      "msBetweenDisplayChange": {
+        "n": 1183,
+        "mean": 16.8994,
+        "p50": 17.1468,
+        "p95": 28.5588,
+        "p99": 34.2844,
+        "max": 40.038
+      },
+      "msUntilDisplayed": {
+        "n": 1183,
+        "mean": 3.705,
+        "p50": 3.6216,
+        "p95": 6.7229,
+        "p99": 9.329,
+        "max": 12.6464
+      },
+      "msUntilRenderComplete": {
+        "n": 1183,
+        "mean": 0.3821,
+        "p50": 0.3792,
+        "p95": 0.4892,
+        "p99": 0.5734,
+        "max": 9.7336
+      },
+      "msInPresentAPI": {
+        "n": 1183,
+        "mean": 0.2173,
+        "p50": 0.1945,
+        "p95": 0.3114,
+        "p99": 0.4366,
+        "max": 9.6252
+      },
+      "display_intervals_over_25ms": 76
+    },
+    "qsv": {
+      "trace_seconds": [
+        0.3,
+        5
+      ],
+      "presents": 775,
+      "dropped": 3,
+      "present_modes": {
+        "Hardware Composed: Independent Flip": 772,
+        "Composed: Flip": 3
+      },
+      "msBetweenPresents": {
+        "n": 775,
+        "mean": 6.0616,
+        "p50": 5.6717,
+        "p95": 8.8526,
+        "p99": 17.2233,
+        "max": 35.3513
+      },
+      "msBetweenDisplayChange": {
+        "n": 772,
+        "mean": 6.0853,
+        "p50": 5.716,
+        "p95": 5.8412,
+        "p99": 17.262,
+        "max": 40.0936
+      },
+      "msUntilDisplayed": {
+        "n": 772,
+        "mean": 9.1903,
+        "p50": 9.9682,
+        "p95": 10.6545,
+        "p99": 10.7443,
+        "max": 10.8336
+      },
+      "msUntilRenderComplete": {
+        "n": 775,
+        "mean": 0.3678,
+        "p50": 0.338,
+        "p95": 0.6993,
+        "p99": 0.9853,
+        "max": 1.0983
+      },
+      "msInPresentAPI": {
+        "n": 775,
+        "mean": 0.2623,
+        "p50": 0.224,
+        "p95": 0.4511,
+        "p99": 0.6379,
+        "max": 1.0766
+      },
+      "display_intervals_over_25ms": 3
+    }
+  },
+  "gpu": {
+    "window": "25-35 seconds from ETL start",
+    "gpu_packets": [
+      {
+        "context": "0xffff92022ee9ede0",
+        "thread": "27952",
+        "queue_ms": {
+          "p50": 0.039,
+          "p95": 3.319,
+          "p99": 4.517,
+          "max": 7.858,
+          "sum": 1009.456,
+          "n": 2114
+        },
+        "gpu_ms": {
+          "p50": 0.292,
+          "p95": 0.349,
+          "p99": 0.389,
+          "max": 0.458,
+          "sum": 630.534,
+          "n": 2114
+        },
+        "total_ms": {
+          "p50": 0.337,
+          "p95": 3.622,
+          "p99": 4.814,
+          "max": 8.165,
+          "sum": 1639.99,
+          "n": 2114
+        },
+        "dma_interval_union_ms": 630.534,
+        "dma_interval_coverage_percent": 6.30534,
+        "node_ordinal": 0,
+        "engine": "3D"
+      },
+      {
+        "context": "0xffff9202555d94f0",
+        "thread": "9128",
+        "queue_ms": {
+          "p50": 0.025,
+          "p95": 1.266,
+          "p99": 2.92,
+          "max": 4.339,
+          "sum": 433.333,
+          "n": 2352
+        },
+        "gpu_ms": {
+          "p50": 4.174,
+          "p95": 5.62,
+          "p99": 6.234,
+          "max": 7.393,
+          "sum": 10012.325,
+          "n": 2352
+        },
+        "total_ms": {
+          "p50": 4.248,
+          "p95": 6.082,
+          "p99": 7.192,
+          "max": 9.158,
+          "sum": 10445.658,
+          "n": 2352
+        },
+        "dma_interval_union_ms": 7245.098,
+        "dma_interval_coverage_percent": 72.45098,
+        "node_ordinal": 14,
+        "engine": "Video Codec 0"
+      },
+      {
+        "context": "0xffff920236247de0",
+        "thread": "3864",
+        "queue_ms": {
+          "p50": 0.044,
+          "p95": 0.15,
+          "p99": 0.179,
+          "max": 0.259,
+          "sum": 108.192,
+          "n": 1722
+        },
+        "gpu_ms": {
+          "p50": 0.23,
+          "p95": 0.74,
+          "p99": 0.862,
+          "max": 1.043,
+          "sum": 601.133,
+          "n": 1722
+        },
+        "total_ms": {
+          "p50": 0.277,
+          "p95": 0.791,
+          "p99": 0.901,
+          "max": 1.061,
+          "sum": 709.325,
+          "n": 1722
+        },
+        "dma_interval_union_ms": 601.133,
+        "dma_interval_coverage_percent": 6.01133,
+        "node_ordinal": 0,
+        "engine": "3D"
+      },
+      {
+        "context": "0xffff920236309de0",
+        "thread": "3864",
+        "queue_ms": {
+          "p50": 0.038,
+          "p95": 0.173,
+          "p99": 0.214,
+          "max": 0.841,
+          "sum": 88.774,
+          "n": 1188
+        },
+        "gpu_ms": {
+          "p50": 0.108,
+          "p95": 0.532,
+          "p99": 0.66,
+          "max": 0.857,
+          "sum": 296.1,
+          "n": 1188
+        },
+        "total_ms": {
+          "p50": 0.247,
+          "p95": 0.552,
+          "p99": 0.681,
+          "max": 0.94,
+          "sum": 384.874,
+          "n": 1188
+        },
+        "dma_interval_union_ms": 296.1,
+        "dma_interval_coverage_percent": 2.9610000000000003,
+        "node_ordinal": 0,
+        "engine": "3D"
+      }
+    ],
+    "present_interval_ms": {
+      "p50": 16.671,
+      "p95": 27.354,
+      "p99": 34.407,
+      "max": 37.055,
+      "sum": 9960.41,
+      "n": 593
+    },
+    "viewer_event_counts": {
+      "Microsoft-Windows-DxgKrnl/Profiler/win:Start": 62522,
+      "Microsoft-Windows-DxgKrnl/Unlock/win:Info": 9183,
+      "Microsoft-Windows-DxgKrnl/Profiler/win:Stop": 62522,
+      "Microsoft-Windows-DxgKrnl/Render/win:Info": 7381,
+      "Microsoft-Windows-DxgKrnl/QueuePacket/win:Start": 27799,
+      "Microsoft-Windows-DxgKrnl/SignalSynchronizationObjectFromGpu/win:Info": 15356,
+      "Microsoft-Windows-DxgKrnl/WaitForSynchronizationObjectFromCpu/win:Info": 7381,
+      "Microsoft-Windows-DxgKrnl/DmaPacket/win:Info": 537,
+      "Microsoft-Windows-DxgKrnl/DmaPacket/win:Stop": 534,
+      "Microsoft-Windows-DxgKrnl/RuntimePowerManagement/win:Start": 550,
+      "Microsoft-Windows-DxgKrnl/RuntimePowerManagement/win:Info": 285,
+      "Microsoft-Windows-DxgKrnl/RuntimePowerManagement/win:Stop": 550,
+      "Microsoft-Windows-DxgKrnl/QueuePacket/win:Stop": 1746,
+      "Microsoft-Windows-DxgKrnl/VidSchiCompleteSignalCommmand/win:Info": 1176,
+      "Microsoft-Windows-DxgKrnl/UnwaitCpuWaiter/win:Info": 1036,
+      "Microsoft-Windows-DxgKrnl/WaitForSynchronizationObject2/win:Info": 2316,
+      "Microsoft-Windows-DxgKrnl/SignalSynchronizationObject2/win:Info": 2316,
+      "Microsoft-Windows-DxgKrnl/WaitForSynchronizationObjectFromGpu/win:Info": 2802,
+      "Microsoft-Windows-DxgKrnl/ReferenceWrittenPrimaries/win:Info": 1188,
+      "Microsoft-Windows-DxgKrnl/GetDeviceState/win:Info": 594,
+      "Microsoft-Windows-DxgKrnl/PresentHistoryDetailed/win:Start": 594,
+      "Microsoft-Windows-DxgKrnl/Present/win:Info": 594,
+      "Microsoft-Windows-DxgKrnl/VSyncInterrupt/win:Info": 237,
+      "Microsoft-Windows-DxgKrnl/PresentHistory/win:Info": 112,
+      "Microsoft-Windows-DxgKrnl/VSyncDPC/win:Info": 236,
+      "Microsoft-Windows-DxgKrnl/VSyncDPCMultiPlane/win:Info": 236,
+      "Microsoft-Windows-DxgKrnl/DWMVsyncSignal/win:Info": 236,
+      "Microsoft-Windows-DxgKrnl/UnwaitQueuePacket/win:Info": 117,
+      "Microsoft-Windows-DxgKrnl/IndependentFlip/win:Info": 34,
+      "Microsoft-Windows-DxgKrnl/DdiSetVidPnMultiPlaneOverlay3/win:Start": 33,
+      "Microsoft-Windows-DxgKrnl/DdiSetVidPnMultiPlaneOverlay3/win:Stop": 33,
+      "Microsoft-Windows-DxgKrnl/MMIOFlipMultiPlaneOverlay3/win:Info": 33,
+      "Microsoft-Windows-DxgKrnl/MMIOFlipMultiPlaneOverlay/win:Info": 33,
+      "Microsoft-Windows-DxgKrnl/MMIOFlipMultiPlaneOverlayDirtyRect/win:Info": 33,
+      "Microsoft-Windows-DxgKrnl/VSyncWaiterChange/win:Info": 4,
+      "Microsoft-Windows-DxgKrnl/PendingFlipsForThisEntry/win:Info": 2,
+      "Microsoft-Windows-DxgKrnl/VidSchSignalSyncObjectsFromGpuImmediate/win:Info": 8
+    }
+  },
+  "limits": [
+    "GPU packet execution spans can overlap. Use interval union, not sum, for coverage.",
+    "PresentMon reports client presentation, not remote input-to-photon latency.",
+    "QSV baseline here is a short preceding session, not a matched replay.",
+    "Derived ETL omitted CLR rundown, syscall Enter/Exit and page-fault events; original is unchanged."
+  ]
+}

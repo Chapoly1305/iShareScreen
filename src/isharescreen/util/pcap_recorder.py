@@ -171,9 +171,13 @@ class _PcapFile:
     def close(self) -> None:
         try:
             self._fh.flush()
-            self._fh.close()
         except OSError:
             pass
+        finally:
+            try:
+                self._fh.close()
+            except OSError:
+                pass
 
 
 # ── recorder ─────────────────────────────────────────────────────────
@@ -208,6 +212,11 @@ class PcapRecorder:
         self._tcp_seq: dict[tuple, int] = {}
         self._ident = 0
         self._pending: deque = deque()
+        self._pending_bytes = 0
+        self._max_pending_bytes = 16 * 1024 * 1024
+        self.dropped_packets = 0
+        self.write_error: str | None = None
+        self._final_stats = (0, 0)
         self._stop = False
         self._file: Optional[_PcapFile] = None
         self._writer: Optional[threading.Thread] = None
@@ -273,23 +282,42 @@ class PcapRecorder:
 
     # ── writer thread ────────────────────────────────────────────────
 
-    def _writer_loop(self) -> None:
-        while True:
-            with self._cond:
-                while not self._pending and not self._stop:
-                    self._cond.wait()
-                if self._stop and not self._pending:
-                    return
-                batch = self._pending
-                self._pending = deque()
-                f = self._file
-            # Write the batch outside the lock so the recording threads
-            # can keep enqueuing while the (possibly flushing) write runs.
-            if f is not None:
-                for ts, frame in batch:
-                    f.write(ts, frame)
+    def _enqueue_locked(self, ts: float, frame: bytes) -> None:
+        if self._stop or self._file is None:
+            return
+        if self._pending_bytes + len(frame) > self._max_pending_bytes:
+            self.dropped_packets += 1
+            return
+        self._pending.append((ts, frame))
+        self._pending_bytes += len(frame)
+        self._cond.notify()
 
-    # ── recording entry points (called from the socket taps) ─────────
+    def _writer_loop(self) -> None:
+        file = self._file
+        try:
+            while True:
+                with self._cond:
+                    while not self._pending and not self._stop:
+                        self._cond.wait()
+                    if self._stop and not self._pending:
+                        break
+                    batch, self._pending = self._pending, deque()
+                    self._pending_bytes = 0
+                for ts, frame in batch:
+                    file.write(ts, frame)
+        except OSError as error:
+            log.error("recording stopped after disk write failure: %s", error)
+            with self._cond:
+                self.write_error = str(error)
+                self._stop = True
+                self._pending.clear()
+                self._pending_bytes = 0
+        finally:
+            # The writer exclusively owns file I/O, including flush and close.
+            file.close()
+            with self._cond:
+                self._final_stats = (file.packets, file.bytes)
+                self._file = None
 
     def record_tcp(self, outbound: bool, client_port: int, server_port: int,
                    data: bytes) -> None:
@@ -319,7 +347,7 @@ class PcapRecorder:
                 l4 = _build_tcp(src_port, dst_port, seq, chunk)
                 ip_hdr = _build_ipv4(_IPPROTO_TCP, src_ip, dst_ip, len(l4),
                                      self._next_ident())
-                self._pending.append((ts, _eth_frame(c2s, ip_hdr + l4)))
+                self._enqueue_locked(ts, _eth_frame(c2s, ip_hdr + l4))
                 off += len(chunk)
                 if off >= total:
                     break
@@ -344,34 +372,26 @@ class PcapRecorder:
                 return
             ip_hdr = _build_ipv4(_IPPROTO_UDP, src_ip, dst_ip, len(l4),
                                  self._next_ident())
-            self._pending.append((ts, _eth_frame(c2s, ip_hdr + l4)))
+            self._enqueue_locked(ts, _eth_frame(c2s, ip_hdr + l4))
             self._cond.notify()
 
     def close(self) -> tuple[int, int]:
-        """Stop the writer, flush every queued packet to disk, close the file.
-        Idempotent. Returns the final (packets, bytes) written."""
+        """Stop accepting packets and drain on the owning writer thread.
+
+        A blocked disk gets two seconds to finish; it retains ownership after
+        that deadline. Returned counts are a snapshot in that case.
+        """
         with self._cond:
-            if self._file is None:
-                return (0, 0)
             self._stop = True
             self._cond.notify()
         if self._writer is not None:
             self._writer.join(timeout=2.0)
+            if self._writer.is_alive():
+                log.warning("capture writer still draining; file remains owned by writer")
         with self._cond:
-            f = self._file
-            if f is None:
-                return (0, 0)
-            # Drain any straggler the writer didn't reach (e.g. a packet
-            # enqueued after stop, or a join() that timed out).
-            while self._pending:
-                ts, frame = self._pending.popleft()
-                f.write(ts, frame)
-            stats = (f.packets, f.bytes)
-            f.close()
-            self._file = None
-            return stats
-
-    # ── socket taps ──────────────────────────────────────────────────
+            if self._file is not None:
+                return self._file.packets, self._file.bytes
+            return self._final_stats
 
     def wrap_tcp(self, sock: socket.socket) -> "_TcpTap":
         try:

@@ -9,9 +9,12 @@ macOS). `--codec auto` (the default) resolves to HEVC 4:4:4 when the GPU can
 hardware-decode it and to H.264 4:2:0 otherwise.
 
 Detection is a *real* hardware decode of a tiny embedded HEVC 4:4:4 IDR through
-the same libav hwaccel path production uses. If the decoded frame comes back in
-a hardware pixel format the GPU supports it; if libav fell back to software
-(frame format `yuv444p`) or the hwaccel failed to initialise, it does not. This
+the same libav hwaccel path production uses. The probe counts as hardware when
+a frame decodes and the context's `is_hwaccel` is not False (a bound NVDEC
+context still returns `yuv444p` frames after the download, so the pixel format
+alone is not proof); if libav fell back to software or the hwaccel failed to
+initialise, it does not. Only device types this PyAV build supports
+(`hwdevices_available()`) are tried. This
 tests the actual decode path rather than trusting a static profile table, so it
 can't be fooled by a profile GUID that's advertised but broken.
 """
@@ -21,15 +24,21 @@ import logging
 import os
 import sys
 
+from .decode_common import available_hwaccels, context_is_hwaccel
+
 log = logging.getLogger(__name__)
 
-# A 64x64 HEVC Main 4:4:4 8-bit IDR access unit (VPS + SPS + PPS + IDR slice,
-# Annex-B), produced by libx265 from a yuv444p frame. Self-contained: it
-# decodes with a fresh decoder context, no external parameter sets. ~97 bytes.
+# A 160x160 HEVC Main 4:4:4 8-bit IDR access unit (VPS + SPS + PPS + IDR slice,
+# Annex-B), produced by libx265 (``color=gray``, ``info=0``) from a yuv444p frame.
+# Self-contained: it decodes with a fresh decoder context. 117 bytes.
+# 160x160, not smaller: NVDEC's minimum HEVC picture is 144x144, so a 64x64
+# sample is refused by a GPU that decodes the real stream fine (measured on an
+# RTX 3080 Ti: 64 and 128 px fail at avcodec_send_packet, 144 and 160 px decode).
 _HEVC444_SAMPLE = bytes.fromhex(
-    "0000000140010c01ffff0408000003009e280000030000baba0240000000014201"
-    "010408000003009e280000030000ba90041020b2dd25261734040000030004003d"
-    "090020000000014401c070306011200000012801ade0d117ffd39173238b80"
+    "0000000140010c01ffff0408000003009e2800000300001eba0240000000014201"
+    "010408000003009e2800000300001e900284050b2dd25261780b40400000030040"
+    "0000030042000000014401c070306031200000012801adcaf48ed117ce7322f0aa"
+    "07706828d408d5db80a00c27279b0e488cf8"
 )
 
 # Per-platform hwaccel candidates to probe, in priority order — mirrors the
@@ -66,7 +75,9 @@ def _probe_one(hwaccel_type: str) -> bool:
         ctx = av.CodecContext.create("hevc", "r", hwaccel=hw)
         frames = list(ctx.decode(av.Packet(_HEVC444_SAMPLE)))
         frames += list(ctx.decode(None))  # flush
-        ok = bool(frames)
+        # A frame alone is not proof: a device type PyAV lacks yields a
+        # software context that still decodes. Trust is_hwaccel when known.
+        ok = bool(frames) and context_is_hwaccel(ctx) is not False
         log.info("hevc444 probe (%s): %s%s", hwaccel_type,
                  "HW-decoded" if ok else "no HW frame",
                  (" (fmt=%s)" % frames[0].format.name) if frames else "")
@@ -76,7 +87,8 @@ def _probe_one(hwaccel_type: str) -> bool:
         return False
 
 
-_method_cache: dict[str, str] = {}
+_libav_cache: dict[str, bool] = {}
+_qsv_cache: dict[str, bool] = {}
 
 
 def _qsv_hevc444() -> bool:
@@ -92,29 +104,39 @@ def _qsv_hevc444() -> bool:
         return False
 
 
-def hevc444_decode_method() -> "str | None":
-    """How HEVC 4:4:4 can be hardware-decoded here: ``"qsv"`` (Intel Quick
-    Sync), ``"libav"`` (generic libav hwaccel / native VideoToolbox), or
-    ``None`` (no HW 4:4:4 → AVC fallback). Cached for the process lifetime."""
-    if "method" in _method_cache:
-        return _method_cache["method"] or None
+def libav_hevc444_hwdecode() -> bool:
+    """Probe generic hardware independently of QSV; cache for this process."""
+    if "available" in _libav_cache:
+        return _libav_cache["available"]
     override = os.environ.get("ISS_HEVC444")
     if override == "0":
-        _method_cache["method"] = ""
-        return None
-    method = ""
-    if sys.platform == "darwin":
-        method = "libav"          # native VideoToolbox path (vtdecode.py)
+        result = False
+    elif override == "1" or sys.platform == "darwin":
+        result = True  # forced on, or the existing native VideoToolbox path
     else:
-        hwaccels = _PROBE_HWACCELS.get(sys.platform, _PROBE_HWACCELS["*"])
-        if any(_probe_one(h) for h in hwaccels):
-            method = "libav"
-        elif _qsv_hevc444():
-            method = "qsv"
-    if override == "1" and not method:
-        method = "libav"          # forced on; trust the libav path
-    _method_cache["method"] = method
-    return method or None
+        hwaccels = available_hwaccels(
+            _PROBE_HWACCELS.get(sys.platform, _PROBE_HWACCELS["*"]))
+        result = any(_probe_one(h) for h in hwaccels)
+    _libav_cache["available"] = result
+    return result
+
+
+def qsv_hevc444_hwdecode() -> bool:
+    """Probe QSV even when generic hardware also works, without changing priority."""
+    if "available" not in _qsv_cache:
+        _qsv_cache["available"] = (
+            sys.platform in ("win32", "linux")
+            and os.environ.get("ISS_HEVC444") != "0"
+            and _qsv_hevc444()
+        )
+    return _qsv_cache["available"]
+
+
+def hevc444_decode_method() -> "str | None":
+    """Backward-compatible summary; the registry queries both paths separately."""
+    if libav_hevc444_hwdecode():
+        return "libav"
+    return "qsv" if qsv_hevc444_hwdecode() else None
 
 
 def supports_hevc444_hwdecode() -> bool:
@@ -133,4 +155,5 @@ def supports_hevc444_hwdecode() -> bool:
 # 4:4:4 decoder is available rather than probing here directly. hwcaps remains
 # the probe provider (the registry's availability callbacks delegate to it).
 
-__all__ = ["supports_hevc444_hwdecode", "hevc444_decode_method"]
+__all__ = ["supports_hevc444_hwdecode", "hevc444_decode_method",
+           "libav_hevc444_hwdecode", "qsv_hevc444_hwdecode"]

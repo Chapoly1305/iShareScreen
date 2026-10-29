@@ -379,7 +379,7 @@ class _Win32Grab:
         self._KBDLL = _KBDLLHOOKSTRUCT
 
         self._HOOKPROC = ctypes.WINFUNCTYPE(
-            ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM,
+            ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM,
         )
         self._u32.SetWindowsHookExW.argtypes = [
             ctypes.c_int, self._HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD,
@@ -390,7 +390,7 @@ class _Win32Grab:
         self._u32.CallNextHookEx.argtypes = [
             wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM,
         ]
-        self._u32.CallNextHookEx.restype = ctypes.c_long
+        self._u32.CallNextHookEx.restype = ctypes.c_ssize_t
         self._u32.GetForegroundWindow.argtypes = []
         self._u32.GetForegroundWindow.restype = wintypes.HWND
 
@@ -461,15 +461,17 @@ class _Win32Grab:
             # Bare character key — let GLFW handle it normally.
             return u32.CallNextHookEx(None, nCode, wParam, lParam)
 
-        self._cb_ref = _proc
-        hook = u32.SetWindowsHookExW(_WH_KEYBOARD_LL, _proc, None, 0)
+        # Reuse one callback for this grab's lifetime. Unhooking does not
+        # guarantee a callback already in progress has returned.
+        if self._cb_ref is None:
+            self._cb_ref = _proc
+        hook = u32.SetWindowsHookExW(_WH_KEYBOARD_LL, self._cb_ref, None, 0)
         if not hook:
             err = ctypes.get_last_error()
             log.warning(
                 "keyboard grab failed: SetWindowsHookEx returned NULL "
                 "(GetLastError=%d)", err,
             )
-            self._cb_ref = None
             return False
         self._hook = hook
         log.info(
@@ -483,7 +485,6 @@ class _Win32Grab:
             return
         self._u32.UnhookWindowsHookEx(self._hook)
         self._hook = None
-        self._cb_ref = None
         # Release any modifier we believe is held but won't get a key-up
         # for (because we're tearing down before the user lets go).
         for vk in list(self._mods_held):

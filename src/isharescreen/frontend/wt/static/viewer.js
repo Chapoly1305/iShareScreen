@@ -1,0 +1,1254 @@
+"use strict";
+
+const status = document.getElementById("status");
+const stage = document.getElementById("stage");
+const canvas = document.getElementById("screen");
+const ctx = canvas.getContext("2d", {
+  alpha: false,
+  desynchronized: true,  // skip browser compositor where supported
+});
+
+const topbar = document.getElementById("topbar");
+function setStatus(msg, klass) {
+  status.textContent = msg;
+  status.className = klass || "";
+  // Mirror the err/ok class onto the bar itself so it tints red on
+  // failure (the bar is the only carrier of state when stats are
+  // hidden, since errors auto-pop the bar into view).
+  topbar.classList.toggle("err", klass === "err");
+  if (klass === "err") topbar.classList.add("show");
+}
+
+// Top bar behaviour:
+// - Windowed: always pinned at the top, takes its own 36 px row.
+// - Fullscreen: auto-hides; cursor near the top edge re-reveals it.
+// Body class `fullscreen` toggles the layout via CSS; here we just
+// drive the show/hide and listen for the OS fullscreen events.
+(function setupTopbar() {
+  const REVEAL_PX = 24;
+  let hideTimer = null;
+  const isFullscreen = () =>
+    !!(document.fullscreenElement || document.webkitFullscreenElement);
+  const show = () => {
+    if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+    topbar.classList.add("show");
+  };
+  const scheduleHide = (delay = 600) => {
+    if (hideTimer) clearTimeout(hideTimer);
+    hideTimer = setTimeout(() => {
+      if (!topbar.classList.contains("err")) topbar.classList.remove("show");
+    }, delay);
+  };
+  document.addEventListener("mousemove", (e) => {
+    if (!isFullscreen()) return;     // pinned in windowed mode
+    if (e.clientY <= REVEAL_PX) show();
+    else if (e.clientY > 60 && !topbar.matches(":hover")) scheduleHide();
+  });
+  topbar.addEventListener("mouseenter", () => { if (isFullscreen()) show(); });
+  topbar.addEventListener("mouseleave", () => { if (isFullscreen()) scheduleHide(250); });
+  document.addEventListener("touchstart", (e) => {
+    if (!isFullscreen()) return;
+    if (e.touches[0] && e.touches[0].clientY < REVEAL_PX) show();
+    else scheduleHide(0);
+  }, {passive: true});
+
+  // Track fullscreen state on <body>. The CSS uses .fullscreen to
+  // pick layout (overlay-hide vs. pinned).
+  const onFsChange = () => {
+    document.body.classList.toggle("fullscreen", isFullscreen());
+    if (!isFullscreen()) topbar.classList.remove("show"); // pinned, no need
+  };
+  document.addEventListener("fullscreenchange", onFsChange);
+  document.addEventListener("webkitfullscreenchange", onFsChange);
+
+  const fsBtn = document.getElementById("fs-btn");
+  fsBtn.addEventListener("click", () => {
+    if (isFullscreen()) {
+      (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+    } else {
+      const el = document.documentElement;
+      (el.requestFullscreen || el.webkitRequestFullscreen).call(el);
+    }
+  });
+})();
+
+// Relay browser-side log messages back to the iss server so they
+// appear in the iss log alongside server-side events. Best-effort.
+function srvLog(level, msg) {
+  console[level === "error" ? "error" : "log"]("[srvlog]", msg);
+  viewerFetch("/log", {
+    method: "POST",
+    headers: {"content-type": "application/json"},
+    body: JSON.stringify({level, msg}),
+    keepalive: true,
+  }).catch(() => {});
+}
+
+window.addEventListener("error", (e) => {
+  srvLog("error", `JS error: ${e.message} @${e.filename}:${e.lineno}`);
+});
+window.addEventListener("unhandledrejection", (e) => {
+  srvLog("error", `promise rejection: ${e.reason && (e.reason.message || e.reason)}`);
+});
+
+function hexToBytes(hex) {
+  if (hex.length % 2) throw new Error("odd hex length");
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(hex.slice(i*2, i*2+2), 16);
+  }
+  return out;
+}
+
+// `?nofit=1` puts the canvas in 1:1 device-pixel mode for diagnostic
+// pixel counting — disables fit-to-window CSS scaling so each
+// encoded pixel maps to exactly 1/devicePixelRatio CSS pixels.
+const NOFIT = new URLSearchParams(location.search).get("nofit") === "1";
+
+// `?display=N` shows only host monitor N (its rect within the combined canvas,
+// from the 0x451 layout). Open one window per monitor for 1:1 mapping. Unset =
+// show the whole combined canvas (all monitors). `cropRect` is that monitor's
+// rect in canvas (backing) pixels, filled in from the config's display_rects.
+const DISPLAY_IDX = (() => {
+  const v = new URLSearchParams(location.search).get("display");
+  if (v == null || v === "") return null;
+  const n = parseInt(v, 10);
+  // Unparseable / negative → show the whole canvas (null), not silently monitor 0.
+  return Number.isInteger(n) && n >= 0 ? n : null;
+})();
+let cropRect = null;
+// Display scale (--hidpi). The window is reported to the host at
+// logical = physical/HIDPI_SCALE, so the host draws the UI at this scale while
+// the backing stays = the window's physical pixels. Set from the server config.
+let HIDPI_SCALE = 2;
+
+// Displays picker: on the combined window (no ?display) of a multi-monitor
+// host, list the monitors and open each in its own window (?display=N). Each is
+// a separate viewer, so N windows can be live at once — fullscreen each on a
+// local monitor for 1:1 host↔client mapping. Hidden on single-monitor hosts and
+// on per-monitor windows.
+const dispSel = document.getElementById("disp");
+const openAllBtn = document.getElementById("openall");
+
+// Build a viewer URL for host monitor `idx`, PRESERVING every existing query
+// param (hash/transport/decode/lat/…). Dropping ?hash= would break the new
+// tab's WebTransport cert trust, so we can't just write `?display=N`.
+function displayUrl(idx) {
+  const p = new URLSearchParams(location.search);
+  p.set("display", String(idx));
+  return "?" + p.toString() + location.hash;
+}
+
+// Open one viewer window per host monitor. Monitors 1..N-1 open as new windows;
+// THIS tab repurposes itself into monitor 0, so we end up with exactly N viewers
+// and no redundant full-canvas stream (which would double the host's encoder
+// load). MUST be called from a user gesture — the monitor count only arrives
+// after connect (async 0x451 layout), long after the connect click's activation
+// has lapsed, and browsers block window.open() that isn't gesture-driven.
+function openAllDisplays(rects) {
+  for (let i = 1; i < rects.length; i++) window.open(displayUrl(i), `_disp${i}`);
+  location.search = displayUrl(0);  // navigate self last, after the popups fire
+}
+
+function setupDisplayPicker(rects) {
+  if (DISPLAY_IDX != null || !rects || rects.length < 2) {
+    dispSel.style.display = "none";
+    openAllBtn.style.display = "none";
+    return;
+  }
+  // Prominent one-click "open all" is the primary path for a multi-monitor host.
+  openAllBtn.textContent = `🖥 Open all ${rects.length} displays`;
+  openAllBtn.style.display = "";
+  openAllBtn.onclick = () => openAllDisplays(rects);
+  // The dropdown keeps the finer picks (open just one monitor in its own window).
+  dispSel.innerHTML = '<option value="">🖥 Displays…</option>'
+    + rects.map((r, i) =>
+        `<option value="${i}">Monitor ${i + 1} (${r.w}×${r.h}) → new window</option>`).join("")
+    + '<option value="all">Open all monitors</option>';
+  dispSel.style.display = "";
+  dispSel.onchange = () => {
+    const v = dispSel.value;
+    if (v === "all") {
+      openAllDisplays(rects);
+    } else if (v !== "") {
+      window.open(displayUrl(parseInt(v, 10)), `_disp${v}`);
+    }
+    dispSel.value = "";  // reset so the same monitor can be re-picked
+  };
+}
+
+function fitCanvasToStage(intrinsicW, intrinsicH) {
+  if (NOFIT) {
+    // Size in CSS pixels = intrinsic / devicePixelRatio so the
+    // device-pixel grid is 1:1 with the encoded canvas grid.
+    const dpr = window.devicePixelRatio || 1;
+    canvas.style.width = (intrinsicW / dpr) + "px";
+    canvas.style.height = (intrinsicH / dpr) + "px";
+    return;
+  }
+  const sw = stage.clientWidth;
+  const sh = stage.clientHeight;
+  if (cropRect && intrinsicW > 0 && intrinsicH > 0) {
+    // Crop to one host monitor: scale so the monitor's rect aspect-fits the
+    // stage, size the (full) canvas at that scale, and translate it so the
+    // rect's centre lands at the flex-centred stage centre. The stage's
+    // `overflow:hidden` clips everything outside the rect. Input needs no
+    // change — the canvas element still spans the full canvas, so the
+    // pointer-fraction mapping stays correct for the visible sub-region.
+    const scale = Math.min(sw / cropRect.w, sh / cropRect.h);
+    canvas.style.width = (intrinsicW * scale) + "px";
+    canvas.style.height = (intrinsicH * scale) + "px";
+    const tx = (intrinsicW / 2 - (cropRect.x + cropRect.w / 2)) * scale;
+    const ty = (intrinsicH / 2 - (cropRect.y + cropRect.h / 2)) * scale;
+    canvas.style.transform = `translate(${tx}px, ${ty}px)`;
+    return;
+  }
+  canvas.style.transform = "";
+  const src = intrinsicW / intrinsicH;
+  const dst = sw / sh;
+  let w, h;
+  if (dst > src) { h = sh; w = h * src; } else { w = sw; h = w / src; }
+  canvas.style.width = w + "px";
+  canvas.style.height = h + "px";
+}
+
+const viewerToken = new URLSearchParams(location.hash.slice(1)).get("token") || "";
+function viewerFetch(url, options = {}) {
+  return fetch(url, {...options, headers: {...options.headers, "X-ISS-Token": viewerToken}});
+}
+
+async function main() {
+  // The HTML page is served over plain HTTP; the cert hash for the
+  // (HTTPS-but-self-signed) WebTransport endpoint is fetched from
+  // /cert-hash on the same origin. ?hash=… is a fallback for
+  // bookmarks / direct navigation.
+  const params = new URLSearchParams(location.search);
+  let certHash = params.get("hash");
+  if (!certHash) {
+    try {
+      const r = await viewerFetch("/cert-hash");
+      certHash = (await r.text()).trim();
+    } catch (e) {
+      setStatus("missing cert hash", "err");
+      return;
+    }
+  }
+  if (!("WebTransport" in window)) {
+    // Chrome only exposes WebTransport on a Secure Context: HTTPS, or
+    // http://localhost. Plain-HTTP IP/LAN origins make the constructor
+    // silently absent (it isn't a version issue — Chrome ≥97 is fine
+    // when loaded via localhost). Tell the user the actual blocker.
+    const insecure = !window.isSecureContext;
+    if (insecure) {
+      setStatus(
+        `WebTransport blocked: this page is on ${location.protocol}//${location.host} ` +
+        `(non-secure origin). Open via http://localhost:${location.port || 80}, ` +
+        `or whitelist this origin in chrome://flags/#unsafely-treat-insecure-origin-as-secure.`,
+        "err",
+      );
+    } else {
+      setStatus("browser missing WebTransport — use Chrome 97+/Firefox 114+/Edge 97+", "err");
+    }
+    return;
+  }
+  if (!("VideoDecoder" in window)) {
+    setStatus("browser missing WebCodecs — use Chrome 94+/Firefox 130+", "err");
+    return;
+  }
+
+  // Safari (incl. iOS) reliably exposes GestureEvent; Chrome/Edge/Firefox
+  // don't. WebKit deliberately does NOT implement serverCertificateHashes,
+  // so Safari can only do WebTransport against a cert the system trusts.
+  const ua = navigator.userAgent;
+  const isSafari = (typeof window.GestureEvent !== "undefined") ||
+    (/safari/i.test(ua) && !/chrome|chromium|crios|edg|fxios|android|opr/i.test(ua));
+  let safariTrusted = false;
+  let singleStream = false;
+  let dynamicRes = false;
+  try {
+    const cfg = await (await viewerFetch("/wt-config")).json();
+    safariTrusted = !!cfg.safariTrusted;
+    singleStream = !!cfg.videoSingleStream;
+    dynamicRes = !!cfg.dynamic;
+  } catch (e) { /* older server without /wt-config — assume not trusted */ }
+  // In per-monitor crop mode we must keep the full combined canvas (all host
+  // displays) so their rects stay valid; a dynamic re-encode to the window
+  // would collapse it to one window-sized view. Force non-dynamic.
+  if (DISPLAY_IDX != null) dynamicRes = false;
+  // Safari uses the same per-frame transport as Chrome/Edge/Firefox. (An earlier
+  // assumption forced Safari onto a single long-lived stream believing its
+  // ~100-uni-stream WebTransport credit exhausted on a stream-per-frame; measured
+  // otherwise — Safari replenishes that credit generously at the QUIC level
+  // (100 → 7000+ under load, never blocked), so it doesn't need the workaround.
+  // Per-frame also avoids single-stream's head-of-line blocking under loss and
+  // its rougher behaviour through a mid-session re-encode on resize.)
+  // Explicit override for testing/tuning: ?transport=single|perframe wins (the
+  // server reads the same choice from the CONNECT path below).
+  const tsp = new URLSearchParams(location.search).get("transport");
+  if (tsp === "single") singleStream = true;
+  else if (tsp === "perframe" || tsp === "per-frame") singleStream = false;
+
+  if (isSafari && !safariTrusted) {
+    setStatus(
+      "Safari can't use this tool's self-signed certificate — WebKit doesn't " +
+      "support serverCertificateHashes. Restart iss with --trust-cert-for-safari " +
+      "(one-time keychain prompt), or open this URL in Chrome, Edge, or Firefox.",
+      "err",
+    );
+    srvLog("error", "Safari without a keychain-trusted cert — refusing to connect");
+    return;
+  }
+
+  // WebTransport is on the SAME host:port as the HTTP page but on UDP
+  // (HTTP/3 over QUIC). Chrome/Edge/Firefox authenticate the self-signed
+  // cert via serverCertificateHashes. Safari (with --trust-cert-for-safari)
+  // ignores hashes and validates against the keychain-trusted cert, so we
+  // omit the option entirely for it.
+  const wtUrl = `https://${location.host}/wt?token=${encodeURIComponent(viewerToken)}` +
+    (singleStream ? "&transport=single" : "");
+  setStatus("opening WebTransport…");
+  const useHashes = !(isSafari && safariTrusted);
+  srvLog("info", `WT connect: ${location.host} ${useHashes ? "hash=" + certHash : "(keychain trust)"}`);
+  const mkWt = () => useHashes
+    ? new WebTransport(wtUrl, {
+        serverCertificateHashes: [{
+          algorithm: "sha-256",
+          value: hexToBytes(certHash),
+        }],
+      })
+    : new WebTransport(wtUrl);
+  // The WebTransport handshake can fail transiently — most visibly when a
+  // window is closed and reopened, where the browser may reject the first
+  // reconnect attempt (a fresh session over a QUIC path the previous one just
+  // vacated) with a generic WebTransportError before it settles. The server
+  // reconnect path itself is clean (verified: aioquic + real Chrome loopback
+  // both reconnect indefinitely), so a single failure is not fatal — retry a
+  // few times with backoff instead of dropping the user on a dead error page.
+  // A genuinely-down iss exhausts the retries and then shows the error.
+  const RETRIES = 5;
+  let wt = null;
+  for (let attempt = 1; attempt <= RETRIES; attempt++) {
+    wt = mkWt();
+    // Diagnostic: the session-close reason carries the real cause when
+    // wt.ready rejects with a generic WebTransportError (e.g. a SETTINGS
+    // mismatch shows up as the close code/reason, not in .message).
+    wt.closed
+      .then((info) => srvLog("info", `WT closed: ${JSON.stringify(info)}`))
+      .catch((e) => srvLog("error",
+        `WT closed-err: name=${e.name} msg=${e.message} source=${e.source} streamErrorCode=${e.streamErrorCode}`));
+    try {
+      await wt.ready;
+      break;  // connected
+    } catch (e) {
+      const msg = `WT failed: name=${e.name} msg=${e.message || e} source=${e.source} streamErrorCode=${e.streamErrorCode}`;
+      srvLog("error", `${msg} (attempt ${attempt}/${RETRIES})`);
+      try { wt.close(); } catch (_) {}
+      wt = null;
+      if (attempt === RETRIES) {
+        setStatus(`${msg} — giving up after ${RETRIES} attempts`, "err");
+        return;
+      }
+      // Backoff: 300ms, 600ms, 1.2s, 2.4s — let the browser/QUIC path settle.
+      const backoff = 300 * Math.pow(2, attempt - 1);
+      setStatus(`reconnecting (attempt ${attempt + 1}/${RETRIES})…`);
+      await new Promise((r) => setTimeout(r, backoff));
+    }
+  }
+  srvLog("info", "WT ready");
+  setStatus("connected", "ok");
+
+  // --- decoder setup ---------------------------------------------------
+  let firstFrame = true;
+  let decoderReady = false;
+  let decoderErrored = false;
+  let lastDecoderError = "";
+  let intrinsic = { w: 0, h: 0 };
+  let decoded = 0, dropped = 0, decodeErrCount = 0;
+  let lastResetT = 0, resetTimer = null;  // decode-error rebuild backoff
+  // Canvas pixel-stat sampling — sample a small grid of pixels
+  // periodically so the iss server log can report if the canvas is
+  // showing real content (varied) vs frozen / all gray.
+  let lastSampleStats = { mean: 0, std: 0, gray_frac: 0 };
+  // Pass-through: iss forwards Apple's H.264 access units in the server's
+  // forward (decode) order to ONE shared WebCodecs VideoDecoder; each decoded
+  // frame draws to its tile slot (y-offset). The default is a SINGLE tile (the
+  // CLI forces ISS_TILES_PER_FRAME=1): WebCodecs can't follow the cross-tile
+  // references in Apple's multi-tile mode, which shows as drift ("fleas"), so
+  // the single-stream mirror is the reliable path. For tiles>1, routeFifo maps
+  // output frames back to tiles by feed order. Geometry + codec arrive in a
+  // one-time config message (tag 3) before the first frame.
+  let geom = null;            // {num_tiles, canvas_w, canvas_h, tile_h, codec}
+  let numTiles = 1, tileH = 0;
+  // slotHeight = the encoder's actual CTU-padded picture height (e.g. 304),
+  // discovered from the first decoded frame. Tiles stack at tile_index *
+  // slotHeight, last tile clamped to canvas height — same as native upload_tile.
+  let slotHeight = 0;
+  let decoder = null;
+  let routeFifo = [];         // tile_id per fed AU; output frames shift() it
+  let awaitingKey = true;     // drop until the first keyframe
+  // Reorder by global seq so AUs reach the shared decoder in the server's
+  // forward order (per-frame QUIC streams have no cross-stream ordering).
+  let nextSeq = -1;
+  const pending = new Map();  // seq -> {isKey, tileId, payload}
+  const REORDER_GAP_MAX = 6;          // count budget — was 24 (~400ms worst-case stall)
+  const REORDER_GAP_MAX_MS = 45;      // ...or skip ahead after this long stuck on a gap
+  let gapSince = 0;
+  let videoTs = 0;            // synthetic monotonic decode timestamp (µs)
+
+  // Render at the display's vsync, NOT at the decoder's (irregular, bursty)
+  // output cadence — drawing straight from the output callback races the
+  // compositor and shows up as stutter/tear during motion. Stash the latest
+  // frame per tile and paint them together in requestAnimationFrame.
+  // Opt-in pipeline profiling (?prof=1): arrival intervals (jitter source),
+  // decoded vs painted (skip rate), paint intervals. Read via window.__prof.
+  const PROF = new URLSearchParams(location.search).has("prof");
+  window.__prof = PROF ? { arr: [], paint: [], decoded: 0, painted: 0 } : null;
+  // Latency probe: drift between the source frame timestamp (envelope ts_us)
+  // and local receive time. Absolute value has a clock offset, but its GROWTH
+  // over the session = accumulating transport latency (immune to rAF throttle).
+  window.__lat = PROF ? { base: null, cur: 0, n: 0 } : null;
+  let __lastArr = 0, __lastPaint = 0;
+
+  const pendingFrames = [];   // tile_id -> latest undrawn VideoFrame
+  let rafScheduled = false;
+  function drawPending() {
+    rafScheduled = false;
+    for (let tid = 0; tid < pendingFrames.length; tid++) {
+      const frame = pendingFrames[tid];
+      if (!frame) continue;
+      pendingFrames[tid] = null;
+      try {
+        const yOff = tid * slotHeight;
+        const dh = Math.min(frame.codedHeight, canvas.height - yOff);
+        if (dh > 0) ctx.drawImage(frame, 0, 0, frame.codedWidth, dh, 0, yOff, frame.codedWidth, dh);
+        if (PROF) {
+          const n = performance.now();
+          if (__lastPaint) window.__prof.paint.push(n - __lastPaint);
+          __lastPaint = n; window.__prof.painted++;
+          if (window.__prof.paint.length > 3000) window.__prof.paint.shift();
+        }
+      } finally { frame.close(); }
+    }
+  }
+
+  function buildDecoder() {
+    const dec = new VideoDecoder({
+      output: (frame) => {
+        const tid = routeFifo.length ? routeFifo.shift() : 0;
+        if (slotHeight === 0) slotHeight = frame.codedHeight;
+        // Replace this tile's pending frame (drop the un-drawn previous one —
+        // we only ever show the newest), then paint at vsync.
+        if (pendingFrames[tid]) { try { pendingFrames[tid].close(); } catch (e) {} }
+        pendingFrames[tid] = frame;
+        if (!rafScheduled) { rafScheduled = true; requestAnimationFrame(drawPending); }
+        decoded++;
+        if (PROF) window.__prof.decoded++;
+      },
+      error: (e) => {
+        lastDecoderError = e.message || String(e);
+        decodeErrCount++;
+        decoderErrored = true;
+        if (decodeErrCount <= 5) srvLog("error", `decode error #${decodeErrCount}: ${lastDecoderError} — resetting`);
+        // Backoff: a persistently bad stream would otherwise spin
+        // error→reset→keyframe→error and spam the host with FIRs. Rate-limit
+        // the rebuild + keyframe request to ≤1 per 500 ms.
+        if (resetTimer) return;
+        const wait = Math.max(0, 500 - (performance.now() - lastResetT));
+        resetTimer = setTimeout(() => {
+          resetTimer = null; lastResetT = performance.now(); resetDecoder();
+        }, wait);
+      },
+    });
+    // Hardware decode by default (low CPU; the platform HW decoder handles this
+    // stream fine now that frames aren't corrupted). ?decode=sw forces software.
+    const qp = new URLSearchParams(location.search);
+    const hwPref = qp.get("decode") === "sw" ? "prefer-software" : "prefer-hardware";
+    dec.configure({
+      codec: (geom && geom.codec) || "avc1.640032",
+      optimizeForLatency: qp.get("lat") !== "0",   // default true; ?lat=0 disables
+      hardwareAcceleration: hwPref,
+    });
+    return dec;
+  }
+
+  function resetDecoder() {
+    decoderErrored = false;
+    try { if (decoder) decoder.close(); } catch (e) {}
+    decoder = buildDecoder();
+    routeFifo = []; awaitingKey = true;
+    pending.clear(); nextSeq = -1; videoTs = 0;
+    for (const f of pendingFrames) { if (f) { try { f.close(); } catch (e) {} } }
+    pendingFrames.length = 0;
+    try { send({ type: "keyframe" }); } catch (e) {}
+  }
+
+  function drainReorder() {
+    if (nextSeq < 0) nextSeq = Math.min(...pending.keys());
+    while (pending.has(nextSeq)) {
+      feedAU(pending.get(nextSeq)); pending.delete(nextSeq);
+      nextSeq = (nextSeq + 1) >>> 0;
+      gapSince = 0;
+    }
+    // Head seq is missing (late/dropped stream). Don't stall waiting on it: skip
+    // ahead to the oldest buffered seq once the backlog passes the COUNT budget
+    // OR the gap has persisted past the TIME budget — whichever first. Bounds one
+    // late frame to a <=45ms hitch instead of the old ~400ms (24-frame) stall.
+    if (pending.size) {
+      if (!gapSince) gapSince = performance.now();
+      if (pending.size > REORDER_GAP_MAX ||
+          performance.now() - gapSince > REORDER_GAP_MAX_MS) {
+        let mn = Infinity; for (const k of pending.keys()) if (k < mn) mn = k;
+        nextSeq = mn; gapSince = 0;
+        while (pending.has(nextSeq)) {
+          feedAU(pending.get(nextSeq)); pending.delete(nextSeq);
+          nextSeq = (nextSeq + 1) >>> 0;
+        }
+      }
+    }
+  }
+
+  function feedAU(au) {
+    if (au.isKey) awaitingKey = false;
+    if (awaitingKey) return;
+    frames++;
+    if (PROF) {
+      const n = performance.now();
+      if (__lastArr) {
+        const gap = n - __lastArr;
+        window.__prof.arr.push(gap);
+        if (gap > 80) srvLog("info", `ARRIVAL GAP ${gap.toFixed(0)}ms`);
+        if (window.__prof.arr.length > 3000) window.__prof.arr.shift();
+      }
+      __lastArr = n;
+    }
+    routeFifo.push(au.tileId);
+    try {
+      decoder.decode(new EncodedVideoChunk({
+        // Synthetic MONOTONIC timestamp, not the raw RTP ts. Apple's stream is
+        // variable-framerate, so the RTP ts jumps irregularly; a steady
+        // 60fps-spaced counter keeps WebCodecs happy (per pymobiledevice3).
+        data: au.payload, type: au.isKey ? "key" : "delta", timestamp: videoTs,
+      }));
+      videoTs += 16666;
+    } catch (e) {
+      routeFifo.pop(); dropped++;
+      if (dropped <= 3) srvLog("error", `decode submit failed: ${e.message || e}`);
+    }
+  }
+
+  function applyConfig(cfg) {
+    geom = cfg;
+    numTiles = Math.max(1, cfg.num_tiles | 0);
+    tileH = (cfg.tile_h | 0) || Math.floor(cfg.canvas_h / numTiles);
+    slotHeight = 0;
+    canvas.width = cfg.canvas_w;
+    canvas.height = cfg.canvas_h;
+    intrinsic.w = cfg.canvas_w;
+    intrinsic.h = cfg.canvas_h;
+    firstFrame = false;
+    // Resolve ?display=N to its host-monitor rect within the combined canvas.
+    // Out-of-range or a host with no layout yet → show the whole canvas.
+    if (cfg.hidpi_scale > 0) HIDPI_SCALE = cfg.hidpi_scale;
+    const dr = cfg.display_rects || [];
+    cropRect = (DISPLAY_IDX != null && DISPLAY_IDX >= 0 && DISPLAY_IDX < dr.length)
+      ? dr[DISPLAY_IDX]
+      : (DISPLAY_IDX == null && cfg.content_rect ? cfg.content_rect : null);
+    setupDisplayPicker(dr);
+    if (DISPLAY_IDX != null) {
+      srvLog("info", cropRect
+        ? `display ${DISPLAY_IDX}: crop ${cropRect.w}x${cropRect.h} @${cropRect.x},${cropRect.y}`
+        : `display ${DISPLAY_IDX} not in layout (${dr.length} display(s)); showing full canvas`);
+    } else if (cropRect) {
+      srvLog("info", `auto-cropping host layout gap to ${cropRect.w}x${cropRect.h} `
+             + `@${cropRect.x},${cropRect.y}`);
+    }
+    fitCanvasToStage(cfg.canvas_w, cfg.canvas_h);
+    // A config means the host session is up and streaming (and, after a resize,
+    // that the re-encode we requested has landed). Clear the in-flight guard and
+    // re-check the window size — this both drives the initial Auto match and
+    // lets a resize converge on the window's final size one step at a time.
+    __resizeInFlight = false;
+    reportSize();
+    resetDecoder();
+    srvLog("info", `config: ${numTiles} tiles ${cfg.canvas_w}x${cfg.canvas_h} `
+           + `tile_h=${tileH} codec=${cfg.codec} (single shared decoder)`);
+  }
+  decoderReady = true;
+
+  // --- cursor (RFB enc 1104) ------------------------------------------
+  // The host cursor is NOT baked into the framebuffer; the server sends pixmaps
+  // and we paint them as the canvas CSS cursor (positioned by the local
+  // pointer, hotspot-aligned). Moving the mouse never dirties the frame.
+  const _curCanvas = document.createElement("canvas");
+  let _lastCursorKey = "";
+  function applyCursor(payload) {
+    if (payload.length < 8) return;
+    const w = (payload[0] << 8) | payload[1];
+    const h = (payload[2] << 8) | payload[3];
+    const hx = (payload[4] << 8) | payload[5];
+    const hy = (payload[6] << 8) | payload[7];
+    const rgba = payload.subarray(8);
+    if (w <= 0 || h <= 0 || w > 256 || h > 256 || rgba.length < w * h * 4) {
+      canvas.style.cursor = "none";  // empty/hidden cursor
+      return;
+    }
+    const key = `${w}x${h}:${rgba.length}:${rgba[0]},${rgba[(w*h*2)|0]},${rgba[rgba.length-1]}`;
+    if (key === _lastCursorKey) return;  // unchanged shape — skip re-encode
+    _lastCursorKey = key;
+    _curCanvas.width = w; _curCanvas.height = h;
+    const cctx = _curCanvas.getContext("2d");
+    const id = cctx.createImageData(w, h);
+    id.data.set(rgba.subarray(0, w * h * 4));
+    cctx.putImageData(id, 0, 0);
+    const cx = Math.min(Math.max(0, hx), w - 1);
+    const cy = Math.min(Math.max(0, hy), h - 1);
+    canvas.style.cursor = `url(${_curCanvas.toDataURL("image/png")}) ${cx} ${cy}, auto`;
+  }
+
+  // --- input forwarding -----------------------------------------------
+  const inputStream = await wt.createBidirectionalStream();
+  const inputWriter = inputStream.writable.getWriter();
+  const enc = new TextEncoder();
+  let buttonMask = 0;
+
+  function inWindowToCanvas(ev) {
+    if (intrinsic.w === 0) return null;
+    const rect = canvas.getBoundingClientRect();
+    const px = (ev.clientX - rect.left) / rect.width;
+    const py = (ev.clientY - rect.top) / rect.height;
+    if (px < 0 || py < 0 || px >= 1 || py >= 1) return null;
+    return [Math.floor(px * intrinsic.w), Math.floor(py * intrinsic.h)];
+  }
+
+  async function send(obj) {
+    try { await inputWriter.write(enc.encode(JSON.stringify(obj) + "\n")); }
+    catch (e) { /* writer closed during teardown */ }
+  }
+
+  // Dynamic resolution ("Auto" in the connect form): report the stage's pixel
+  // size so iss re-encodes the host display to match the window, instead of
+  // streaming its full (e.g. 4K) canvas — the same mechanism the desktop
+  // frontend uses on native-window resize. We report the CSS-pixel size (1×):
+  // it tracks the window and keeps the stream light/smooth; the server clamps
+  // it to the host's 3840×2160 ceiling. A fixed --advertise leaves dynamicRes
+  // false, so we never override the user's explicit resolution choice.
+  let __lastReportedWH = "";
+  let __resizeInFlight = false, __resizeInFlightT = 0;
+  function reportSize() {
+    if (!dynamicRes) return;
+    // Serialize: keep only ONE host re-encode in flight at a time (cleared when
+    // its config lands — see applyConfig — or after a timeout if it never does).
+    // This is what stops a click-drag resize from stacking re-encodes and
+    // thrashing the decoder: we converge on the window's final size in a couple
+    // of steps instead of re-encoding on every intermediate size.
+    if (__resizeInFlight) {
+      if (performance.now() - __resizeInFlightT < 4000) return;  // still settling
+      // Timed out with no config back (a lost re-advertise) — retry the current
+      // size (the periodic tick below re-invokes us). Clear the dedup so the
+      // same size is re-sent rather than swallowed.
+      __resizeInFlight = false; __lastReportedWH = "";
+    }
+    // Report req = physical_px / HIDPI_SCALE; the host renders req × scale = the
+    // window's PHYSICAL pixels (crisp 1:1, NOT over-rendered), and draws the UI
+    // at `scale` (the Display-scale control). Both ends must use the same scale.
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(320, Math.round(stage.clientWidth * dpr / HIDPI_SCALE)) & ~1;
+    const h = Math.max(240, Math.round(stage.clientHeight * dpr / HIDPI_SCALE)) & ~1;
+    const key = w + "x" + h;
+    if (!w || !h || key === __lastReportedWH) return;
+    __lastReportedWH = key;
+    __resizeInFlight = true; __resizeInFlightT = performance.now();
+    send({ type: "resize", w, h });
+  }
+  let __resizeTimer = null;
+  function reportSizeDebounced() {
+    if (__resizeTimer) clearTimeout(__resizeTimer);
+    __resizeTimer = setTimeout(reportSize, 600);  // fire once the drag settles
+  }
+  if (dynamicRes) {
+    // Subsequent window resizes; the initial report is driven by applyConfig
+    // (fires once the session is actually streaming — see the note there).
+    window.addEventListener("resize", reportSizeDebounced);
+    // Slow safety tick: retries the current size if a re-advertise was lost
+    // (the in-flight guard times out at 4s); a no-op via dedup when stable.
+    setInterval(reportSize, 2500);
+  } else {
+    // Fixed canvas (explicit --advertise, or per-monitor crop): re-fit/re-crop
+    // to the stage on window resize — no host re-encode, just CSS re-layout.
+    window.addEventListener("resize", () => {
+      if (intrinsic.w > 0) fitCanvasToStage(intrinsic.w, intrinsic.h);
+    });
+  }
+
+  // Mouse moves go via WebTransport DATAGRAMS — drops are harmless
+  // (only the most recent position matters), and we avoid head-of-
+  // line blocking on the reliable bidi stream which carries
+  // keystrokes / button clicks. Coalesced to vsync (~60Hz when
+  // moving) so we don't flood the wire on every pointer event.
+  // Safari's WebTransport doesn't expose a datagram writer, so feature-detect
+  // it. When present (Chrome/Edge/Firefox) moves go via datagrams; when absent
+  // (Safari) fall back to the SAME {type:"mouse"} JSON on the reliable input
+  // stream that clicks already use — the server dispatches both identically.
+  // Either way moves are coalesced to vsync below, so the stream isn't flooded.
+  const dgrams = wt.datagrams;
+  const dgWriter = (dgrams && dgrams.writable) ? dgrams.writable.getWriter() : null;
+  if (!dgWriter) srvLog("info", "no datagram writer (Safari) — mouse moves go over the input stream");
+  let pendingMove = null;
+  function flushMove() {
+    if (pendingMove !== null) {
+      if (dgWriter) {
+        // 13-byte fixed-format mouse-move datagram.
+        // [type=0x10][buttons:u32 BE][x:i32 BE][y:i32 BE]
+        const buf = new ArrayBuffer(13);
+        const v = new DataView(buf);
+        v.setUint8(0, 0x10);
+        v.setUint32(1, buttonMask >>> 0);
+        v.setInt32(5, pendingMove[0]);
+        v.setInt32(9, pendingMove[1]);
+        dgWriter.write(new Uint8Array(buf)).catch(() => {});
+      } else {
+        send({type: "mouse", buttons: buttonMask, x: pendingMove[0], y: pendingMove[1]});
+      }
+      pendingMove = null;
+    }
+    requestAnimationFrame(flushMove);
+  }
+  requestAnimationFrame(flushMove);
+
+  canvas.addEventListener("mousemove", (e) => {
+    const xy = inWindowToCanvas(e);
+    if (xy) pendingMove = xy;
+  });
+  // Apple's button mask is non-standard: bit 0 = left, bit 1 = right,
+  // bit 2 = middle (right and middle are SWAPPED from the RFB spec).
+  // DOM `e.button`: 0 = left, 1 = middle, 2 = right.
+  function buttonBit(domButton) {
+    return domButton === 0 ? 1   // left   → bit 0 = 0x01
+         : domButton === 2 ? 2   // right  → bit 1 = 0x02 (Apple convention)
+                           : 4;  // middle → bit 2 = 0x04
+  }
+  canvas.addEventListener("mousedown", (e) => {
+    if (e.target !== canvas) return;
+    e.preventDefault();
+    const xy = inWindowToCanvas(e);
+    if (!xy) return;
+    buttonMask |= buttonBit(e.button);
+    send({type: "mouse", buttons: buttonMask, x: xy[0], y: xy[1]});
+  });
+  canvas.addEventListener("mouseup", (e) => {
+    e.preventDefault();
+    const xy = inWindowToCanvas(e);
+    if (!xy) return;
+    buttonMask &= ~buttonBit(e.button);
+    send({type: "mouse", buttons: buttonMask, x: xy[0], y: xy[1]});
+  });
+  canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+  // Wheel: convert pixel-mode `deltaY` to integer ticks for the host's
+  // RFB scroll-button protocol. macOS's native scroll has velocity
+  // acceleration (consecutive fast scrolls amplify exponentially),
+  // which RFB doesn't carry across the wire — we replicate it here:
+  // measure time since previous wheel event and multiply ticks when
+  // events arrive in quick succession.
+  let wheelAccum = 0;
+  let lastWheelT = 0;
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const xy = inWindowToCanvas(e);
+    if (!xy || e.deltaY === 0) return;
+    const now = performance.now();
+    const dt = now - lastWheelT;
+    lastWheelT = now;
+    // Acceleration curve tuned to feel like native macOS scroll.
+    let mult = 1.0;
+    if (dt < 25) mult = 10.0;
+    else if (dt < 50) mult = 6.0;
+    else if (dt < 100) mult = 3.5;
+    else if (dt < 200) mult = 2.0;
+    else if (dt < 350) mult = 1.4;
+    // Each `tick` becomes one wheel press/release pair, and the macOS host
+    // maps each press to a scroll of exactly 1 PIXEL (the server fixes ±1 px
+    // per press). So ticks == pixels scrolled on the host. Normalise deltaMode
+    // to a pixel-equivalent, then divide to land ~12 ticks (px) per wheel notch
+    // (~1 line) — enough to be clearly perceptible. The old /25 gave ~4 px/notch,
+    // so a slow scroll moved too few pixels to notice ("tick didn't register").
+    let pxDelta = e.deltaY;
+    if (e.deltaMode === 1) pxDelta *= 16;        // DOM_DELTA_LINE → ~px
+    else if (e.deltaMode === 2) pxDelta *= 400;  // DOM_DELTA_PAGE → ~px
+    wheelAccum += (pxDelta * mult) / 8;
+    let ticks = Math.trunc(wheelAccum);
+    // Minimum 1 tick per event so slow / tiny-delta inputs always
+    // register. Without this, sub-1-tick accumulator values from a
+    // gentle trackpad swipe could fail to fire for several events.
+    if (ticks === 0) {
+      ticks = e.deltaY > 0 ? 1 : -1;
+      wheelAccum = 0;
+    } else {
+      wheelAccum -= ticks;
+    }
+    if (ticks > 50) ticks = 50;
+    if (ticks < -50) ticks = -50;
+    send({type: "scroll", x: xy[0], y: xy[1], dx: 0, dy: ticks});
+  }, { passive: false });
+
+  document.addEventListener("keydown", (e) => {
+    if (e.metaKey && e.key === "w") return;  // let the user close the tab
+    e.preventDefault();
+    const ks = keysymFromEvent(e);
+    if (ks) send({type: "key", down: true, keysym: ks});
+  });
+  document.addEventListener("keyup", (e) => {
+    e.preventDefault();
+    const ks = keysymFromEvent(e);
+    if (ks) send({type: "key", down: false, keysym: ks});
+  });
+
+  // --- video stream reader --------------------------------------------
+  const reader = wt.incomingUnidirectionalStreams.getReader();
+  let frames = 0, bytesReceived = 0;
+  let lastDecoded = 0, lastFrames = 0, lastBytes = 0, lastT = performance.now();
+  // Server-side stats (loss%, stuck-time, encoder, decoder) are pulled
+  // from /stats; updated independently so a slow fetch doesn't gap the
+  // local fps/bitrate readout.
+  let serverStats = {loss_pct: 0, stuck_s: 0, decoder: "", encoder: ""};
+  setInterval(async () => {
+    try {
+      const r = await viewerFetch("/stats", {cache: "no-store"});
+      if (r.ok) serverStats = await r.json();
+    } catch (e) { /* keep last */ }
+  }, 1000);
+  setInterval(() => {
+    const ms = decoder ? (decoder.decodeQueueSize ?? 0) : 0;
+    if (decoderErrored) return;
+    const now = performance.now();
+    const dt = (now - lastT) / 1000;
+    const dFps = ((decoded - lastDecoded) / dt);
+    const sFps = ((frames - lastFrames) / dt);
+    const mbps = ((bytesReceived - lastBytes) * 8 / 1e6 / dt);
+    lastDecoded = decoded; lastFrames = frames; lastBytes = bytesReceived; lastT = now;
+    // Compact status line — the fields a viewer actually cares about:
+    //   fps      — is the decoder keeping up? (essential)
+    //   Mb/s     — current bandwidth (what the user watches)
+    //   WxH      — the resolution actually being delivered
+    //   loss%    — server-side cumulative SRTP loss (quality)
+    //   frozen   — shown ONLY when the iss decoder hasn't published a
+    //              fresh tile for >=1.5s (a real freeze); tints the bar red
+    //   dec/enc  — hw paths that picked up (vaapi/h264_videotoolbox/…)
+    // The canvas gray-sampler still runs below and is reported to the iss
+    // server log; gray% just isn't shown here — it isn't actionable for
+    // the person watching.
+    const stuck = serverStats.stuck_s || 0;
+    const loss = serverStats.loss_pct || 0;
+    const klass = stuck >= 1.5 ? "err" : "ok";
+    setStatus(
+      `${dFps.toFixed(0)} fps · ${mbps.toFixed(2)} Mb/s · ${canvas.width}×${canvas.height}`
+      + ` · loss ${loss.toFixed(2)}%`
+      + (stuck >= 1.5 ? ` · ⚠ frozen ${stuck.toFixed(1)}s` : "")
+      + ` · ${serverStats.decoder || "?"}/${serverStats.encoder || "?"}`,
+      klass,
+    );
+    // Sample the canvas to verify real content is being displayed.
+    // 8x8 grid of 1-pixel reads → mean / std / gray-fraction. Tiny
+    // (~0.1ms). Lets the iss server log "is the user seeing video"
+    // without requiring the user to look at the screen.
+    let sm = 0, ssq = 0, sg = 0, n = 0;
+    if (canvas.width > 0 && canvas.height > 0) {
+      try {
+        for (let gy = 0; gy < 8; gy++) {
+          for (let gx = 0; gx < 8; gx++) {
+            const px = ctx.getImageData(
+              Math.floor((gx + 0.5) * canvas.width / 8),
+              Math.floor((gy + 0.5) * canvas.height / 8),
+              1, 1).data;
+            const lum = 0.2126 * px[0] + 0.7152 * px[1] + 0.0722 * px[2];
+            sm += lum; ssq += lum * lum; n++;
+            // "gray" = near-mid + desaturated (concealment fill).
+            if (Math.abs(lum - 128) < 16
+                && Math.abs(px[0] - px[1]) < 6 && Math.abs(px[1] - px[2]) < 6) sg++;
+          }
+        }
+        const mean = sm / n;
+        const std = Math.sqrt(Math.max(0, ssq / n - mean * mean));
+        lastSampleStats = {
+          mean: +mean.toFixed(1),
+          std: +std.toFixed(1),
+          gray_frac: +(sg / n).toFixed(3),
+        };
+      } catch (e) { /* getImageData may throw on some GPU paths */ }
+    }
+    // Mirror browser-side stats to the server log so the iss operator
+    // can read what the viewer sees alongside the encoder stats.
+    send({
+      type: "stats",
+      decode_fps: +dFps.toFixed(1),
+      stream_fps: +sFps.toFixed(1),
+      mbps: +mbps.toFixed(2),
+      decoder_queue: ms,
+      decoder_errored: decoderErrored ? 1 : 0,
+      decoder_error: lastDecoderError || "",
+      total_mb: +(bytesReceived/1024/1024).toFixed(1),
+      total_streams: frames,
+      canvas_w: canvas.width, canvas_h: canvas.height,
+      pixel_mean: lastSampleStats.mean,
+      pixel_std: lastSampleStats.std,
+      gray_frac: lastSampleStats.gray_frac,
+      audio_state: audioPipelineState,
+      audio_ctx: audioCtx ? audioCtx.state : "none",
+      audio_packets: audioPackets,
+      audio_frames: audioFrames,
+      audio_decode_err: audioDecodeErrors,
+      audio_submit_err: audioSubmitErrors,
+    });
+  }, 1000);
+
+  // Audio decode + playback via AudioWorklet ring buffer. The worklet
+  // is loaded lazily on the first audio packet so video-only streams
+  // don't pay any audio-stack cost.
+  //
+  // AudioContext autoplay policy: most browsers require a user gesture
+  // before audio can be heard. We construct the context on the first
+  // packet, then resume it on the first input event (click/key/move).
+  let audioDec = null, audioCtx = null, audioNode = null;
+  let audioPackets = 0, audioFrames = 0;
+  let audioDecodeErrors = 0, audioSubmitErrors = 0;
+  let audioPipelineState = "uninit";
+  let audioPendingResume = false;
+  async function ensureAudio() {
+    if (audioCtx) return;
+    audioPipelineState = "init";
+    try {
+      audioCtx = new AudioContext({ latencyHint: "interactive", sampleRate: 48000 });
+      srvLog("info", `audio: ctx created sr=${audioCtx.sampleRate} state=${audioCtx.state}`);
+      await audioCtx.audioWorklet.addModule("/audio-worklet.js");
+      audioNode = new AudioWorkletNode(audioCtx, "iss-audio-ring", {
+        outputChannelCount: [2],
+      });
+      audioNode.connect(audioCtx.destination);
+      audioDec = new AudioDecoder({
+        output: ad => {
+          audioFrames++;
+          const ch = ad.numberOfChannels, n = ad.numberOfFrames;
+          const planes = [];
+          for (let p = 0; p < ch; p++) {
+            const buf = new Float32Array(n);
+            ad.copyTo(buf, { planeIndex: p, format: "f32-planar" });
+            planes.push(buf);
+          }
+          ad.close();
+          const out = new Float32Array(n * 2);
+          const l = planes[0], r = planes[ch > 1 ? 1 : 0];
+          for (let i = 0; i < n; i++) { out[i*2] = l[i]; out[i*2+1] = r[i]; }
+          audioNode.port.postMessage(out, [out.buffer]);
+        },
+        error: e => {
+          audioDecodeErrors++;
+          srvLog("error", `audio decoder error: ${e.message || e}`);
+        },
+      });
+      audioDec.configure({
+        codec: "opus",
+        sampleRate: 48000,
+        numberOfChannels: 2,
+      });
+      audioPipelineState = audioCtx.state === "running" ? "ready" : "needs-gesture";
+      srvLog("info", `audio: pipeline configured, ctx state=${audioCtx.state}`);
+      // Try to resume immediately — works if the user has already
+      // interacted with the page; otherwise we resume on first input.
+      if (audioCtx.state === "suspended") {
+        try {
+          await audioCtx.resume();
+          audioPipelineState = audioCtx.state === "running" ? "ready" : "needs-gesture";
+          srvLog("info", `audio: resume after configure -> ${audioCtx.state}`);
+        } catch (e) {
+          srvLog("info", `audio: deferred resume (no gesture yet)`);
+        }
+      }
+    } catch (e) {
+      audioPipelineState = "failed";
+      srvLog("error", `audio init failed: ${e.message || e}`);
+      throw e;
+    }
+  }
+  async function resumeAudioOnGesture() {
+    // Only unlock on a gesture when the user actually wants audio (unmuted).
+    // While muted the context is intentionally suspended, so resuming it on
+    // every keystroke just flip-flops suspended→running and spams the log
+    // (each keystroke is a "user gesture"). The unmute button's own click
+    // gesture resumes it when the user opts in.
+    if (!audioCtx || !audioIntent || audioCtx.state !== "suspended"
+        || audioPendingResume) return;
+    audioPendingResume = true;
+    try {
+      await audioCtx.resume();
+      srvLog("info", `audio: resumed via user gesture -> ${audioCtx.state}`);
+      audioPipelineState = audioCtx.state === "running" ? "ready" : "needs-gesture";
+    } catch (e) {
+      srvLog("error", `audio resume failed: ${e.message || e}`);
+    } finally {
+      audioPendingResume = false;
+    }
+  }
+  // Hook every input path the user can hit. AudioContext.resume()
+  // must be called from inside a user-gesture handler in some
+  // browsers, so we attach to all of them.
+  ["pointerdown", "keydown", "mousedown", "touchstart"].forEach(ev =>
+    window.addEventListener(ev, resumeAudioOnGesture, { passive: true })
+  );
+  // User's intent for audio: starts muted (Chrome's autoplay policy
+  // would suspend it anyway). Click toggles. We track the *intent*
+  // separately from `audioCtx.state` because Chrome can flip the
+  // context between suspended/running on focus changes, audio device
+  // changes, etc. — without that separation the icon flickers
+  // spontaneously. We re-assert intent in the interval below.
+  let audioIntent = false;  // false = muted, true = playing
+  const unmuteBtn = document.getElementById("unmute");
+  unmuteBtn.addEventListener("click", async () => {
+    if (!audioCtx) await ensureAudio();
+    if (!audioCtx) return;
+    audioIntent = !audioIntent;
+    try {
+      if (audioIntent) await audioCtx.resume();
+      else await audioCtx.suspend();
+    } catch (e) {}
+    unmuteBtn.textContent = audioIntent ? "🔊" : "🔇";
+  });
+  // Re-apply user intent if Chrome silently flipped state. Doesn't
+  // touch the icon — the icon reflects user intent only, set on click.
+  setInterval(() => {
+    if (!audioCtx) return;
+    if (audioIntent && audioCtx.state === "suspended") {
+      audioCtx.resume().catch(() => {});
+    } else if (!audioIntent && audioCtx.state === "running") {
+      audioCtx.suspend().catch(() => {});
+    }
+  }, 1000);
+
+  // Resolution selector — sends a preferred max-height to the server's
+  // pump; the server triggers a session reconnect with the new
+  // virtual-display geometry. 0 = source resolution. Choice persists
+  // in localStorage so a CPU-bound user doesn't re-pick every reload.
+  // We DON'T send on initial page-load because the server already has
+  // the previous setting (it persists across page reloads as long as
+  // iss is alive). Only `change` events trigger a reconnect.
+  const resSelect = document.getElementById("res");
+  resSelect.value = localStorage.getItem("iss_res") || "0x0";
+  resSelect.addEventListener("change", () => {
+    const v = resSelect.value || "0x0";
+    localStorage.setItem("iss_res", v);
+    const [w, h] = v.split("x").map(s => parseInt(s, 10) || 0);
+    send({type: "set_resolution", width: w, height: h});
+  });
+
+  // Kick off audio init right after WT is ready so the datagram reader
+  // never blocks waiting for AudioContext / worklet load. We do this
+  // even if no audio is on the stream yet — the cost is tiny.
+  ensureAudio().catch(e => srvLog("error", `audio init kicked-off: ${e.message || e}`));
+
+  // Datagram reader (audio + future input back-channels).
+  // Runs in parallel with the stream reader. NEVER blocks — drops
+  // audio packets that arrive before the decoder is ready.
+  (async () => {
+    const dgIn = wt.datagrams;
+    if (!dgIn || !dgIn.readable) {
+      srvLog("info", "no datagram reader (Safari) — audio-over-datagram disabled");
+      return;
+    }
+    const dgReader = dgIn.readable.getReader();
+    let audioDropped = 0;
+    while (true) {
+      const { value: buf, done } = await dgReader.read();
+      if (done) break;
+      if (!buf || buf.byteLength < 14) continue;
+      // Envelope: [tag][tile][seq(4)][ts(8)][payload]. Reading the Opus payload
+      // at the wrong offset prepends a stray byte to the TOC → garbage/noise.
+      const tag = buf[0];
+      const ts = readBE64(buf, 6);
+      const payload = buf.subarray(14);
+      bytesReceived += buf.byteLength;
+      if (tag === 2) {
+        audioPackets++;
+        if (audioDec === null || (audioDec.state !== "configured")) {
+          audioDropped++;
+          if (audioDropped <= 3) {
+            srvLog("info", `audio: drop pkt=${audioPackets} (dec=${audioDec ? audioDec.state : "null"})`);
+          }
+          continue;
+        }
+        try {
+          audioDec.decode(new EncodedAudioChunk({
+            data: payload,
+            type: "key",
+            timestamp: Number(ts),
+          }));
+          if (audioPackets === 1 || audioPackets === 50 || audioPackets === 200 || audioPackets === 1000) {
+            srvLog("info", `audio: pkt=${audioPackets} payload=${payload.byteLength}B ctx=${audioCtx ? audioCtx.state : "?"} decFrames=${audioFrames} dropped=${audioDropped}`);
+          }
+        } catch (e) {
+          audioSubmitErrors++;
+          if (audioSubmitErrors < 3) srvLog("error", `audio decode submit: ${e.message}`);
+        }
+      }
+    }
+  })().catch(e => srvLog("error", `datagram reader: ${e.message || e}`));
+
+  // Dispatch one envelope ([tag][tile][seq:4][ts:8][payload]; tag 0=delta,
+  // 1=key, 3=config, 4=cursor). `ordered`=true (single-stream) feeds the
+  // decoder directly; false (per-frame) buffers by seq so drainReorder() can
+  // restore order across out-of-order streams.
+  function handleEnvelope(fbuf, ordered) {
+    if (fbuf.length < 14) return;
+    const tag = fbuf[0];
+    const seq = (fbuf[2] * 0x1000000) + (fbuf[3] << 16) + (fbuf[4] << 8) + fbuf[5];
+    if (window.__lat && (tag === 0 || tag === 1)) {
+      const hi = ((fbuf[6] * 0x1000000) + (fbuf[7] << 16) + (fbuf[8] << 8) + fbuf[9]) >>> 0;
+      const lo = ((fbuf[10] * 0x1000000) + (fbuf[11] << 16) + (fbuf[12] << 8) + fbuf[13]) >>> 0;
+      const tsMs = (hi * 4294967296 + lo) / 1000;   // ts_us → ms
+      const drift = performance.now() - tsMs;
+      if (window.__lat.base === null) window.__lat.base = drift;
+      window.__lat.cur = drift - window.__lat.base;  // added latency vs first frame
+      window.__lat.n++;
+    }
+    const payload = fbuf.subarray(14);
+    if (tag === 3) {               // config
+      try { applyConfig(JSON.parse(new TextDecoder().decode(payload))); }
+      catch (e) { srvLog("error", `bad config: ${e}`); }
+      return;
+    }
+    if (tag === 4) { applyCursor(payload); return; }  // enc-1104 cursor
+    if (tag !== 0 && tag !== 1) return;
+    if (!decoder) return;          // config not seen yet
+    if (ordered) {
+      feedAU({ seq, isKey: tag === 1, tileId: fbuf[1], payload });
+    } else {
+      pending.set(seq, { seq, isKey: tag === 1, tileId: fbuf[1], payload });
+      drainReorder();
+    }
+  }
+
+  if (singleStream) {
+    // SINGLE-STREAM mode: the server sends every envelope length-prefixed
+    // ([u32 len][envelope]) on ONE long-lived uni stream. It's ordered, so we
+    // feed the decoder directly — no reorder buffer, 1 stream credit (Safari).
+    // The server bounds latency by dropping deltas when its send buffer backs
+    // up (then a keyframe resyncs the decoder), NOT by resetting the stream, so
+    // normally there's a single stream for the whole session. We still loop over
+    // reader.read() defensively: if a stream ever ends we drop its partial
+    // buffer and pick up the next one. Only a WT session close ends the loop.
+    srvLog("info", "video transport: single-stream");
+    while (true) {
+      const { value: stream, done: outerDone } = await reader.read();
+      if (outerDone) break;              // session closed
+      if (!stream) continue;
+      const r = stream.getReader();
+      // Amortized-O(n) accumulator: a growable buffer with a read pointer,
+      // compacted with copyWithin. The old code re-copied the ENTIRE pending
+      // buffer on every QUIC chunk — O(n^2), and a 4K keyframe split over ~700
+      // chunks meant hundreds of MB of copying per frame, so the read loop
+      // couldn't keep up with the source and latency grew without bound. Each
+      // envelope payload is consumed synchronously (EncodedVideoChunk /
+      // JSON.parse copy their data), so reusing the backing buffer is safe.
+      let buf = new Uint8Array(1 << 16);
+      let len = 0, rp = 0;
+      try {
+        while (true) {
+          const { value, done } = await r.read();
+          if (done) break;
+          bytesReceived += value.byteLength;
+          if (len + value.byteLength > buf.length) {
+            if (rp > 0) { buf.copyWithin(0, rp, len); len -= rp; rp = 0; }
+            if (len + value.byteLength > buf.length) {
+              let cap = buf.length;
+              while (cap < len + value.byteLength) cap *= 2;
+              const nb = new Uint8Array(cap); nb.set(buf.subarray(0, len)); buf = nb;
+            }
+          }
+          buf.set(value, len); len += value.byteLength;
+          while (len - rp >= 4) {
+            const l = (buf[rp] * 0x1000000) + (buf[rp + 1] << 16) +
+                      (buf[rp + 2] << 8) + buf[rp + 3];
+            if (len - rp - 4 < l) break;   // wait for the rest
+            handleEnvelope(buf.subarray(rp + 4, rp + 4 + l), true);
+            rp += 4 + l;
+          }
+          if (rp > (1 << 20)) { buf.copyWithin(0, rp, len); len -= rp; rp = 0; }
+        }
+      } catch (e) {
+        // Server RESET this stream to shed a stale backlog — expected. Discard
+        // the partial buffer and fall through to read the fresh stream.
+        srvLog("info", "single-stream reset — resyncing on next stream");
+      }
+    }
+    setStatus("WT closed", "err");
+    return;
+  }
+
+  // PER-FRAME mode (default): the server opens a fresh uni stream per frame.
+  // A behind client backs up at QUIC's stream-count limit so the server drops
+  // newest frames rather than buffering unboundedly (bounds latency). Streams
+  // can surface out of order → drainReorder() restores seq order.
+  while (true) {
+    const { value: stream, done } = await reader.read();
+    if (done) break;
+    // Read each stream in its OWN task — do NOT await it here. If we awaited,
+    // a single stalled stream (opened but slow/never-FIN'd, which Safari does
+    // during a host stall) would block the outer loop from pulling ANY later
+    // stream — including the resume keyframe — so the stream would never
+    // recover (Chrome delivered FINs promptly and hid this; Safari didn't).
+    // Concurrent reads are safe because drainReorder() restores the server's
+    // forward order by sequence number regardless of completion order.
+    (async (s) => {
+      const chunks = [];
+      let total = 0;
+      const r = s.getReader();
+      while (true) {
+        const { value, done } = await r.read();
+        if (done) break;
+        chunks.push(value);
+        total += value.byteLength;
+      }
+      bytesReceived += total;
+      if (total < 14) return;
+      const fbuf = new Uint8Array(total);
+      let off = 0;
+      for (const c of chunks) { fbuf.set(c, off); off += c.byteLength; }
+      handleEnvelope(fbuf, false);
+    })(stream).catch(() => {});  // a per-stream reset/abort is harmless — the
+    // stream is now unawaited, so swallow it here (drainReorder covers the gap)
+    // rather than leak an unhandled rejection.
+  }
+  setStatus("WT closed", "err");
+}
+
+function readBE64(buf, off) {
+  // BigInt path because timestamps are 64-bit.
+  let v = 0n;
+  for (let i = 0; i < 8; i++) v = (v << 8n) | BigInt(buf[off + i]);
+  return v;
+}
+
+// Minimal JS keycode → X11 keysym map. Covers letters, digits,
+// arrows, Enter/Tab/Esc/Backspace, modifiers. Add as needed.
+function keysymFromEvent(e) {
+  const k = e.key;
+  if (k.length === 1) return k.charCodeAt(0);
+  const M = {
+    Enter: 0xff0d, Tab: 0xff09, Backspace: 0xff08, Escape: 0xff1b,
+    ArrowLeft: 0xff51, ArrowUp: 0xff52, ArrowRight: 0xff53, ArrowDown: 0xff54,
+    Home: 0xff50, End: 0xff57, PageUp: 0xff55, PageDown: 0xff56,
+    Insert: 0xff63, Delete: 0xffff,
+    F1: 0xffbe, F2: 0xffbf, F3: 0xffc0, F4: 0xffc1, F5: 0xffc2,
+    F6: 0xffc3, F7: 0xffc4, F8: 0xffc5, F9: 0xffc6, F10: 0xffc7,
+    F11: 0xffc8, F12: 0xffc9,
+    // screensharingd maps Meta_L to Option and Alt_L to Command, so a Mac's
+    // Option key is sent as Meta_L; a PC's Alt (Command's position) stays Alt_L.
+    Shift: 0xffe1, Control: 0xffe3, Meta: 0xffeb,
+    Alt: /Mac/.test(navigator.platform || navigator.userAgent) ? 0xffe7 : 0xffe9,
+    CapsLock: 0xffe5,
+  };
+  return M[k] || 0;
+}
+
+window.addEventListener("resize", () => {
+  if (canvas.width && canvas.height) fitCanvasToStage(canvas.width, canvas.height);
+});
+
+main().catch(e => { setStatus(`fatal: ${e.message || e}`, "err"); console.error(e); });

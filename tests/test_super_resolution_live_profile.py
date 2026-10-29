@@ -11,10 +11,10 @@ def test_evaluation_profile_overrides_submitted_fields_without_mutating_input(mo
     from isharescreen.proxy.media import registry
     monkeypatch.setattr(registry, "select", lambda codec: SimpleNamespace(name="vt-hevc444") if codec == "hevc" else None)
     submitted = dict(sr_evaluation="on", frontend="browser", advertise="auto", scale="4.0",
-                     decoder="libav-avc420", audio="on", curtain="off", host="mac.test", user="viewer", password="secret")
+                     decoder="libav-avc420", codec="avc", chroma="444", audio="on", curtain="off", host="mac.test", user="viewer", password="secret")
     normalized = connect._evaluation_values(submitted)
     assert normalized == dict(submitted, frontend="desktop", advertise="960x540", scale="1.0",
-                              decoder="vt-hevc444", audio="off", curtain="on")
+                              decoder="vt-hevc444", codec="hevc", chroma="auto", audio="off", curtain="on")
     assert submitted["advertise"] == "auto" and submitted["decoder"] == "libav-avc420"
     assert connect._evaluation_values({"advertise": "auto"}) == {"advertise": "auto"}
 

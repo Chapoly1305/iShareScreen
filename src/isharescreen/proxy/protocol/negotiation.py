@@ -747,112 +747,117 @@ def connect_and_negotiate(
                         krb_principal=krb_principal, krb_service=krb_service)
     sock, ecb_key = _phase_auth(host, port, username, password, auth_mode,
                                 recorder, **auth_options)
-    server_w, server_h = _phase_client_init(sock)
+    try:
+        server_w, server_h = _phase_client_init(sock)
 
-    # Auto-detect the SessionSelect prompt rather than requiring a pre-set
-    # flag: the daemon emits it only when someone other than the auth user is
-    # logged in. Peek non-destructively — if absent, the bytes stay buffered
-    # for the normal handshake below; if present, route by flag (default
-    # share-console = view their session; --alt-session = log in separately).
-    if _peek_ss_prompt(sock):
-        # Neither mode was forced and the launcher gave us a way to ask the
-        # user (a different user is logged in at the host's console): prompt
-        # now for share-console vs alt-session and route on their answer.
-        if not alt_session and not share_console and on_session_choice is not None:
-            console_user = _peek_ss_console_user(sock)
-            try:
-                choice = on_session_choice(console_user)
-            except Exception:
-                log.exception("session-choice prompt failed; defaulting to share")
-                choice = "share_console"
-            alt_session = (choice == "alt_session")
-            log.info("session-select: %r chose %s", console_user, choice)
-        # Apple Screen Sharing's two-TCP convention for the cmd=2 alt-session
-        # path: open conn1, do SRP, see the SessionSelect prompt, close
-        # conn1, then open a fresh conn2 and redo SRP from scratch
-        # before sending cmd=2. The point is to avoid daemon-side state
-        # bleed where conn1's SRP-K-derived cryptor sticks around and
-        # confuses subsequent decryption. In practice: console user
-        # stays uncurtained and display routing doesn't combine. We do
-        # the same here.
-        # cmd=0 share-console only needs one TCP — no encrypted creds
-        # to worry about — so it skips this dance.
-        if alt_session:
-            if not password:
-                sock.close()
-                raise AuthError("Starting a separate user session requires a password; "
-                                "enter one or save it in the system credential store")
-            log.info("alt-session: closing conn1, opening conn2 for cmd=2")
-            try:
-                sock.close()
-            except Exception:
-                pass
-            sock, ecb_key = _phase_auth(host, port, username, password,
-                                        auth_mode, recorder, **auth_options)
-            server_w, server_h = _phase_client_init(sock)
+        # Auto-detect the SessionSelect prompt rather than requiring a pre-set
+        # flag: the daemon emits it only when someone other than the auth user is
+        # logged in. Peek non-destructively — if absent, the bytes stay buffered
+        # for the normal handshake below; if present, route by flag (default
+        # share-console = view their session; --alt-session = log in separately).
+        if _peek_ss_prompt(sock):
+            # Neither mode was forced and the launcher gave us a way to ask the
+            # user (a different user is logged in at the host's console): prompt
+            # now for share-console vs alt-session and route on their answer.
+            if not alt_session and not share_console and on_session_choice is not None:
+                console_user = _peek_ss_console_user(sock)
+                try:
+                    choice = on_session_choice(console_user)
+                except Exception:
+                    log.exception("session-choice prompt failed; defaulting to share")
+                    choice = "share_console"
+                alt_session = (choice == "alt_session")
+                log.info("session-select: %r chose %s", console_user, choice)
+            # Apple Screen Sharing's two-TCP convention for the cmd=2 alt-session
+            # path: open conn1, do SRP, see the SessionSelect prompt, close
+            # conn1, then open a fresh conn2 and redo SRP from scratch
+            # before sending cmd=2. The point is to avoid daemon-side state
+            # bleed where conn1's SRP-K-derived cryptor sticks around and
+            # confuses subsequent decryption. In practice: console user
+            # stays uncurtained and display routing doesn't combine. We do
+            # the same here.
+            # cmd=0 share-console only needs one TCP — no encrypted creds
+            # to worry about — so it skips this dance.
+            if alt_session:
+                if not password:
+                    sock.close()
+                    raise AuthError("Starting a separate user session requires a password; "
+                                    "enter one or save it in the system credential store")
+                log.info("alt-session: closing conn1, opening conn2 for cmd=2")
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                sock, ecb_key = _phase_auth(host, port, username, password,
+                                            auth_mode, recorder, **auth_options)
+                server_w, server_h = _phase_client_init(sock)
 
-        # Read the (re-)issued SessionSelect prompt and send our cmd
-        # response. For cmd=2 the body carries
-        # AES-128-ECB(ecb_key, username/password) at body+0x48/+0x88;
-        # the daemon decrypts under conn2's freshly-derived ecb_key.
-        # For cmd=0 it's a 72-byte plain login_info.
-        mode = "alt_session" if alt_session else "share_console"
-        _phase_session_select(
-            sock,
-            mode=mode,
-            username=username, password=password, ecb_key=ecb_key,
-        )
-
-    if alt_session:
-        # cmd=2 path: send a SetDisplayConfiguration with the alt-user
-        # login hint set (the 0x07 byte at displayInfo+0x99 — captured
-        # from Apple Screen Sharing.app traffic). Without that hint the
-        # daemon's `createLoginWindow=1` branch leaves
-        # `virtualDisplayCount=0` and the encoder targets the *console*
-        # user's screen instead of the alt-user vdisplay we just
-        # spawned. With it set, count=1 and the encoder picks up the
-        # correct `displayID to capture`.
-        sock.sendall(
-            build_viewer_info(
-                app_id=2, app_ver=(6, 1, 0),
-                os_ver=APPLE_VIEWER_OS_VER,
-                command_mask=APPLE_VIEWER_COMMAND_MASK,
-                extra=b"",
+            # Read the (re-)issued SessionSelect prompt and send our cmd
+            # response. For cmd=2 the body carries
+            # AES-128-ECB(ecb_key, username/password) at body+0x48/+0x88;
+            # the daemon decrypts under conn2's freshly-derived ecb_key.
+            # For cmd=0 it's a 72-byte plain login_info.
+            mode = "alt_session" if alt_session else "share_console"
+            _phase_session_select(
+                sock,
+                mode=mode,
+                username=username, password=password, ecb_key=ecb_key,
             )
-            + APPLE_0X12_FOLLOWUP
+
+        if alt_session:
+            # cmd=2 path: send a SetDisplayConfiguration with the alt-user
+            # login hint set (the 0x07 byte at displayInfo+0x99 — captured
+            # from Apple Screen Sharing.app traffic). Without that hint the
+            # daemon's `createLoginWindow=1` branch leaves
+            # `virtualDisplayCount=0` and the encoder targets the *console*
+            # user's screen instead of the alt-user vdisplay we just
+            # spawned. With it set, count=1 and the encoder picks up the
+            # correct `displayID to capture`.
+            sock.sendall(
+                build_viewer_info(
+                    app_id=2, app_ver=(6, 1, 0),
+                    os_ver=APPLE_VIEWER_OS_VER,
+                    command_mask=APPLE_VIEWER_COMMAND_MASK,
+                    extra=b"",
+                )
+                + APPLE_0X12_FOLLOWUP
+            )
+            time.sleep(_POST_VIEWERINFO_SETTLE_S)
+            sock.sendall(build_virtual_display(
+                width=advertise.width,
+                height=advertise.height,
+                hidpi_scale=advertise.hidpi_scale,
+                hdr=hdr,
+                alt_user_login=True,
+            ))
+            sock.sendall(build_set_encodings(HP_ENCODINGS_FULL))
+        else:
+            _phase_handshake_plaintext(sock, advertise, hdr, curtain=curtain)
+
+        cipher = _phase_enable_enc1103(sock, ecb_key)
+        leftover_msgs: list[bytes] = []
+        keys, (canvas_w, canvas_h, canvas_tiles) = _phase_media_offer(
+            sock, cipher, audio_offer, video_offer,
+            alt_session=alt_session, leftover_msgs=leftover_msgs,
         )
-        time.sleep(_POST_VIEWERINFO_SETTLE_S)
-        sock.sendall(build_virtual_display(
-            width=advertise.width,
-            height=advertise.height,
-            hidpi_scale=advertise.hidpi_scale,
-            hdr=hdr,
-            alt_user_login=True,
-        ))
-        sock.sendall(build_set_encodings(HP_ENCODINGS_FULL))
-    else:
-        _phase_handshake_plaintext(sock, advertise, hdr, curtain=curtain)
 
-    cipher = _phase_enable_enc1103(sock, ecb_key)
-    leftover_msgs: list[bytes] = []
-    keys, (canvas_w, canvas_h, canvas_tiles) = _phase_media_offer(
-        sock, cipher, audio_offer, video_offer,
-        alt_session=alt_session, leftover_msgs=leftover_msgs,
-    )
+        return NegotiationResult(
+            sock=sock,
+            cipher=cipher,
+            keys=keys,
+            ecb_key=ecb_key,
+            server_width=server_w,
+            server_height=server_h,
+            canvas_width=canvas_w,
+            canvas_height=canvas_h,
+            canvas_tiles=canvas_tiles,
+            video_decryptor=SRTPDecryptor.from_blob(keys.video_key_s),
+            leftover_msgs=leftover_msgs,
+        )
+    except BaseException:
+        sock.close()
+        raise
 
-    return NegotiationResult(
-        sock=sock,
-        cipher=cipher,
-        keys=keys,
-        ecb_key=ecb_key,
-        server_width=server_w,
-        server_height=server_h,
-        canvas_width=canvas_w,
-        canvas_height=canvas_h,
-        canvas_tiles=canvas_tiles,
-        video_decryptor=SRTPDecryptor.from_blob(keys.video_key_s),
-        leftover_msgs=leftover_msgs,
-    )
 
 
 # ── helpers ──────────────────────────────────────────────────────────

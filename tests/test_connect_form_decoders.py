@@ -17,7 +17,8 @@ from isharescreen.proxy.media import registry as R
 def _darwin_no_vt(monkeypatch):
     """Pretend: macOS where VideoToolbox HEVC-444 is NOT actually available."""
     monkeypatch.setattr(R.sys, "platform", "darwin")
-    monkeypatch.setattr(R, "_hevc444_method", lambda: None)
+    monkeypatch.setattr(R, "_libav_hw", lambda: False)
+    monkeypatch.setattr(R, "_qsv_hw", lambda: False)
     monkeypatch.setattr(R, "_vt_available", lambda: False)
 
 

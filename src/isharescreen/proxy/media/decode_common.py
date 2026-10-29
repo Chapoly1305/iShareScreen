@@ -85,7 +85,8 @@ class _TileSlot:
     """The latest decoded frame for one tile + its bookkeeping. Locked so
     the decode worker (writer) and the consumer's `get_frame()` (reader)
     don't tear."""
-    raw_frame: Optional[av.VideoFrame] = None
+    raw_frame: Optional[TileFrame] = None
+    prepared_error: bool = False
     good_count: int = 0
     # Frames published WITHOUT a libav decode-error flag — i.e. actually
     # clean video, not concealed gray. `good_count` counts every published
@@ -126,6 +127,7 @@ def _av_frame_to_tile(
     frame: av.VideoFrame,
     reformatter_holder: list[Optional[av.video.reformatter.VideoReformatter]],
     seen_fmts: set[str],
+    preserve_nv12: bool = False,
 ) -> tuple[Optional[TileFrame], bool]:
     """Convert an `av.VideoFrame` to our `TileFrame`.
 
@@ -151,13 +153,13 @@ def _av_frame_to_tile(
         if reformatter_holder[0] is None:
             from av.video.reformatter import VideoReformatter
             reformatter_holder[0] = VideoReformatter()
-        # Apple's HEVC stream is RExt 4:4:4 — reformatting to 4:2:0
-        # (nv12) throws away three-quarters of the chroma and produces
-        # visible "pixelated gray" fringing on text and rectangles.
-        # Preserve full chroma. yuv444p is universally supported by
-        # libswscale; the GPU upload path already handles it as planar
-        # full-resolution Y/U/V.
-        frame = reformatter_holder[0].reformat(frame, format="yuv444p")
+        # AMD downloads GPU frames on the decode producer after a bounded batch,
+        # before notifying the display consumer.
+        # Preserve their native software format: forcing 4:4:4 would quadruple
+        # chroma storage for a 4:2:0 source and add an unnecessary conversion.
+        software_format = getattr(frame, "sw_format", None)
+        output_format = getattr(software_format, "name", None) or "yuv444p"
+        frame = reformatter_holder[0].reformat(frame, format=output_format)
         fmt = frame.format.name
 
     if fmt in _PACKED_444_FORMATS:
@@ -169,6 +171,15 @@ def _av_frame_to_tile(
             reformatter_holder[0] = VideoReformatter()
         frame = reformatter_holder[0].reformat(frame, format="yuv444p")
         fmt = frame.format.name
+
+    if fmt == "nv12" and preserve_nv12:
+        yp, uvp = frame.planes
+        return TileFrame(
+            y=bytes(yp), u=bytes(uvp), v=None,
+            width=width, height=height,
+            y_stride=yp.line_size, uv_stride=uvp.line_size,
+            chroma_width=width // 2, chroma_height=height // 2,
+        ), had_error
 
     if fmt in ("nv12", "nv21"):
         # Biplanar 4:2:0 (VideoToolbox's AVC output). Deinterleaving the UV
@@ -218,3 +229,26 @@ __all__ = [
     "_HW_FRAME_FORMATS",
     "_av_frame_to_tile",
 ]
+
+
+def available_hwaccels(candidates: "tuple[str, ...]") -> "tuple[str, ...]":
+    """Keep only the hwaccel device types this PyAV build supports.
+
+    Requesting a device type PyAV was built without (e.g. ``vaapi`` from the PyPI
+    wheel, which bundles no libva) does not fail: libav quietly hands back a
+    software context, so the type looks usable when it is not. Filtering on
+    ``hwdevices_available()`` lets the next candidate (e.g. ``cuda``) be tried.
+    It does not detect hardware: a supported type with no device behind it still
+    fails at context creation, which callers already handle."""
+    try:
+        from av.codec.hwaccel import hwdevices_available
+        present = set(hwdevices_available())
+    except Exception:
+        return candidates
+    return tuple(c for c in candidates if c in present)
+
+
+def context_is_hwaccel(ctx: object) -> "bool | None":
+    """``CodecContext.is_hwaccel`` where PyAV provides it, else ``None`` (unknown)."""
+    value = getattr(ctx, "is_hwaccel", None)
+    return value if isinstance(value, bool) else None

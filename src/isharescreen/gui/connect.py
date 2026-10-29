@@ -17,6 +17,7 @@ from __future__ import annotations
 import http.server
 import json
 import os
+from pathlib import Path
 import queue
 import signal
 import socket
@@ -51,8 +52,20 @@ _CHOICE_EVENT = threading.Event()   # set when the user answers the session moda
 _CHOICE_RESULT = "share"            # "alt" | "share" — the user's last answer
 
 
+def _is_profiling_log(line: str) -> bool:
+    return " | pipeline_timing:" in line or " | presentation: draw_calls=" in line
+
+
+def _clear_logs() -> None:
+    with _LOCK:
+        _LOG.clear()
+    _emit("log_reset", {})
+
+
 def _emit(kind: str, payload) -> None:
     if kind == "log":
+        if _is_profiling_log(payload):
+            return
         with _LOCK:
             _LOG.append(payload)
     elif kind == "snapshot":
@@ -241,8 +254,24 @@ def _evaluation_values(values: dict) -> dict:
         if decoder is None:
             raise ValueError("Super-resolution evaluation requires an HEVC decoder")
         values.update(frontend="desktop", advertise="960x540", scale="1.0",
-                      decoder=decoder.name, audio="off", curtain="on")
+                      decoder=decoder.name, codec="hevc", chroma="auto", audio="off", curtain="on")
     return values
+
+
+def _kerberos_supported() -> bool:
+    if sys.platform == "win32":
+        from importlib.util import find_spec
+        return find_spec("spnego") is not None
+    if sys.platform == "darwin":
+        return True
+    if sys.platform.startswith("linux"):
+        from ctypes.util import find_library
+        return bool(find_library("gssapi_krb5"))
+    return False
+
+
+def _default_auth() -> str:
+    return "srp"
 
 
 def _launch(values: dict) -> None:
@@ -263,7 +292,10 @@ def _launch(values: dict) -> None:
     except ValueError:
         _emit("log", "[gui] port must be between 1 and 65535")
         return
-    auth = values.get("auth", "srp")
+    auth = values.get("auth", _default_auth())
+    if auth == "kerberos" and not _kerberos_supported():
+        _emit("log", "[gui] Kerberos is unavailable on this platform; choose Password (SRP)")
+        return
     if auth not in ("srp", "nonsrp", "kerberos"):
         _emit("log", "[gui] invalid authentication mode")
         return
@@ -271,6 +303,38 @@ def _launch(values: dict) -> None:
         _emit("log", "[gui] host and user are required")
         _STATE["status"] = "idle"
         _emit("status", dict(_STATE))
+        return
+    # Validate manual selections before replacing the running session.
+    from isharescreen.proxy.media.registry import all_specs, normalize_override
+    codec = values.get("codec", "auto").strip() or "auto"
+    decoder = values.get("decoder", "auto").strip() or "auto"
+    frontend = values.get("frontend", "browser")
+    chroma = values.get("chroma", "auto")
+    names = {spec.name for spec in all_specs()}
+    normalized = normalize_override(decoder, codec if codec != "auto" else "hevc")
+    if chroma not in ("auto", "444", "420") or (chroma == "444" and (codec == "avc" or frontend == "browser")):
+        _emit("log", "[gui] 4:4:4 requires Desktop with HEVC or Auto codec")
+        return
+    if (frontend not in ("browser", "desktop") or codec not in ("auto", "avc", "hevc")
+            or (normalized is not None and normalized not in names)
+            or (frontend == "browser" and codec == "hevc")):
+        _emit("log", "[gui] invalid video settings; browser viewing requires H.264 or Auto")
+        return
+    if decoder == "amd-hevc420" and (chroma == "444" or frontend == "browser"):
+        _emit("log", "[gui] AMD HEVC requires Desktop and 4:2:0/Auto chroma")
+        return
+    effective_codec = "hevc" if chroma == "444" and codec == "auto" else codec
+    if effective_codec != "auto" and normalized is not None:
+        spec = next(spec for spec in all_specs() if spec.name == normalized)
+        if spec.codec != effective_codec:
+            _emit("log", "[gui] selected decoder does not support the selected codec; choose Auto or a matching decoder")
+            return
+    try:
+        bandwidth_mbps = int(values.get("bandwidth_mbps", "0"))
+        if not 0 <= bandwidth_mbps <= 200:
+            raise ValueError
+    except (TypeError, ValueError):
+        _emit("log", "[gui] target video bandwidth must be Auto (0) or 1–200 Mbps")
         return
     _kill_current()            # Reconnect / new connection replaces the old one
     # Also clear any ORPHANED iss bridge (a previous GUI session that crashed,
@@ -301,7 +365,7 @@ def _launch(values: dict) -> None:
         cmd.append("--remember-password")
     cmd += ["--port", str(port), "--auth", auth]
     if evaluation:
-        cmd += ["--codec", "hevc", "--no-dynamic", "--hidpi", "off", "--display", "combined", "--curtain"]
+        cmd += ["--no-dynamic", "--hidpi", "off", "--display", "combined", "--curtain"]
     # Resolution = the encoded BACKING (bandwidth); Display scale = UI size.
     # For a fixed resolution we advertise logical points = backing ÷ scale, so
     # the host encodes exactly the chosen backing while drawing the UI at
@@ -319,30 +383,9 @@ def _launch(values: dict) -> None:
             cmd += ["--advertise", advertise]
     else:
         cmd += ["--hidpi", scale]
-    decoder = values.get("decoder", "auto").strip()
-    if decoder and decoder != "auto":
-        cmd += ["--decoder", decoder]        # explicit pin — session honours it
-    elif frontend == "desktop" and "ISS_VIDEO_CODEC" not in os.environ:
-        # "Auto" on the desktop frontend: the GUI already probed hardware at
-        # startup, so pin the DECODER here → the session skips its decoder-build
-        # probe (and "hevc444 probe: unavailable" log noise) at stream start.
-        # Only pass --codec for AVC: that matches what the cli already forces on
-        # a non-HEVC box (where the probe noise actually is), and it lets the
-        # session skip resolve_codec too. For HEVC we deliberately do NOT pass
-        # --codec — forcing it would change the media offer from the default
-        # "both"-bank (byte-identical to Apple's) to a single-HEVC bank
-        # (offers.py DANGER note); the session resolves the codec itself
-        # (cheap on a HEVC-capable box). Skipped if the user set ISS_VIDEO_CODEC.
-        try:
-            from isharescreen.proxy.media.registry import resolve_codec, select
-            codec = resolve_codec("auto")
-            spec = select(codec)
-            if spec is not None:
-                cmd += ["--decoder", spec.name]
-                if codec == "avc":
-                    cmd += ["--codec", "avc"]
-        except Exception:
-            pass  # fall back to the session's own auto resolution
+    decoder = values.get("decoder", "auto").strip() or "auto"
+    codec = values.get("codec", "auto").strip() or "auto"
+    cmd += ["--decoder", decoder, "--codec", codec, "--chroma", chroma]
     if values.get("curtain") != "on":
         cmd.append("--no-curtain")
     if values.get("audio") != "on":
@@ -355,6 +398,11 @@ def _launch(values: dict) -> None:
         env["ISS_SR_PRECISION"] = "fp32"
         env["ISS_SR_GPU_ONLY"] = "1"
         env["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
+
+    # Auto explicitly restores protocol defaults, including after a prior cap.
+    env.pop("ISS_VIDEO_BITRATE_BPS", None)
+    if bandwidth_mbps:
+        env["ISS_VIDEO_BITRATE_BPS"] = str(bandwidth_mbps * 1_000_000)
     if _GUI_PORT:
         # iss POSTs here (blocking) to ask share-vs-alt when a different user is
         # at the console; the /session-choice handler answers from the modal.
@@ -413,106 +461,7 @@ _HEAD = """<meta charset="utf-8"><meta name="viewport" content="width=device-wid
 <style> :root { color-scheme: dark; } * { box-sizing: border-box; }
  body { margin:0; background:#16171a; color:#e8e8ea; font:15px -apple-system,"Segoe UI",system-ui,sans-serif; } </style>"""
 
-_FORM = """<!doctype html><html><head><title>iShareScreen — Connect</title>__HEAD__
-<style>
- body { min-height:100vh; display:grid; place-items:center; }
- .card { width:360px; background:#1e1f22; border:1px solid #2c2e33; border-radius:16px; padding:28px 28px 24px; box-shadow:0 12px 40px #0008; }
- h1 { margin:0 0 2px; font-size:22px; } .sub { margin:0 0 20px; color:#9aa0a6; font-size:13px; }
- label { display:block; margin:0 0 6px; color:#c7c9cf; font-size:13px; }
- input[type=text],input[type=password],input[type=number],select { width:100%; margin:0 0 14px; padding:10px 12px; font-size:15px; color:#e8e8ea; background:#2b2d31; border:1px solid #3a3d42; border-radius:9px; outline:none; }
- input:focus,select:focus { border-color:#4f8cff; }
- .row { display:flex; gap:10px; align-items:center; margin:2px 0 12px; } .row input { width:auto; margin:0; }
- button { width:100%; margin-top:8px; padding:12px; font-size:15px; font-weight:600; color:#fff; background:#4f8cff; border:0; border-radius:9px; cursor:pointer; } button:hover { background:#5f97ff; }
-</style></head><body>
- <form class="card" method="post" action="/connect" onsubmit="return prepVideo()">
-  <h1>iShareScreen</h1><p class="sub">Connect to a Mac</p>
-  <label>Host</label><input type="text" name="host" placeholder="Mac hostname or IP" value="__HOST__" autofocus>
-  <label>Port</label><input type="number" name="port" value="__PORT__" min="1" max="65535" required>
-  <label>User</label><input type="text" name="user" placeholder="macOS account" value="__USER__">
-  <label>Authentication</label><select name="auth">
-   <option value="srp" __SRP_SEL__>Password (SRP)</option>
-   <option value="nonsrp" __NONSRP_SEL__>Password (legacy RSA1)</option>
-   <option value="kerberos" __KERBEROS_SEL__>Kerberos</option>
-  </select>
-  <label>Password</label><input type="password" name="password" placeholder="Leave blank to use saved password" autocomplete="current-password">
-  <div class="row"><input type="checkbox" name="remember_password" id="remember-password" __REMEMBER__><label for="remember-password" style="margin:0">Remember password in system credential store</label></div>
-  <button type="button" onclick="forgetPassword()" style="background:#2b2d31;font-size:13px;margin-bottom:14px">Forget saved password</button>
-  <p id="credential-status" role="status" style="font-size:13px;color:#9aa0a6"></p>
-  <div class="row"><input type="checkbox" name="sr_evaluation" id="sr-evaluation" onchange="evaluationMode()"><label for="sr-evaluation" style="margin:0">Super-resolution evaluation</label></div>
-  <p id="evaluation-settings" hidden style="font-size:13px;color:#9aa0a6">Locked: Desktop · 960×540 input · 100% scale · HEVC · GPU-only PyTorch · precision shown per model · CPU fallback disabled · dynamic resolution off · audio off · private virtual display (blanks the host screen). Only the display model changes during comparison.</p>
-  <label>Frontend</label>
-  <select name="frontend"><option value="browser" __BROWSER_SEL__>browser (WebTransport + WebCodecs)</option><option value="desktop" __DESKTOP_SEL__>desktop (native window)</option></select>
-  <label>Resolution</label>
-  <select name="advertise" title="The encoded pixel resolution = how much bandwidth you use. Higher = sharper + more bandwidth. UI size is set separately by Display scale.">
-   <option value="auto" selected>Auto — track window size</option>
-   <option value="3840x2160">3840 × 2160 (4K UHD)</option>
-   <option value="3440x1440">3440 × 1440 (UWQHD)</option>
-   <option value="2560x1600">2560 × 1600 (WQXGA)</option>
-   <option value="2560x1440">2560 × 1440 (QHD)</option>
-   <option value="1920x1200">1920 × 1200 (WUXGA)</option>
-   <option value="1920x1080">1920 × 1080 (FHD)</option>
-   <option value="1680x1050">1680 × 1050 (WSXGA+)</option>
-   <option value="1600x900">1600 × 900 (HD+)</option>
-   <option value="1366x768">1366 × 768 (WXGA)</option>
-   <option value="1280x720">1280 × 720 (HD)</option>
-   <option value="1024x768">1024 × 768 (XGA)</option>
-   <option value="960x540">960 × 540 (540p, ×2 to 1080p)</option>
-   <option value="800x600">800 × 600 (SVGA)</option>
-  </select>
-  <label>Display scale</label>
-  <select name="scale" title="How large the host UI is drawn — like Windows display scaling (100%–400%). Higher = bigger text/UI. This does NOT change bandwidth; Resolution does.">
-   <option value="1.0">100% — smallest UI, most desktop space</option>
-   <option value="1.5">150%</option>
-   <option value="2.0" selected>200% — Retina (normal UI, crisp)</option>
-   <option value="2.5">250%</option>
-   <option value="3.0">300% — large UI</option>
-   <option value="3.5">350%</option>
-   <option value="4.0">400% — largest UI</option>
-  </select>
-  <label>Decoder</label>
-  <select name="decoder" title="Only decoders available on this computer are listed. 'Auto' picks the best one; the rest are for pinning a specific path when debugging.">
-   __DECODER_OPTIONS__
-  </select>
-  <div class="row"><input type="checkbox" name="audio" id="audio" checked><label for="audio" style="margin:0">Audio</label></div>
-  <div class="row"><input type="checkbox" name="curtain" id="curtain" checked><label for="curtain" style="margin:0">Curtain (private virtual display)</label></div>
-  <button type="submit">Connect</button>
- </form>
- <script>
- async function forgetPassword(){
-   const status=document.getElementById('credential-status');
-   status.textContent='Removing saved password…';
-   try{
-     const form=document.querySelector('form'), body=new URLSearchParams();
-     for(const key of ['host','port','user']) body.set(key,form.elements[key].value);
-     const response=await fetch('/forget-password',{method:'POST',body});
-     status.textContent=await response.text();
-   }catch(e){status.textContent='Could not reach credential store';}
- }
- function evaluationMode(){
-   const enabled=document.getElementById('sr-evaluation').checked;
-   const decoder=document.querySelector('[name=decoder]');
-   const hevc=Array.from(decoder.options).find(option=>option.value.includes('hevc'));
-   const fixed={frontend:'desktop',advertise:'960x540',scale:'1.0',decoder:hevc?hevc.value:'auto',audio:false,curtain:true};
-   for(const [name,value] of Object.entries(fixed)){
-     const field=document.querySelector(`[name=${name}]`), checkbox=field.type==='checkbox';
-     if(enabled&&!field.disabled) field.dataset.beforeEvaluation=checkbox?String(field.checked):field.value;
-     if(enabled){ if(checkbox) field.checked=value; else field.value=value; }
-     else if(field.dataset.beforeEvaluation!==undefined){
-       if(checkbox) field.checked=field.dataset.beforeEvaluation==='true'; else field.value=field.dataset.beforeEvaluation;
-       delete field.dataset.beforeEvaluation;
-     }
-     field.disabled=enabled;
-   }
-   document.getElementById('evaluation-settings').hidden=!enabled;
- }
- window.addEventListener('pageshow', evaluationMode);
- // Open the video tab DURING the Connect click (a real user gesture, so no
- // popup-block) — but the URL doesn't exist yet, so point it at a local
- // "Connecting…" page that polls for the real URL and redirects itself. Only
- // for the browser frontend; the desktop frontend has no video page.
- function prepVideo(){ evaluationMode(); try{ var f=document.querySelector('[name=frontend]');
-   if(f&&f.value==='browser') window.open('/video-wait','_blank'); }catch(e){} return true; }
- </script></body></html>"""
+_FORM = (Path(__file__).parent / "static" / "connect.html").read_text(encoding="utf-8")
 
 _VIDEO_WAIT = """<!doctype html><html><head><meta charset="utf-8"><title>Connecting…</title>
 <style>body{background:#16171a;color:#c7c9cf;font:15px -apple-system,system-ui,sans-serif;display:flex;height:100vh;margin:0;align-items:center;justify-content:center;flex-direction:column;gap:16px}.s{width:34px;height:34px;border:3px solid #2c2e33;border-top-color:#4f8cff;border-radius:50%;animation:r .8s linear infinite}@keyframes r{to{transform:rotate(360deg)}}</style></head>
@@ -551,7 +500,7 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
  .tile .t { color:#9aa0a6; font-size:11px; } .bar { height:5px; border-radius:3px; background:#2b2d31; margin-top:6px; overflow:hidden; }
  .bar > i { display:block; height:100%; background:#4ec97a; } .bar.loss > i { background:#e06c75; }
  .logwrap { flex:1; display:flex; flex-direction:column; min-height:120px; padding:8px 16px 14px; }
- .loghdr { font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:#9aa0a6; margin:6px 0; }
+ .loghdr { display:flex; align-items:center; justify-content:space-between; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:#9aa0a6; margin:6px 0; }
  #log { flex:1; margin:0; padding:10px 12px; overflow:auto; white-space:pre-wrap; word-break:break-word; background:#0f1012; border:1px solid #2c2e33; border-radius:10px; font:12px ui-monospace,SFMono-Regular,Menlo,monospace; }
  .lvl-ERROR{color:#ff7b72;} .lvl-WARN{color:#e0b341;} .lvl-DEBUG{color:#7f848e;}
  #modal { position:fixed; inset:0; background:#000a; display:none; align-items:center; justify-content:center; z-index:20; }
@@ -620,7 +569,7 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
      <span>Decode lat</span><b id="q_lat">—</b></div></div>
  </div>
  <div class="tiles"><div class="tilegrid" id="tiles"></div></div>
- <div class="logwrap"><div class="loghdr">Log <span class="meta">— drag to select &amp; copy</span></div><pre id="log"></pre></div>
+ <div class="logwrap"><div class="loghdr"><div>Log <span class="meta">— drag to select &amp; copy</span></div><button class="btn" onclick="act('clear_logs')">Clear</button></div><pre id="log"></pre></div>
  <div id="modal"><div class="modalbox">
    <h2>Another user is at the console</h2>
    <p><span id="modaluser">Someone is signed in at this Mac.</span> Share their existing session, or sign in as your own user on a separate display (alt-session)?</p>
@@ -719,6 +668,7 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
    enhancementState(d.enhancement);
    tiles(d.tiles); });
  const logEl=$('log');
+ es.addEventListener('log_reset', () => { logEl.textContent=''; });
  es.addEventListener('log', e => { const line=JSON.parse(e.data);
    const atBottom = logEl.scrollHeight-logEl.scrollTop-logEl.clientHeight < 40;
    const lvl = line.includes(' ERROR ')?'lvl-ERROR':line.includes(' WARNING ')?'lvl-WARN':line.includes(' DEBUG ')?'lvl-DEBUG':'';
@@ -735,6 +685,7 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
 # decoders SUPPORTED ON THIS CLIENT PLATFORM (via the registry), so e.g.
 # VideoToolbox never shows on Windows/Linux and Intel QSV never shows on macOS.
 _DECODER_LABELS = {
+    "amd-hevc420":      "HEVC — AMD Radeon (4:2:0)",
     "vt-hevc444":       "HEVC — VideoToolbox (Mac GPU)",
     "libav-hevc444":    "HEVC — Generic GPU (d3d11va / vaapi / cuda)",
     "qsv-hevc444":      "HEVC — Intel Quick Sync",
@@ -800,7 +751,7 @@ def _decoder_options_html() -> str:
             if not _spec_offerable(s, probe_ready):
                 continue
             label = _DECODER_LABELS.get(s.name, f"{s.codec.upper()} — {s.name}")
-            opts.append(f'<option value="{_h.escape(s.name, quote=True)}">'
+            opts.append(f'<option value="{_h.escape(s.name, quote=True)}" data-codec="{s.codec}">'
                         f'{_h.escape(label)}</option>')
     except Exception:
         pass  # registry unavailable → just offer Auto
@@ -822,16 +773,22 @@ def _form_page() -> bytes:
             user = getattr(last, "user", "") or ""
             frontend = getattr(last, "frontend", "browser") or "browser"
             remember_password = getattr(last, "remember_password", False)
+    auth = getattr(last, "auth", _default_auth())
+    if auth == "kerberos" and not _kerberos_supported():
+        auth = "srp"
     import html as _html
     return (_FORM
+            .replace("__DEFAULT_AUTH__", _default_auth())
+            .replace("__KERBEROS_DISABLED__", "" if _kerberos_supported() else "disabled")
+            .replace("__AUTH_NOTE__", "Windows Kerberos via pyspnego is experimental; standalone Macs may need KDC configuration. SRP remains the default." if sys.platform == "win32" and _kerberos_supported() else "" if _kerberos_supported() else "Kerberos is not available in this client on Windows or without a system GSS library. Use Password (SRP).")
             .replace("__HEAD__", _HEAD)
             .replace("__HOST__", _html.escape(host, quote=True))
             .replace("__USER__", _html.escape(user, quote=True))
             .replace("__REMEMBER__", "checked" if remember_password else "")
             .replace("__PORT__", _html.escape(str(getattr(last, "port", 5900)), quote=True))
-            .replace("__SRP_SEL__", "selected" if getattr(last, "auth", "srp") == "srp" else "")
-            .replace("__NONSRP_SEL__", "selected" if getattr(last, "auth", "srp") == "nonsrp" else "")
-            .replace("__KERBEROS_SEL__", "selected" if getattr(last, "auth", "srp") == "kerberos" else "")
+            .replace("__SRP_SEL__", "selected" if auth == "srp" else "")
+            .replace("__NONSRP_SEL__", "selected" if auth == "nonsrp" else "")
+            .replace("__KERBEROS_SEL__", "selected" if auth == "kerberos" else "")
             .replace("__BROWSER_SEL__", "selected" if frontend == "browser" else "")
             .replace("__DESKTOP_SEL__", "selected" if frontend == "desktop" else "")
             .replace("__DECODER_OPTIONS__", _decoder_options_html())).encode()
@@ -917,6 +874,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     return
             elif action == "reconnect":
                 threading.Thread(target=_reconnect, daemon=True).start()
+            elif action == "clear_logs":
+                _clear_logs()
             elif action == "session_choice":
                 _set_session_choice(values.get("choice", "share"))
             self._html(b"ok")
@@ -962,7 +921,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             if _VIDEO_URL:
                 self._event("video_url", {"url": _VIDEO_URL})
             for line in backlog:
-                self._event("log", line)
+                if not _is_profiling_log(line):
+                    self._event("log", line)
             while True:
                 kind, payload = q.get()
                 self._event(kind, payload)
@@ -988,7 +948,13 @@ def main() -> int:
     # dropdown reflects real availability and the session doesn't re-probe at
     # stream start (the "hevc444 probe: unavailable" log noise).
     threading.Thread(target=_warm_decoder_probe, daemon=True).start()
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    # A stable origin lets browser localStorage survive launcher restarts.
+    try:
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 49731), _Handler)
+    except OSError as error:
+        print(f"Cannot open the launcher at http://127.0.0.1:49731/: {error}")
+        print("Close the previous launcher and run iss again.")
+        return 1
     _GUI_PORT = server.server_address[1]
     url = f"http://127.0.0.1:{_GUI_PORT}/"
     print(f"iShareScreen → {url}")

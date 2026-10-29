@@ -275,6 +275,12 @@ class VideoSettings:
         _uint("hdr_modes", self.hdr_modes)
         if int(self.pixel_formats) & ~int(PixelFormat.ALL):
             raise ValueError("pixel_formats contains unknown capability bits")
+        if not self.pixel_formats:
+            raise ValueError("pixel_formats must advertise at least one format")
+        if self.codec == "avc" and not (self.pixel_formats & (
+            PixelFormat.YUV420_8_FULL | PixelFormat.YUV420_8_VIDEO
+        )):
+            raise ValueError("AVC requires an 8-bit YUV420 pixel format")
         if int(self.hdr_modes) & ~int(HDRMode.ALL):
             raise ValueError("hdr_modes contains unknown capability bits")
         payloads = [p for p in self.payloads if self.codec == "both" or p.payload == (123 if self.codec == "avc" else 100)]
@@ -345,6 +351,16 @@ class MediaOfferConfig:
         if codec not in ("both", "hevc", "avc"):
             codec = "both"
         config = cls(video=VideoSettings(codec=codec))
+        chroma = os.environ.get("ISS_VIDEO_CHROMA", "auto")
+        if chroma not in ("auto", "444", "420"):
+            raise ValueError("video chroma must be auto, 444 or 420")
+        if chroma == "444":
+            if codec == "avc":
+                raise ValueError("H.264 4:4:4 is not supported by this client")
+            config.video.codec = "hevc"
+            config.video.pixel_formats = PixelFormat.YUV444_8_FULL | PixelFormat.YUV444_8_VIDEO
+        elif chroma == "420":
+            config.video.pixel_formats = PixelFormat.YUV420_8_FULL | PixelFormat.YUV420_8_VIDEO
         config.video.ltrp_enabled = codec != "avc" and os.environ.get("ISS_LTRP", "1") != "0"
         if "ISS_TILES_PER_FRAME" in os.environ:
             try:
@@ -353,6 +369,9 @@ class MediaOfferConfig:
                 pass
         if "ISS_AUDIO_F4" in os.environ:
             config.audio.payload_flags = int(os.environ["ISS_AUDIO_F4"])
+        bitrate = os.environ.get("ISS_VIDEO_BITRATE_BPS")
+        if bitrate is not None:
+            config.set_video_bitrate(int(bitrate))
         return config
 
     def set_video_bitrate(self, bps: int) -> MediaOfferConfig:

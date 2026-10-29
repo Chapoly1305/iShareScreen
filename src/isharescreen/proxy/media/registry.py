@@ -50,10 +50,14 @@ class DecoderSpec:
 
 # ── availability probes (delegate to hwcaps; lazy import) ────────────────
 
-def _hevc444_method() -> Optional[str]:
-    """'qsv' | 'libav' | None — how HEVC 4:4:4 can be HW-decoded here."""
-    from .hwcaps import hevc444_decode_method
-    return hevc444_decode_method()
+def _libav_hw() -> bool:
+    from .hwcaps import libav_hevc444_hwdecode
+    return libav_hevc444_hwdecode()
+
+
+def _qsv_hw() -> bool:
+    from .hwcaps import qsv_hevc444_hwdecode
+    return qsv_hevc444_hwdecode()
 
 
 def _vt_available() -> bool:
@@ -97,6 +101,17 @@ def _build_libav_hevc_sw(num_tiles, *, enable_quality_gate=True, on_frame_publis
                        on_frame_published=on_frame_published, prefer_hwaccel=False)
 
 
+def _amd_available():
+    from .amd import available
+    return available()
+
+
+def _build_amd(num_tiles, *, enable_quality_gate=True, on_frame_published=None, **_):
+    from .hevc import HevcDecoder
+    return HevcDecoder(num_tiles, amd_only=True, enable_quality_gate=enable_quality_gate,
+                       on_frame_published=on_frame_published)
+
+
 def _build_avc(num_tiles, *, enable_quality_gate=True, on_frame_published=None,
                prefer_hwaccel=True, **_):
     from .avc import AvcDecoder
@@ -127,14 +142,17 @@ def _build_avc(num_tiles, *, enable_quality_gate=True, on_frame_published=None,
 #    20  libav-hevc444-sw  SOFTWARE HEVC 4:4:4 — manual override only (slow for
 #                          live 4-tile streams); not on the auto ladder.
 _REGISTRY: list[DecoderSpec] = [
+    DecoderSpec("amd-hevc420", "hevc", "420", ("win32",), "hardware", 70,
+                available=_amd_available, build=_build_amd,
+                note="AMD Radeon D3D11 HEVC 4:2:0; explicitly selected adapter, no fallback"),
     DecoderSpec("vt-hevc444", "hevc", "444", ("darwin",), "hardware", 100,
                 available=lambda: _vt_available(), build=_build_vt,
                 note="direct VideoToolbox (VTDecompressionSession, no libav RPS layer)"),
     DecoderSpec("libav-hevc444", "hevc", "444", ("*",), "hardware", 60,
-                available=lambda: _hevc444_method() == "libav", build=_build_libav_hevc,
+                available=lambda: _libav_hw(), build=_build_libav_hevc,
                 note="libav generic hwaccel — d3d11va RExt / vaapi / cuda (VT-hwaccel fallback on mac)"),
     DecoderSpec("qsv-hevc444", "hevc", "444", ("win32", "linux"), "hardware", 50,
-                available=lambda: _hevc444_method() == "qsv", build=_build_qsv,
+                available=lambda: _qsv_hw(), build=_build_qsv,
                 note="Intel Quick Sync (hevc_qsv) — fallback where generic DXVA lacks 4:4:4"),
     DecoderSpec("libav-hevc444-sw", "hevc", "444", ("*",), "software", 20,
                 available=lambda: True, build=_build_libav_hevc_sw,
@@ -178,7 +196,8 @@ def candidates(codec: str, chroma: Optional[str] = None) -> list[DecoderSpec]:
     best-first (hardware before software, then priority)."""
     out = [s for s in _REGISTRY
            if s.codec == codec and s.supported_here()
-           and (chroma is None or s.chroma == chroma)]
+           and (chroma is None or s.chroma == chroma)
+           and (s.name != "amd-hevc420" or chroma == "420")]
     out.sort(key=lambda s: (s.kind == "hardware", s.priority), reverse=True)
     return out
 
@@ -198,6 +217,10 @@ def select(codec: str, *, override: Optional[str] = None) -> Optional[DecoderSpe
     if override:
         for s in _REGISTRY:
             if s.name == override:
+                if s.codec != codec:
+                    log.warning("decoder override %r cannot decode %s — using auto",
+                                override, codec)
+                    break
                 if not s.supported_here():
                     log.warning("decoder override %r not supported on %s — using auto",
                                 override, sys.platform)
@@ -211,19 +234,29 @@ def select(codec: str, *, override: Optional[str] = None) -> Optional[DecoderSpe
     return None
 
 
-def build_best(codec: str, *, override: Optional[str], num_tiles: int, **opts):
+def build_best(codec: str, *, override: Optional[str], num_tiles: int, initialize=None, **opts):
     """Select + construct a decoder for `codec`, falling through to the next
     available candidate if construction fails (preserves the old HW→libav
     fallback). Returns (spec, decoder) or (None, None)."""
     chosen = select(codec, override=override)
     ordered = ([chosen] if chosen else [])
     ordered += [s for s in candidates(codec) if s is not chosen and s.available()]
+    if chosen is not None and chosen.name == "amd-hevc420":
+        ordered = [chosen]  # An explicit AMD choice must not silently run on Intel/CPU.
     for spec in ordered:
+        dec = None
         try:
             dec = spec.build(num_tiles, **opts)
+            if initialize is not None:
+                initialize(dec)
             log.info("decoder: %s — %s", spec.name, spec.note)
             return spec, dec
         except Exception as e:
+            if dec is not None:
+                try:
+                    dec.close()
+                except Exception:
+                    log.exception("failed decoder cleanup: %s", spec.name)
             log.warning("decoder %s failed to start (%s) — trying next candidate",
                         spec.name, e)
     return None, None
@@ -231,18 +264,23 @@ def build_best(codec: str, *, override: Optional[str], num_tiles: int, **opts):
 
 # ── codec negotiation (moved here from hwcaps to break the import cycle) ──
 
-def resolve_codec(choice: str) -> str:
+def resolve_codec(choice: str, *, decoder_override: Optional[str] = None) -> str:
     """Resolve a `--codec` value to a concrete 'hevc' / 'avc'. 'auto' offers
     HEVC when any 4:4:4 hardware decoder is available, else H.264 4:2:0.
 
     Priority: HW HEVC 4:4:4 > AVC 4:2:0. Software HEVC 4:4:4 is available
     when HEVC is requested explicitly but does not drive auto negotiation.
 
-    Codec and decoder are orthogonal: call sites that derive a codec from a
-    decoder name (e.g. the TUI) must pass the resolved codec explicitly via
-    ISS_VIDEO_CODEC / --codec rather than relying on this function."""
+    A supported explicit decoder determines the codec in auto mode. An explicit
+    codec still wins, and select() rejects incompatible decoder overrides."""
     if choice != "auto":
         return choice
+    raw = (decoder_override if decoder_override is not None else os.environ.get("ISS_DECODER", "")).strip().lower()
+    name = _ALIASES.get(raw, raw)
+    for spec in _REGISTRY:
+        if spec.name == name and spec.supported_here():
+            log.info("codec=auto: decoder %s requires %s", name, spec.codec)
+            return spec.codec
     if can_decode("hevc", "444", hardware_only=True):
         log.info("codec=auto: a HEVC 4:4:4 hardware decoder is available -> hevc")
         return "hevc"

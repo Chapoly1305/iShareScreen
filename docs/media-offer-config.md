@@ -1,5 +1,27 @@
 # 配置启动媒体协商
 
+## CLI precedence and hardware preset example
+
+Explicit `--codec` / `--decoder` flags override inherited environment settings.
+Omitting a flag preserves the inherited value; explicitly passing `auto` clears
+that override and uses the frontend's normal automatic selection.
+
+For an RX 6800 XT using the existing H.264 path:
+
+```sh
+iss --host mac.local -u me --frontend desktop --codec avc --decoder libav-avc420
+```
+
+`libav-avc420` is the decoder registry ID. `d3d11va` is a hardware backend
+chosen internally on Windows, not a valid `--decoder` name. Hardware may still
+fall back to software if initialization fails. A JSON preset loader is not yet
+implemented; a future preset for this path should use `codec: avc`,
+`chroma: "420"`, and `decoder: libav-avc420`.
+
+Pixel format offers must be nonempty. AVC offers must include an 8-bit 4:2:0
+format; HEVC 4:2:0 remains available through the low-level offer configuration
+but advertising it does not prove the host or selected decoder supports it.
+
 `src/isharescreen/proxy/protocol/media_config.py` 将启动 offer 的已复原字段保存为可编辑的 Python dataclass。配置经 `create_offers()` 序列化为 plist/zlib/protobuf，也可以直接交给 `SessionConfig.media_offer`。每次 offer 的 SSRC、时间戳和 UUID 仍由构造器生成。
 
 ## 常用配置
@@ -103,3 +125,19 @@ video_plist, audio_plist = create_offers(config=media, audio_enabled=False)
 ## 验证依据
 
 重构前保存了 40 个确定性 MediaBlob 的 SHA-256，覆盖 codec、LTRP、分片环境变量、音频开关及音频覆写；默认序列化与这些基准逐字节对应。相关回归和 Session 接入测试在 `tests/test_media_offer_config.py`。协议字段来源和限制见 [24G624 分析](analysis/media-negotiation-24G624.md)。
+
+
+### Independent codec and chroma selection
+
+The connection page exposes codec (Auto, HEVC, H.264) and chroma sampling
+(Auto, 4:4:4, 4:2:0) separately. The CLI equivalent is `--codec hevc --chroma 420`.
+`--chroma` accepts `auto`, `444`, or `420`; omitted values inherit
+`ISS_VIDEO_CHROMA`, while explicit `auto` clears that override.
+
+Explicit chroma choices restrict the media offer to the corresponding 8-bit
+pixel formats. Auto retains the existing format bitmap. Auto codec plus 4:4:4
+selects HEVC. H.264 4:4:4 and browser 4:4:4 are rejected because those paths
+are not supported by this client. HEVC 4:2:0 is an advertised preference;
+remote-host negotiation and hardware decoding still require live validation.
+The current HEVC decoder registry retains its conservative 4:4:4 capability
+probes, so requesting 4:2:0 does not guarantee selection of a different GPU.
