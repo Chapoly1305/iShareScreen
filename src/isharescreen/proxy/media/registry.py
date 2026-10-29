@@ -50,10 +50,14 @@ class DecoderSpec:
 
 # ── availability probes (delegate to hwcaps; lazy import) ────────────────
 
-def _hevc444_method() -> Optional[str]:
-    """'qsv' | 'libav' | None — how HEVC 4:4:4 can be HW-decoded here."""
-    from .hwcaps import hevc444_decode_method
-    return hevc444_decode_method()
+def _libav_hw() -> bool:
+    from .hwcaps import libav_hevc444_hwdecode
+    return libav_hevc444_hwdecode()
+
+
+def _qsv_hw() -> bool:
+    from .hwcaps import qsv_hevc444_hwdecode
+    return qsv_hevc444_hwdecode()
 
 
 def _vt_available() -> bool:
@@ -131,10 +135,10 @@ _REGISTRY: list[DecoderSpec] = [
                 available=lambda: _vt_available(), build=_build_vt,
                 note="direct VideoToolbox (VTDecompressionSession, no libav RPS layer)"),
     DecoderSpec("libav-hevc444", "hevc", "444", ("*",), "hardware", 60,
-                available=lambda: _hevc444_method() == "libav", build=_build_libav_hevc,
+                available=lambda: _libav_hw(), build=_build_libav_hevc,
                 note="libav generic hwaccel — d3d11va RExt / vaapi / cuda (VT-hwaccel fallback on mac)"),
     DecoderSpec("qsv-hevc444", "hevc", "444", ("win32", "linux"), "hardware", 50,
-                available=lambda: _hevc444_method() == "qsv", build=_build_qsv,
+                available=lambda: _qsv_hw(), build=_build_qsv,
                 note="Intel Quick Sync (hevc_qsv) — fallback where generic DXVA lacks 4:4:4"),
     DecoderSpec("libav-hevc444-sw", "hevc", "444", ("*",), "software", 20,
                 available=lambda: True, build=_build_libav_hevc_sw,
@@ -198,6 +202,10 @@ def select(codec: str, *, override: Optional[str] = None) -> Optional[DecoderSpe
     if override:
         for s in _REGISTRY:
             if s.name == override:
+                if s.codec != codec:
+                    log.warning("decoder override %r cannot decode %s — using auto",
+                                override, codec)
+                    break
                 if not s.supported_here():
                     log.warning("decoder override %r not supported on %s — using auto",
                                 override, sys.platform)
@@ -238,11 +246,16 @@ def resolve_codec(choice: str) -> str:
     Priority: HW HEVC 4:4:4 > AVC 4:2:0. Software HEVC 4:4:4 is available
     when HEVC is requested explicitly but does not drive auto negotiation.
 
-    Codec and decoder are orthogonal: call sites that derive a codec from a
-    decoder name (e.g. the TUI) must pass the resolved codec explicitly via
-    ISS_VIDEO_CODEC / --codec rather than relying on this function."""
+    A supported explicit decoder determines the codec in auto mode. An explicit
+    codec still wins, and select() rejects incompatible decoder overrides."""
     if choice != "auto":
         return choice
+    raw = os.environ.get("ISS_DECODER", "").strip().lower()
+    name = _ALIASES.get(raw, raw)
+    for spec in _REGISTRY:
+        if spec.name == name and spec.supported_here():
+            log.info("codec=auto: decoder %s requires %s", name, spec.codec)
+            return spec.codec
     if can_decode("hevc", "444", hardware_only=True):
         log.info("codec=auto: a HEVC 4:4:4 hardware decoder is available -> hevc")
         return "hevc"

@@ -190,6 +190,10 @@ class HevcDecoder:
         # SEGVs on the next dereference. We've seen this crash named
         # `libavcodec...+0x43a9d0` from the `hevc-decode` thread.
         self._codec_lock = threading.Lock()
+        # Serialize complete lifecycle transitions, including worker shutdown.
+        # The decode worker only takes _codec_lock, so joining it while holding
+        # this separate lock does not block the worker's exit.
+        self._lifecycle_lock = threading.RLock()
         self._reformatter: list[Optional[av.video.reformatter.VideoReformatter]] = [None]
         self._seen_fmts: set[str] = set()
         self._gate = FrameQualityGate(num_tiles, enabled=enable_quality_gate)
@@ -302,7 +306,8 @@ class HevcDecoder:
         first `feed_nalu` outside burst mode."""
         if not (self._vps and self._sps and self._all_pps):
             raise RuntimeError("set_params() must be called before start()")
-        self._create_codec(force_software=False)
+        with self._lifecycle_lock:
+            self._create_codec(force_software=False)
 
     # -- decoder feed --------------------------------------------------
 
@@ -595,13 +600,15 @@ class HevcDecoder:
 
         Skips rebuild if `set_params` was never called — restart on an
         unconfigured decoder is just a teardown."""
-        self._teardown()
-        if self._vps and self._sps and self._all_pps:
-            self._create_codec(force_software=self._hw_failed)
+        with self._lifecycle_lock:
+            self._teardown()
+            if self._vps and self._sps and self._all_pps:
+                self._create_codec(force_software=self._hw_failed)
 
     def close(self) -> None:
         """Permanent shutdown. Stops the worker, releases the codec context."""
-        self._teardown()
+        with self._lifecycle_lock:
+            self._teardown()
 
     # -- internals: decode --------------------------------------------
 
@@ -1111,6 +1118,12 @@ class HevcDecoder:
     ) -> None:
         """Tear down the HW codec context, build SW one, optionally re-feed
         the burst NALUs."""
+        with self._lifecycle_lock:
+            self._fallback_to_software_locked(tile_nalu_cache)
+
+    def _fallback_to_software_locked(
+        self, tile_nalu_cache: Optional[dict[int, list[bytes]]],
+    ) -> None:
         log.warning("falling back from %s to software decode", self._hw_name)
         self._hw_failed = True
         self._teardown()

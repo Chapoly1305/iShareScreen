@@ -3,7 +3,7 @@
 These exercise the selection LOGIC without a GPU: platform filtering, the
 hardware-then-priority ordering, override aliasing, and codec resolution. The
 availability probes are monkeypatched at their module-global seams
-(`_hevc444_method`, `_vt_available`) — the lambdas in the specs resolve those
+(`_libav_hw`, `_qsv_hw`, `_vt_available`) — the lambdas in the specs resolve those
 names at call time, so patching the module attribute steers selection.
 """
 from __future__ import annotations
@@ -40,15 +40,16 @@ def test_candidates_platform_filtered_and_sorted(monkeypatch):
 def test_windows_prefers_generic_then_qsv(monkeypatch):
     monkeypatch.setattr(R.sys, "platform", "win32")
 
-    monkeypatch.setattr(R, "_hevc444_method", lambda: "libav")
+    monkeypatch.setattr(R, "_libav_hw", lambda: True)
+    monkeypatch.setattr(R, "_qsv_hw", lambda: True)
     assert R.select("hevc").name == "libav-hevc444"     # generic wins when it works
     assert R.can_decode("hevc", "444") is True
     assert R.resolve_codec("auto") == "hevc"
 
-    monkeypatch.setattr(R, "_hevc444_method", lambda: "qsv")
+    monkeypatch.setattr(R, "_libav_hw", lambda: False)
     assert R.select("hevc").name == "qsv-hevc444"        # QSV is the fallback
 
-    monkeypatch.setattr(R, "_hevc444_method", lambda: None)
+    monkeypatch.setattr(R, "_qsv_hw", lambda: False)
     # libav-hevc444-sw (software) is always available, so select() never returns None
     assert R.select("hevc").name == "libav-hevc444-sw"
     assert R.can_decode("hevc", "444") is True           # SW decoder available
@@ -58,7 +59,8 @@ def test_windows_prefers_generic_then_qsv(monkeypatch):
 
 def test_macos_prefers_vt_then_libav(monkeypatch):
     monkeypatch.setattr(R.sys, "platform", "darwin")
-    monkeypatch.setattr(R, "_hevc444_method", lambda: "libav")
+    monkeypatch.setattr(R, "_libav_hw", lambda: True)
+    monkeypatch.setattr(R, "_qsv_hw", lambda: False)
 
     monkeypatch.setattr(R, "_vt_available", lambda: True)
     assert R.select("hevc").name == "vt-hevc444"         # prio 100 over libav 60
@@ -69,7 +71,8 @@ def test_macos_prefers_vt_then_libav(monkeypatch):
 
 def test_override_honored_unsupported_or_unknown_falls_to_auto(monkeypatch):
     monkeypatch.setattr(R.sys, "platform", "win32")
-    monkeypatch.setattr(R, "_hevc444_method", lambda: "libav")
+    monkeypatch.setattr(R, "_libav_hw", lambda: True)
+    monkeypatch.setattr(R, "_qsv_hw", lambda: False)
     assert R.select("hevc", override="qsv-hevc444").name == "qsv-hevc444"
     # vt-hevc444 is darwin-only → on win32 it's unsupported → auto (libav)
     assert R.select("hevc", override="vt-hevc444").name == "libav-hevc444"

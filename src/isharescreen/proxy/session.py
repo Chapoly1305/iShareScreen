@@ -537,6 +537,7 @@ class Session:
         # during the burst tail.
         self._dpb_error_window: deque[float] = deque()
         self._last_decoder_restart_t: float = 0.0
+        self._restart_guard = threading.Lock()
         # Escalation state: when a "Could not find ref" storm persists
         # through repeated targeted FIRs, the tile-0 IDR fan-out doesn't
         # clear it (tiles 1-3 are P-only; the host won't send them their own
@@ -2932,15 +2933,12 @@ class Session:
                 # two HEVC groups within 2 s at curtain start, and a second
                 # teardown there discards IDRs still in flight for the first
                 # group's FIR.
-                # NOTE: read the prior restart time BEFORE stamping `now`,
-                # otherwise the gap is always 0 and the restart never fires.
-                last_restart = self._last_decoder_restart_t
-                must_restart = (
-                    self._video_codec == "avc"
-                    or now - last_restart >= 3.0
-                )
+                # AVC must always reset on a generation change. Only the
+                # HEVC path is debounced; claim its timestamp atomically with
+                # watchdog restarts from the transmit thread.
+                must_restart = self._claim_restart(
+                    now, 0.0 if self._video_codec == "avc" else 3.0)
                 if must_restart:
-                    self._last_decoder_restart_t = now
                     if self._video_codec == "avc":
                         log.info(
                             "AVC SSRC generation change: resetting decoder "
@@ -4281,9 +4279,7 @@ class Session:
                         and now - self._last_video_pkt_t < 0.5)
         if (gap > self._SATURATION_RESTART_GAP_S and self._decoder is not None
                 and not recent_loss and pkts_flowing):
-            last_restart = getattr(self, "_last_decoder_restart_t", 0.0)
-            if now - last_restart >= 3.0:
-                self._last_decoder_restart_t = now
+            if self._claim_restart(now, 3.0):
                 log.warning(
                     "decoder stuck %.1fs, packets flowing, no loss for %.0fs — "
                     "no-flush FIR didn't recover; restart decoder + FIR",
@@ -4296,16 +4292,14 @@ class Session:
                 self.request_fir()
                 return
         if gap > 15.0 and self._decoder is not None:
-            last_restart = getattr(self, "_last_decoder_restart_t", 0.0)
-            if now - last_restart >= 8.0:
+            quiet_for = (now - self._last_video_pkt_t
+                         if self._last_video_pkt_t > 0.0 else 0.0)
+            if quiet_for >= 1.5:
+                return
+            if self._claim_restart(now, 8.0):
                 # Same Apple-idle suppression as the 3 s path: if no
                 # packets are arriving, Apple isn't encoding, restart
                 # + FIR can't help. Wait for packets to resume.
-                quiet_for = (now - self._last_video_pkt_t
-                             if self._last_video_pkt_t > 0.0 else 0.0)
-                if quiet_for >= 1.5:
-                    return
-                self._last_decoder_restart_t = now
                 log.warning(
                     "decoder stuck %.1fs (long); restart decoder + FIR storm",
                     gap,
@@ -4392,9 +4386,7 @@ class Session:
                 # does. Safe to restart here: with no loss there are no
                 # missing refs to orphan, so no cascade. Throttled so the
                 # decoder can re-bootstrap before another restart.
-                last_restart = getattr(self, "_last_decoder_restart_t", 0.0)
-                if now - last_restart >= 4.0:
-                    self._last_decoder_restart_t = now
+                if self._claim_restart(now, 4.0):
                     log.warning(
                         "tile stuck (worst bad_streak=%d, tiles=%s, no loss) "
                         "— VT saturation wedge; restart decoder + FIR",
@@ -4405,6 +4397,14 @@ class Session:
                     except Exception as e:
                         log.debug("saturation-wedge restart failed: %s", e)
                     self.request_fir()
+
+    def _claim_restart(self, now: float, interval: float) -> bool:
+        """Atomically reserve a restart across video and watchdog threads."""
+        with self._restart_guard:
+            if interval > 0.0 and now - self._last_decoder_restart_t < interval:
+                return False
+            self._last_decoder_restart_t = max(now, self._last_decoder_restart_t)
+            return True
 
     # ── tx-side port helpers ─────────────────────────────────────────
 

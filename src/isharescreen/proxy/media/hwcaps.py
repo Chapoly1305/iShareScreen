@@ -87,7 +87,8 @@ def _probe_one(hwaccel_type: str) -> bool:
         return False
 
 
-_method_cache: dict[str, str] = {}
+_libav_cache: dict[str, bool] = {}
+_qsv_cache: dict[str, bool] = {}
 
 
 def _qsv_hevc444() -> bool:
@@ -103,30 +104,39 @@ def _qsv_hevc444() -> bool:
         return False
 
 
-def hevc444_decode_method() -> "str | None":
-    """How HEVC 4:4:4 can be hardware-decoded here: ``"qsv"`` (Intel Quick
-    Sync), ``"libav"`` (generic libav hwaccel / native VideoToolbox), or
-    ``None`` (no HW 4:4:4 → AVC fallback). Cached for the process lifetime."""
-    if "method" in _method_cache:
-        return _method_cache["method"] or None
+def libav_hevc444_hwdecode() -> bool:
+    """Probe generic hardware independently of QSV; cache for this process."""
+    if "available" in _libav_cache:
+        return _libav_cache["available"]
     override = os.environ.get("ISS_HEVC444")
     if override == "0":
-        _method_cache["method"] = ""
-        return None
-    method = ""
-    if sys.platform == "darwin":
-        method = "libav"          # native VideoToolbox path (vtdecode.py)
+        result = False
+    elif override == "1" or sys.platform == "darwin":
+        result = True  # forced on, or the existing native VideoToolbox path
     else:
         hwaccels = available_hwaccels(
             _PROBE_HWACCELS.get(sys.platform, _PROBE_HWACCELS["*"]))
-        if any(_probe_one(h) for h in hwaccels):
-            method = "libav"
-        elif _qsv_hevc444():
-            method = "qsv"
-    if override == "1" and not method:
-        method = "libav"          # forced on; trust the libav path
-    _method_cache["method"] = method
-    return method or None
+        result = any(_probe_one(h) for h in hwaccels)
+    _libav_cache["available"] = result
+    return result
+
+
+def qsv_hevc444_hwdecode() -> bool:
+    """Probe QSV even when generic hardware also works, without changing priority."""
+    if "available" not in _qsv_cache:
+        _qsv_cache["available"] = (
+            sys.platform in ("win32", "linux")
+            and os.environ.get("ISS_HEVC444") != "0"
+            and _qsv_hevc444()
+        )
+    return _qsv_cache["available"]
+
+
+def hevc444_decode_method() -> "str | None":
+    """Backward-compatible summary; the registry queries both paths separately."""
+    if libav_hevc444_hwdecode():
+        return "libav"
+    return "qsv" if qsv_hevc444_hwdecode() else None
 
 
 def supports_hevc444_hwdecode() -> bool:
@@ -145,4 +155,5 @@ def supports_hevc444_hwdecode() -> bool:
 # 4:4:4 decoder is available rather than probing here directly. hwcaps remains
 # the probe provider (the registry's availability callbacks delegate to it).
 
-__all__ = ["supports_hevc444_hwdecode", "hevc444_decode_method"]
+__all__ = ["supports_hevc444_hwdecode", "hevc444_decode_method",
+           "libav_hevc444_hwdecode", "qsv_hevc444_hwdecode"]

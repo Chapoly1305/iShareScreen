@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import collections
 import time
+import threading
 import types
 
 from isharescreen.proxy.session import (
@@ -35,6 +36,7 @@ def _session(codec: str) -> Session:
     session._last_publish_t = now - _SSRC_ADOPT_STALL_S - 0.1
     session._last_ssrc_adopt_ts = 0.0
     session._last_decoder_restart_t = now - 1.0
+    session._restart_guard = threading.Lock()
     session._needs_param_harvest = False
     session._dpb_error_window = collections.deque([now])
     session._decoder = _Decoder()
