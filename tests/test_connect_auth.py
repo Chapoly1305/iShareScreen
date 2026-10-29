@@ -7,6 +7,7 @@ from isharescreen.tui import storage
 
 
 def test_gui_passes_auth_options_and_keeps_secrets_out_of_argv_and_profile(monkeypatch, tmp_path):
+    monkeypatch.setattr(C, "_kerberos_supported", lambda: True)
     monkeypatch.setattr(storage, "_state_dir", lambda: tmp_path)
     monkeypatch.setattr(C, "_kill_current", lambda: None)
     monkeypatch.setattr(C, "_free_bridge_port", lambda port: None)
@@ -48,6 +49,7 @@ def test_gui_passes_auth_options_and_keeps_secrets_out_of_argv_and_profile(monke
 
 
 def test_saved_profile_renders_auth_selection_but_never_password(monkeypatch):
+    monkeypatch.setattr(C, "_kerberos_supported", lambda: True)
     monkeypatch.setattr(C, "load_last", lambda: SimpleNamespace(
         host='mac"<.local', user="alice", password="never-render", auth="kerberos",
         remember_password=True, port=5901, krb_realm='EXAMPLE"<.COM',
@@ -97,8 +99,29 @@ def test_form_has_advanced_controls_and_secret_free_storage_allowlist(monkeypatc
 
 
 def test_new_login_defaults_to_kerberos_without_remembering_password(monkeypatch):
+    monkeypatch.setattr(C, "_kerberos_supported", lambda: True)
     monkeypatch.setattr(C, "load_last", lambda: None)
     monkeypatch.setattr(C, "_decoder_options_html", lambda: "")
     html = C._form_page().decode()
     assert 'value="kerberos" selected' in html
     assert 'id="remember-password" checked' not in html
+
+
+def test_windows_saved_kerberos_selection_falls_back_to_srp(monkeypatch):
+    monkeypatch.setattr(C, "_kerberos_supported", lambda: False)
+    monkeypatch.setattr(C, "load_last", lambda: SimpleNamespace(auth="kerberos"))
+    monkeypatch.setattr(C, "_decoder_options_html", lambda: "")
+    html = C._form_page().decode()
+    assert 'value="srp" selected' in html
+    assert 'value="kerberos"  disabled' in html
+    assert "&&!o.disabled" in html
+    assert C._default_auth() == "srp"
+
+
+def test_unsupported_kerberos_does_not_stop_current_session(monkeypatch):
+    monkeypatch.setattr(C, "_kerberos_supported", lambda: False)
+    monkeypatch.setattr(C, "_kill_current", lambda: (_ for _ in ()).throw(AssertionError("session stopped")))
+    messages = []
+    monkeypatch.setattr(C, "_emit", lambda kind, text: messages.append(text))
+    C._launch(dict(host="mac", user="alice", auth="kerberos"))
+    assert "choose Password (SRP)" in messages[0]

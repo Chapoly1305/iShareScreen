@@ -233,6 +233,19 @@ def _browser_is_safari(ua: str) -> bool:
                    ("chrome", "chromium", "crios", "edg", "fxios", "android", "opr"))
 
 
+def _kerberos_supported() -> bool:
+    if sys.platform == "darwin":
+        return True
+    if sys.platform.startswith("linux"):
+        from ctypes.util import find_library
+        return bool(find_library("gssapi_krb5"))
+    return False
+
+
+def _default_auth() -> str:
+    return "kerberos" if _kerberos_supported() else "srp"
+
+
 def _launch(values: dict) -> None:
     global _PROC, _LAST, _LAUNCH_N
     host = values.get("host", "").strip()
@@ -245,7 +258,10 @@ def _launch(values: dict) -> None:
     except ValueError:
         _emit("log", "[gui] port must be between 1 and 65535")
         return
-    auth = values.get("auth", "kerberos")
+    auth = values.get("auth", _default_auth())
+    if auth == "kerberos" and not _kerberos_supported():
+        _emit("log", "[gui] Kerberos is unavailable on this platform; choose Password (SRP)")
+        return
     if auth not in ("srp", "nonsrp", "kerberos"):
         _emit("log", "[gui] invalid authentication mode")
         return
@@ -633,16 +649,22 @@ def _form_page() -> bytes:
             user = getattr(last, "user", "") or ""
             frontend = getattr(last, "frontend", "browser") or "browser"
             remember_password = getattr(last, "remember_password", False)
+    auth = getattr(last, "auth", _default_auth())
+    if auth == "kerberos" and not _kerberos_supported():
+        auth = "srp"
     import html as _html
     return (_FORM
+            .replace("__DEFAULT_AUTH__", _default_auth())
+            .replace("__KERBEROS_DISABLED__", "" if _kerberos_supported() else "disabled")
+            .replace("__AUTH_NOTE__", "" if _kerberos_supported() else "Kerberos is not available in this client on Windows or without a system GSS library. Use Password (SRP).")
             .replace("__HEAD__", _HEAD)
             .replace("__HOST__", _html.escape(host, quote=True))
             .replace("__USER__", _html.escape(user, quote=True))
             .replace("__REMEMBER__", "checked" if remember_password else "")
             .replace("__PORT__", _html.escape(str(getattr(last, "port", 5900)), quote=True))
-            .replace("__SRP_SEL__", "selected" if getattr(last, "auth", "kerberos") == "srp" else "")
-            .replace("__NONSRP_SEL__", "selected" if getattr(last, "auth", "kerberos") == "nonsrp" else "")
-            .replace("__KERBEROS_SEL__", "selected" if getattr(last, "auth", "kerberos") == "kerberos" else "")
+            .replace("__SRP_SEL__", "selected" if auth == "srp" else "")
+            .replace("__NONSRP_SEL__", "selected" if auth == "nonsrp" else "")
+            .replace("__KERBEROS_SEL__", "selected" if auth == "kerberos" else "")
             .replace("__BROWSER_SEL__", "selected" if frontend == "browser" else "")
             .replace("__DESKTOP_SEL__", "selected" if frontend == "desktop" else "")
             .replace("__DECODER_OPTIONS__", _decoder_options_html())).encode()

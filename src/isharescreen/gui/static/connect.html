@@ -35,9 +35,10 @@
 </div><div>  <label>Authentication</label><select name="auth">
    <option value="srp" __SRP_SEL__>Password (SRP)</option>
    <option value="nonsrp" __NONSRP_SEL__>Password (legacy RSA1)</option>
-   <option value="kerberos" __KERBEROS_SEL__>Kerberos</option>
+   <option value="kerberos" __KERBEROS_SEL__ __KERBEROS_DISABLED__>Kerberos</option>
   </select>
 </div></div>
+  <p class="hint" id="auth-note">__AUTH_NOTE__</p>
   <label for="codec">Video codec</label><select name="codec" id="codec">
    <option value="auto">Auto — choose for this viewer</option>
    <option value="hevc">HEVC (H.265)</option>
@@ -106,7 +107,7 @@
      for(const name of fields){
        const el=form.elements[name], value=saved[name];
        if(el.type==='checkbox'){if(typeof value==='boolean')el.checked=value;}
-       else if(typeof value==='string' && (el.tagName!=='SELECT'||Array.from(el.options).some(o=>o.value===value)))el.value=value;
+       else if(typeof value==='string' && (el.tagName!=='SELECT'||Array.from(el.options).some(o=>o.value===value&&!o.disabled)))el.value=value;
      }
      document.getElementById('advanced').open=saved.advanced===true;
    }
@@ -132,7 +133,7 @@
  document.getElementById('reset-settings').addEventListener('click',()=>{
    form.reset();form.elements.password.value='';
    form.elements.codec.value='auto';form.elements.chroma.value='auto';form.elements.decoder.value='auto';
-   form.elements.auth.value='kerberos';form.elements.remember_password.checked=false;
+   form.elements.auth.value='__DEFAULT_AUTH__';form.elements.remember_password.checked=false;
    document.getElementById('advanced').open=false;updateVideo();saveSettings();
  });
  // Associate every field with its visible label for keyboard and screen-reader use.
