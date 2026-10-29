@@ -25,6 +25,7 @@
   <label>Password</label><input type="password" name="password" placeholder="Leave blank to use saved password" autocomplete="current-password">
   <div class="row"><input type="checkbox" name="remember_password" id="remember-password" __REMEMBER__><label for="remember-password" style="margin:0">Remember password in system credential store</label></div>
   <button type="button" onclick="forgetPassword()" style="background:#2b2d31;font-size:13px;margin-bottom:14px">Forget saved password</button>
+  <p class="hint">Passwords are saved only when Remember password is selected, after a successful connection.</p>
   <p id="credential-status" role="status" style="font-size:13px;color:#9aa0a6"></p>
   <label>Frontend</label>
   <select name="frontend"><option value="browser" __BROWSER_SEL__>Browser — open a video tab</option><option value="desktop" __DESKTOP_SEL__>Desktop — open a native window</option></select>
@@ -122,6 +123,7 @@
  document.getElementById('reset-settings').addEventListener('click',()=>{
    form.reset();form.elements.password.value='';
    form.elements.codec.value='auto';form.elements.decoder.value='auto';
+   form.elements.auth.value='kerberos';form.elements.remember_password.checked=false;
    document.getElementById('advanced').open=false;updateVideo();saveSettings();
  });
  // Associate every field with its visible label for keyboard and screen-reader use.

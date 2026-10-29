@@ -245,7 +245,7 @@ def _launch(values: dict) -> None:
     except ValueError:
         _emit("log", "[gui] port must be between 1 and 65535")
         return
-    auth = values.get("auth", "srp")
+    auth = values.get("auth", "kerberos")
     if auth not in ("srp", "nonsrp", "kerberos"):
         _emit("log", "[gui] invalid authentication mode")
         return
@@ -635,9 +635,9 @@ def _form_page() -> bytes:
             .replace("__USER__", _html.escape(user, quote=True))
             .replace("__REMEMBER__", "checked" if remember_password else "")
             .replace("__PORT__", _html.escape(str(getattr(last, "port", 5900)), quote=True))
-            .replace("__SRP_SEL__", "selected" if getattr(last, "auth", "srp") == "srp" else "")
-            .replace("__NONSRP_SEL__", "selected" if getattr(last, "auth", "srp") == "nonsrp" else "")
-            .replace("__KERBEROS_SEL__", "selected" if getattr(last, "auth", "srp") == "kerberos" else "")
+            .replace("__SRP_SEL__", "selected" if getattr(last, "auth", "kerberos") == "srp" else "")
+            .replace("__NONSRP_SEL__", "selected" if getattr(last, "auth", "kerberos") == "nonsrp" else "")
+            .replace("__KERBEROS_SEL__", "selected" if getattr(last, "auth", "kerberos") == "kerberos" else "")
             .replace("__BROWSER_SEL__", "selected" if frontend == "browser" else "")
             .replace("__DESKTOP_SEL__", "selected" if frontend == "desktop" else "")
             .replace("__DECODER_OPTIONS__", _decoder_options_html())).encode()

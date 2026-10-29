@@ -149,3 +149,19 @@ def test_session_only_saves_after_negotiation_success(monkeypatch, store, succee
     else:
         assert str(error.value) == "bad password"
     assert C.get_password("mac.local", 5900, "alice") == ("new" if succeeds else None)
+
+
+@pytest.mark.parametrize("remember", [False, True])
+def test_kerberos_password_storage_requires_explicit_opt_in(monkeypatch, store, remember):
+    flags = ["--auth", "kerberos", "--password-stdin"]
+    if remember:
+        flags.append("--remember-password")
+    cfg = config(monkeypatch, *flags, stdin="kerberos-secret\n")
+    assert not store
+    if remember:
+        assert cfg.on_authenticated is not None
+        cfg.on_authenticated()
+        assert C.get_password("mac.local", 5900, "alice") == "kerberos-secret"
+    else:
+        assert cfg.on_authenticated is None
+        assert not store
