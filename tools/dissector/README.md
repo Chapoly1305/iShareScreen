@@ -67,6 +67,11 @@ Decode one conversation to a JSONL record ledger:
 python tools/dissector/dissector_cli.py \
   decode \
   --pcap capture.pcapng \
+  --client-ip 10.0.0.2 \
+  --server-ip 10.0.0.1 \
+  --server-port 5900 \
+  --client-port 50085 \
+  --initial-key-hex <32-hex-session-key> \
   --output records.jsonl
 ```
 
@@ -84,6 +89,11 @@ Fast-scan one session for cadence and update-driving traffic:
 python tools/dissector/dissector_cli.py \
   scan-session \
   --pcap capture.pcapng \
+  --client-ip 10.0.0.2 \
+  --server-ip 10.0.0.1 \
+  --server-port 5900 \
+  --client-port 50085 \
+  --initial-key-hex <32-hex-session-key> \
   --tail-seconds 3,5
 ```
 
@@ -94,6 +104,11 @@ auto-correlated with the selected TCP adaptive session and latest client `0x1c`:
 python tools/dissector/dissector_cli.py \
   analyze-udp-media \
   --pcap capture.pcapng \
+  --client-ip 10.0.0.2 \
+  --server-ip 10.0.0.1 \
+  --server-port 5900 \
+  --client-port 50085 \
+  --initial-key-hex <32-hex-session-key> \
   --output udp_media_summary.json
 ```
 
@@ -132,6 +147,11 @@ Export every client request from one selected session as JSON or Markdown:
 python tools/dissector/dissector_cli.py \
   export-client-requests \
   --pcap capture.pcapng \
+  --client-ip 10.0.0.2 \
+  --server-ip 10.0.0.1 \
+  --server-port 5900 \
+  --client-port 50085 \
+  --initial-key-hex <32-hex-session-key> \
   --format markdown \
   --output native_requests.md
 ```
@@ -142,6 +162,11 @@ Render an exact-timing replay video:
 python tools/dissector/dissector_cli.py \
   render-replay \
   --pcap capture.pcapng \
+  --client-ip 10.0.0.2 \
+  --server-ip 10.0.0.1 \
+  --server-port 5900 \
+  --client-port 50085 \
+  --initial-key-hex <32-hex-session-key> \
   --output replay.mkv \
   --emit-frame-ledger replay_frames.json
 ```

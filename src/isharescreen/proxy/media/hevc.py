@@ -34,7 +34,6 @@ import os
 import queue
 import sys
 import threading
-from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 
@@ -47,19 +46,24 @@ _NALU_DUMP_PATH = os.environ.get("ISS_NALU_DUMP")
 _nalu_dump_f = open(_NALU_DUMP_PATH, "wb") if _NALU_DUMP_PATH else None
 
 import av
-import numpy as np
 
 from .tiles import TileFrame
 from .nalu import IDR_RANGE
 from .quality_gate import FrameQualityGate, TileVisState
+from .decode_common import (
+    _NAL_START_CODE,
+    _CODEC_FLAG_LOW_DELAY,
+    _CODEC_FLAG2_FAST,
+    _TileSlot,
+    _HW_FRAME_FORMATS,
+    _av_frame_to_tile,
+)
 
 
 log = logging.getLogger(__name__)
 
 
 # ── constants ────────────────────────────────────────────────────────
-
-_NAL_START_CODE = b"\x00\x00\x00\x01"
 
 # nv24 (Apple's HW VideoToolbox 4:4:4 biplanar output) is delivered to the GPU
 # as a passthrough TileFrame (raw interleaved UV, `v is None`) and deinterleaved
@@ -70,25 +74,20 @@ _NAL_START_CODE = b"\x00\x00\x00\x01"
 # given GPU; both the decoder and renderer honour it.
 _LEGACY_CHROMA = os.environ.get("ISS_LEGACY_CHROMA") == "1"
 
-# Mid-stream wedge recovery granularity. Default (unset): a wedge drops to
-# the session-wide `_dpb_has_idr = False` gate — ALL four tiles' P-frames
-# are dropped and every tile's `get_frame` returns None until the next IDR.
-# But Apple emits IDRs on tile 0 only (~every 1.7 s), and a tile-0 IDR
-# re-roots tile 0 immediately while tiles 1-3 still reference pre-wedge
-# POCs, so they re-wedge and re-recover for ~4 IDR cycles — an ~8 s
-# all-tile freeze for what is usually a single broken tile. Set
-# ISS_PERTILE_RECOVERY=1 to instead mark ONLY the gate-flagged broken tiles
-# (`bad_streak > 0`) as awaiting re-root: the healthy tiles keep decoding +
-# publishing from their intact history, and only the broken tile(s) wait
-# for the shared tile-0 IDR. Cold start (before the very first IDR) is
-# untouched — `_dpb_has_idr` still gates every tile then.
-_PERTILE_RECOVERY = os.environ.get("ISS_PERTILE_RECOVERY") == "1"
+# Mid-stream wedge recovery granularity. Default (ON): mark ONLY the
+# gate-flagged broken tiles (`bad_streak > 0`) as awaiting re-root — the
+# healthy tiles keep decoding + publishing from their intact history, and
+# only the broken tile(s) wait for the shared tile-0 IDR. This avoids the
+# all-tile freeze the alternative causes: with the session-wide
+# `_dpb_has_idr = False` gate, ALL four tiles' P-frames are dropped and
+# every tile's `get_frame` returns None until the next IDR — and since
+# Apple emits IDRs on tile 0 only (~every 1.7 s), tiles 1-3 re-wedge and
+# re-recover for ~4 IDR cycles (~8 s) for what is usually a single broken
+# tile. Set ISS_PERTILE_RECOVERY=0 to fall back to that session-wide gate.
+# Cold start (before the very first IDR) is untouched — `_dpb_has_idr`
+# still gates every tile then.
+_PERTILE_RECOVERY = os.environ.get("ISS_PERTILE_RECOVERY", "1") != "0"
 
-# libavcodec flags. AV_CODEC_FLAG_LOW_DELAY = 0x80000 disables frame
-# reordering buffers. AV_CODEC_FLAG2_FAST = 0x400000 enables non-bitexact
-# but faster decode paths (acceptable for live screen-share).
-_CODEC_FLAG_LOW_DELAY = 0x00080000
-_CODEC_FLAG2_FAST = 0x00400000
 
 # Decode-worker queue + lifecycle.
 _QUEUE_MAX = 512                           # NALUs in flight to the decoder
@@ -136,224 +135,9 @@ def _platform_hwaccels() -> tuple[str, ...]:
     return _PLATFORM_HWACCELS.get(sys.platform, _PLATFORM_HWACCELS["*"])
 
 
-# ── per-tile output state ────────────────────────────────────────────
+# `_TileSlot`, `_HW_FRAME_FORMATS`, and `_av_frame_to_tile` now live in
+# `decode_common.py` (shared with the AVC decoder) and are imported above.
 
-@dataclass(slots=True)
-class _TileSlot:
-    """The latest decoded frame for one tile + its bookkeeping. Locked so
-    the decode worker (writer) and the consumer's `get_frame()` (reader)
-    don't tear."""
-    raw_frame: Optional[av.VideoFrame] = None
-    good_count: int = 0
-    # Frames published WITHOUT a libav decode-error flag — i.e. actually
-    # clean video, not concealed gray. `good_count` counts every published
-    # frame including concealed ones, so a fully-gray tile still shows a
-    # healthy good_count/rate; `clean_count` is the honest "is this tile
-    # showing real picture" signal. Compare the two in the profile log.
-    clean_count: int = 0
-    last_evaluated_count: int = 0
-    # Per-tile flag, kept for diagnostics. The actual publish gate is
-    # the session-wide `_dpb_has_idr` because Apple's stream uses
-    # cross-tile DPB references (tile-1/2/3 P-frames reference tile-0's
-    # IDR) — so as soon as ANY tile delivers an IDR the shared codec
-    # context has a usable DPB for every tile.
-    saw_idr_since_reset: bool = False
-    lock: threading.Lock = field(default_factory=threading.Lock)
-
-
-# ── frame extraction (av.VideoFrame → TileFrame) ─────────────────────
-
-# libavcodec format names that mean "this frame lives on the GPU; reformat
-# before extracting planes."
-_HW_FRAME_FORMATS = frozenset({
-    "vaapi", "vaapi_vld",
-    "d3d11", "d3d11va", "dxva2_vld",
-    "cuda",
-    "drm_prime",
-    "mediacodec",
-    "videotoolbox", "videotoolbox_vld",
-})
-
-# Packed 4:4:4 formats that Intel Quick Sync (hevc_qsv) outputs for HEVC RExt
-# 4:4:4 decode: one interleaved sample group per pixel, full chroma. Reformat to
-# planar yuv444p so the existing full-resolution planar GPU upload handles them.
-# vuyx = V,U,Y,X(pad); these are true 4:4:4 (no chroma loss), so the reformat is
-# a lossless de-interleave, not a subsample.
-_PACKED_444_FORMATS = frozenset({"vuyx", "vuya", "ayuv", "uyva", "xyuv"})
-
-# 4:2:0 subsampled formats (the AVC/H.264 fallback path) carry HALF-resolution
-# chroma. These are emitted as half-res TileFrames (nv12 → biplanar rg8
-# passthrough, nv21/yuv420p → half-res planar); the GPU renderer samples them
-# through a per-axis `chroma_scale` so its bilinear sampler upsamples chroma to
-# luma resolution on the fly. We deliberately do NOT libswscale-upsample
-# 4:2:0 → 4:4:4 on the CPU first: at HiDPI that full-res chroma rebuild ate the
-# frame budget and capped AVC at ~41 fps. (The chroma detail lost to 4:2:0 is
-# decimated at the host encoder and unrecoverable either way — see
-# avc-offer-params memory.)
-
-
-def _av_frame_to_tile(
-    frame: av.VideoFrame,
-    reformatter_holder: list[Optional[av.video.reformatter.VideoReformatter]],
-    seen_fmts: set[str],
-) -> tuple[Optional[TileFrame], bool]:
-    """Convert an `av.VideoFrame` to our `TileFrame`.
-
-    Returns `(tile, had_decode_error)`. `had_decode_error` is True when
-    libavcodec set `decode_error_flags` or marked the frame corrupt —
-    the cheapest signal we have for "the decoder concealed missing
-    reference data". The tile is still returned (publish-it-anyway
-    policy: a momentary visible artifact + a fast FIR is more useful
-    to the operator than a frozen tile)."""
-    err = getattr(frame, "decode_error_flags", 0)
-    flg = getattr(frame, "flags", 0)
-    had_error = bool(err) or bool(flg & 0x01)
-    if had_error:
-        log.debug("decode error: decode_error_flags=%d flags=0x%x", err, flg)
-    fmt = frame.format.name
-    width = frame.width
-    height = frame.height
-    if fmt not in seen_fmts:
-        seen_fmts.add(fmt)
-        log.info("decoded frame format: %s (%dx%d)", fmt, width, height)
-
-    if fmt in _HW_FRAME_FORMATS:
-        if reformatter_holder[0] is None:
-            from av.video.reformatter import VideoReformatter
-            reformatter_holder[0] = VideoReformatter()
-        # Apple's HEVC stream is RExt 4:4:4 — reformatting to 4:2:0
-        # (nv12) throws away three-quarters of the chroma and produces
-        # visible "pixelated gray" fringing on text and rectangles.
-        # Preserve full chroma. yuv444p is universally supported by
-        # libswscale; the GPU upload path already handles it as planar
-        # full-resolution Y/U/V.
-        frame = reformatter_holder[0].reformat(frame, format="yuv444p")
-        fmt = frame.format.name
-
-    if fmt in _PACKED_444_FORMATS:
-        # Intel QSV 4:4:4 (vuyx etc.): de-interleave to planar yuv444p. Full
-        # chroma preserved — this is the full-quality HEVC 4:4:4 path.
-        if reformatter_holder[0] is None:
-            from av.video.reformatter import VideoReformatter
-            reformatter_holder[0] = VideoReformatter()
-        frame = reformatter_holder[0].reformat(frame, format="yuv444p")
-        fmt = frame.format.name
-
-    if fmt == "nv12":
-        # Biplanar 4:2:0 passthrough (VideoToolbox / d3d11va / VAAPI H.264).
-        # Hand the half-res interleaved Cb,Cr plane to the GPU verbatim
-        # (v is None); the biplanar rg8 shader reads .r=Cb / .g=Cr and the
-        # GPU's bilinear sampler upsamples chroma to luma resolution. This
-        # avoids BOTH a CPU deinterleave AND the libswscale 4:2:0→4:4:4
-        # upsample that capped HiDPI AVC at ~41 fps. Byte order matches nv24.
-        yp = frame.planes[0]
-        uvp = frame.planes[1]
-        return TileFrame(
-            y=bytes(yp), u=bytes(uvp), v=None,
-            width=width, height=height,
-            y_stride=yp.line_size,
-            uv_stride=uvp.line_size,
-            chroma_width=width // 2,
-            chroma_height=height // 2,
-        ), had_error
-
-    if fmt == "nv21":
-        # Biplanar 4:2:0 with Cr,Cb order — the rg8 passthrough shader can't
-        # swap channels, so deinterleave to half-res planar U/V here (rare:
-        # most H.264 HW decoders emit nv12). Still half-res → GPU upsamples.
-        yp = frame.planes[0]
-        uvp = frame.planes[1]
-        chroma_h = height // 2
-        uv_view = (
-            np.frombuffer(bytes(uvp), dtype=np.uint8)
-            .reshape(chroma_h, uvp.line_size)[:, :width]
-        )
-        v_bytes = uv_view[:, 0::2].tobytes()
-        u_bytes = uv_view[:, 1::2].tobytes()
-        return TileFrame(
-            y=bytes(yp), u=u_bytes, v=v_bytes,
-            width=width, height=height,
-            y_stride=yp.line_size,
-            uv_stride=width // 2,
-            chroma_width=width // 2,
-            chroma_height=chroma_h,
-        ), had_error
-
-    if fmt == "nv24" and not _LEGACY_CHROMA:
-        # Biplanar 4:4:4: Y plane + full-resolution interleaved UV. This is
-        # what VideoToolbox delivers for HEVC RExt 4:4:4 8-bit streams (the
-        # libavcodec name for the CV format `444f`/`kCVPixelFormatType_
-        # 444YpCbCr8BiPlanarFullRange`). Apple's screen-share is the canonical
-        # example and the perf-critical hot path.
-        #
-        # Fast path: hand the interleaved UV plane to the GPU verbatim
-        # (`v is None` passthrough) and let the fragment shader read Cb/Cr
-        # from an rg8unorm texture's .r/.g. This skips the per-tile strided
-        # deinterleave entirely — the single biggest CPU cost in the live
-        # pipeline (~half a core at 4-tile/60fps under the GIL). nv24 byte
-        # order is Cb,Cr → texel .r=Cb (U), .g=Cr (V), matching the planar
-        # path below. The two `bytes()` calls own the data for the deferred
-        # render-thread upload (the av frame is recycled after we return).
-        yp = frame.planes[0]
-        uvp = frame.planes[1]
-        return TileFrame(
-            y=bytes(yp), u=bytes(uvp), v=None,
-            width=width, height=height,
-            y_stride=yp.line_size,
-            uv_stride=uvp.line_size,   # interleaved row pitch (≥ 2*width bytes)
-            chroma_width=width,        # rg8 texels per row
-            chroma_height=height,
-        ), had_error
-
-    if fmt in ("nv24", "nv42"):
-        # Biplanar 4:4:4 CPU deinterleave — the universal fallback (nv42, or
-        # nv24 under ISS_LEGACY_CHROMA). Same deinterleave as NV12 but at full
-        # chroma resolution.
-        yp = frame.planes[0]
-        uvp = frame.planes[1]
-        uv_view = (
-            np.frombuffer(bytes(uvp), dtype=np.uint8)
-            .reshape(height, uvp.line_size)[:, :width * 2]
-        )
-        if fmt == "nv24":
-            u_bytes = uv_view[:, 0::2].tobytes()
-            v_bytes = uv_view[:, 1::2].tobytes()
-        else:
-            v_bytes = uv_view[:, 0::2].tobytes()
-            u_bytes = uv_view[:, 1::2].tobytes()
-        return TileFrame(
-            y=bytes(yp), u=u_bytes, v=v_bytes,
-            width=width, height=height,
-            y_stride=yp.line_size,
-            uv_stride=width,
-            chroma_width=width,
-            chroma_height=height,
-        ), had_error
-
-    if fmt in ("yuv420p", "yuvj420p"):
-        yp, up, vp = frame.planes
-        return TileFrame(
-            y=bytes(yp), u=bytes(up), v=bytes(vp),
-            width=width, height=height,
-            y_stride=yp.line_size,
-            uv_stride=up.line_size,
-            chroma_width=width // 2,
-            chroma_height=height // 2,
-        ), had_error
-
-    if fmt in ("yuv444p", "yuvj444p"):
-        yp, up, vp = frame.planes
-        return TileFrame(
-            y=bytes(yp), u=bytes(up), v=bytes(vp),
-            width=width, height=height,
-            y_stride=yp.line_size,
-            uv_stride=up.line_size,
-            chroma_width=width,
-            chroma_height=height,
-        ), had_error
-
-    log.warning("unsupported decoded frame format: %s", fmt)
-    return None, had_error
 
 
 # ── main decoder ─────────────────────────────────────────────────────
@@ -403,15 +187,6 @@ class HevcDecoder:
         # SEGVs on the next dereference. We've seen this crash named
         # `libavcodec...+0x43a9d0` from the `hevc-decode` thread.
         self._codec_lock = threading.Lock()
-        # Serializes the WHOLE start/restart/close/fallback lifecycle, distinct
-        # from _codec_lock (which only guards a single decode() vs the
-        # _codec=None swap). restart() is driven from BOTH the video-process
-        # thread (SSRC adoption / param harvest) and the tx thread (stall /
-        # saturation / FIR-exhaust watchdogs); without this, two concurrent
-        # _teardown()+_create_codec() sequences corrupt the codec/worker state.
-        # RLock so a re-entrant lifecycle call can't self-deadlock; the decode
-        # worker never takes this lock, so _stop_worker()'s join can't deadlock.
-        self._lifecycle_lock = threading.RLock()
         self._reformatter: list[Optional[av.video.reformatter.VideoReformatter]] = [None]
         self._seen_fmts: set[str] = set()
         self._gate = FrameQualityGate(num_tiles, enabled=enable_quality_gate)
@@ -524,8 +299,7 @@ class HevcDecoder:
         first `feed_nalu` outside burst mode."""
         if not (self._vps and self._sps and self._all_pps):
             raise RuntimeError("set_params() must be called before start()")
-        with self._lifecycle_lock:
-            self._create_codec(force_software=False)
+        self._create_codec(force_software=False)
 
     # -- decoder feed --------------------------------------------------
 
@@ -818,15 +592,13 @@ class HevcDecoder:
 
         Skips rebuild if `set_params` was never called — restart on an
         unconfigured decoder is just a teardown."""
-        with self._lifecycle_lock:
-            self._teardown()
-            if self._vps and self._sps and self._all_pps:
-                self._create_codec(force_software=self._hw_failed)
+        self._teardown()
+        if self._vps and self._sps and self._all_pps:
+            self._create_codec(force_software=self._hw_failed)
 
     def close(self) -> None:
         """Permanent shutdown. Stops the worker, releases the codec context."""
-        with self._lifecycle_lock:
-            self._teardown()
+        self._teardown()
 
     # -- internals: decode --------------------------------------------
 
@@ -1040,10 +812,10 @@ class HevcDecoder:
              comes, turning a one-frame blip into a multi-second all-tile
              freeze (the exact restart-loop seen in the field).
 
-          2. **Genuine hwaccel wedge.** A bad slice *can* wedge
-             VideoToolbox in `kVTVideoDecoderBadDataErr` / "reconfig
-             pending", after which every send_packet raises with zero
-             output. Only this warrants the flush.
+          2. **Genuine hwaccel wedge.** A bad slice *can* wedge a HW
+             decoder in a bad-data / reconfig-pending state, after which
+             every send_packet raises with zero output. Only this warrants
+             the escalation to `_try_recovery`.
 
         We distinguish them by output: any successful publish resets
         `_eagain_streak` (see `_decode_one`), so a wedge is the only thing
@@ -1160,11 +932,12 @@ class HevcDecoder:
         self._eagain_streak = 0
         q = self._queue
         if q is not None:
-            try:
-                while True:
+            n = q.qsize()
+            for _ in range(n):
+                try:
                     q.get_nowait()
-            except queue.Empty:
-                pass
+                except queue.Empty:
+                    break
 
     def _drain_codec_to_slots(self) -> None:
         """Pull any frames libavcodec has buffered (None packet flush)."""
@@ -1330,26 +1103,25 @@ class HevcDecoder:
         """Tear down the HW codec context, build SW one, optionally re-feed
         the burst NALUs."""
         log.warning("falling back from %s to software decode", self._hw_name)
-        with self._lifecycle_lock:
-            self._hw_failed = True
-            self._teardown()
-            self._create_codec(force_software=True)
+        self._hw_failed = True
+        self._teardown()
+        self._create_codec(force_software=True)
 
-            if tile_nalu_cache:
-                self._sync_decode_mode = True
-                try:
-                    max_burst = max(
-                        (len(tile_nalu_cache[ti]) for ti in tile_nalu_cache),
-                        default=0,
-                    )
-                    for idx in range(max_burst):
-                        for ti, nalus in tile_nalu_cache.items():
-                            if idx < len(nalus):
-                                self._decode_one(nalus[idx], ti)
-                    good = sum(t.good_count for t in self._tiles)
-                    log.info("software fallback burst: %d frames decoded", good)
-                finally:
-                    self._sync_decode_mode = False
+        if tile_nalu_cache:
+            self._sync_decode_mode = True
+            try:
+                max_burst = max(
+                    (len(tile_nalu_cache[ti]) for ti in tile_nalu_cache),
+                    default=0,
+                )
+                for idx in range(max_burst):
+                    for ti, nalus in tile_nalu_cache.items():
+                        if idx < len(nalus):
+                            self._decode_one(nalus[idx], ti)
+                good = sum(t.good_count for t in self._tiles)
+                log.info("software fallback burst: %d frames decoded", good)
+            finally:
+                self._sync_decode_mode = False
 
     # -- internals: shared teardown -----------------------------------
 

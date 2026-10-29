@@ -13,9 +13,64 @@ from __future__ import annotations
 import socket
 import struct
 import time
+from dataclasses import dataclass
+from typing import Optional
 
 
 PROTOCOL_VERSION = b"RFB 003.889\n"
+
+
+@dataclass(frozen=True)
+class DisplayRect:
+    """One physical display's rectangle within the combined backing (pixel)
+    canvas, from the AppleDisplayLayout (enc 0x451) message. `x/y/w/h` are in
+    BACKING pixels — the coordinates iss crops the decoded canvas by, one
+    window per display, for host↔client monitor mapping."""
+    display_id: int
+    x: int
+    y: int
+    w: int
+    h: int
+
+
+def parse_apple_display_layout(
+    payload: bytes,
+) -> Optional[tuple[int, int, list[DisplayRect]]]:
+    """Parse an AppleDisplayLayout (enc 0x451) rect payload → (backing_w,
+    backing_h, [DisplayRect...]). Returns None if it can't be parsed.
+
+    Wire format (reverse-engineered from screensharingd ViewerMessages +
+    live capture against 1/2/3-display hosts):
+        header 20B:  ver u16 | scaled_w/h u16 | backing_w/h u16 |
+                     0xffffffff u32 | field u32 | display_count u16
+        per display 56B:  hscale f64 | vscale f64 | display_id u32 |
+                     virtual(point) rect y0,x0,y1,x1 (4×u16) |
+                     pixel(backing)  rect y0,x0,y1,x1 (4×u16) |
+                     trailing 20B (gamma/flags, ignored)
+    Rects are (y0,x0,y1,x1); we return them as (x, y, w, h)."""
+    if len(payload) < 20:
+        return None
+    try:
+        _ver = struct.unpack(">H", payload[0:2])[0]
+        _sw, _sh, bw, bh = struct.unpack(">HHHH", payload[2:10])
+        count = struct.unpack(">H", payload[18:20])[0]
+    except struct.error:
+        return None
+    ENTRY = 56
+    rects: list[DisplayRect] = []
+    off = 20
+    for _ in range(count):
+        if off + ENTRY > len(payload):
+            break
+        did = struct.unpack(">I", payload[off + 16:off + 20])[0]
+        py0, px0, py1, px1 = struct.unpack(">HHHH", payload[off + 28:off + 36])
+        # Guard against degenerate/overflowing rects.
+        if px1 > px0 and py1 > py0:
+            rects.append(DisplayRect(did, px0, py0, px1 - px0, py1 - py0))
+        off += ENTRY
+    if not rects:
+        return None
+    return bw, bh, rects
 
 
 # ── message types ─────────────────────────────────────────────────────
@@ -174,7 +229,7 @@ def build_virtual_display(
     *,
     width: int,
     height: int,
-    hidpi_scale: int = 2,
+    hidpi_scale: float = 2.0,
     hdr: bool = False,
     display_name: str = "iShareScreen Virtual Display",
     mode_count: int = 5,
@@ -194,7 +249,7 @@ def build_virtual_display(
 
     The descriptor mirrors what native sends on every 0x1d:
     `display_flags = 0x01` (DYNAMIC_RESOLUTION), `display_type = 4`
-    (virtual display), `reserved = 7`, physical dims of an MBP panel,
+    (virtual display), `reserved = 7`, physical panel dimensions,
     `max_width/height = 3840×2160`, and a heterogeneous mode table scaled
     to the target. A mid-session 0x1d MUST carry these or the server
     won't treat it as a dynamic-resolution request. (RFC §7.1/§7.3.)
@@ -203,37 +258,31 @@ def build_virtual_display(
     logical (point) size while the mode table carries the pixel dimensions.
     `hidpi_scale=1` flat-encodes at the requested resolution.
 
-    `alt_user_login=True` flips a single byte at displayInfo+0x99 to 0x07.
-    That byte is the low byte of the displayInfo `rotations` u32 at +0x96.
+    `alt_user_login=True` marks the cmd=2 alt-user path. The byte at
+    displayInfo+0x99 is the low byte of the `reserved` u32 at +0x96.
 
-    CAUTION: an earlier reading (below) treated this byte as the "magic
-    bit" that makes the daemon target the alt-user vdisplay instead of the
-    *console* screen. Decompiling screensharingd + ScreensharingAgent
-    (a recent macOS build) contradicts that: +0x96 is logged as `rotations` and forwarded
-    verbatim to `SLVirtualDisplaySettings ...rotations:`, and *neither
-    binary branches on +0x96/+0x99*. The console-vs-login-window choice is
-    actually driven by a runtime session probe plus the `BlankScreen`
-    CFPreference, not this descriptor field. A live re-test confirmed this:
-    running the alt-session path with this byte = 0 vs = 0x07 produced
-    byte-identical protocol behavior (same conn1/conn2 auth, ServerInit
-    geometry, enc1103, and cmd=2 dance) — no observable effect, matching
-    the decompilation. (Caveat: on the test host the connecting user was
-    the console user, so alt-session streamed 0 frames either way and the
-    feature itself was not exercised end-to-end.) The write is retained out
-    of caution; drop it once alt-session is validated on a true
-    non-console-user host.
-
-    Earlier (unverified) note: "captured cmd=2 alt-user traffic sets this
-    byte; with it clear the daemon's createLoginWindow=1 branch leaves
-    virtualDisplayCount=0 and targets the console screen." Believed to be a
-    misattribution given the decompilation above.
+    An earlier reading treated this byte as the "magic bit" that makes the
+    daemon target the alt-user vdisplay instead of the *console* screen.
+    Decompilation contradicts that: +0x96 is forwarded verbatim as the
+    `rotations` field and *neither* the daemon nor the agent branches on
+    +0x96/+0x99. The console-vs-login-window choice is actually driven by a
+    runtime session probe plus the `BlankScreen` preference, not this
+    descriptor field. A live re-test confirmed it: this byte = 0 vs = 0x07
+    produced byte-identical protocol behavior (same auth, ServerInit
+    geometry, enc1103, and cmd=2 dance) — no observable effect. (Caveat: on
+    the test host the connecting user was the console user, so alt-session
+    streamed 0 frames either way and the feature was not exercised
+    end-to-end.) Since we always emit `reserved = 7`, displayInfo+0x99 is
+    already `0x07` for every 0x1d, so `alt_user_login` is a no-op at the
+    byte level today — kept for call-site intent and in case the reserved
+    value ever changes.
     """
     # `width`/`height` are the LOGICAL (point / scaled) target. `hidpi_scale`
     # is the backing:point ratio the mode table advertises: 2 => Retina
     # (backing = 2× points), 1 => flat (backing = points, ~1/4 the pixels =
     # much less bandwidth; the right choice on non-Retina clients where a 2×
     # stream renders the UI half-size). The host honors whichever ratio the
-    # mode table carries (verified against 24G231: a 1× mode table returns
+    # mode table carries (verified live: a 1× mode table returns
     # backing == scaled).
     pts_w = width
     pts_h = height
@@ -254,7 +303,7 @@ def build_virtual_display(
     # display_type = 4 (virtual display).
     struct.pack_into(">I", di, 0x7E, 4)
 
-    # Physical dimensions from native capture (MacBook Pro panel).
+    # Physical dimensions from native macOS capture.
     struct.pack_into(">f", di, 0x82, 369.4545593261719)
     struct.pack_into(">f", di, 0x86, 207.81817626953125)
 
@@ -282,8 +331,11 @@ def build_virtual_display(
         # advertises a 2× (Retina) or 1× (flat) backing per the caller.
         msw = int(base[2] * sx + 0.5)
         msh = int(base[3] * sy + 0.5)
-        mw = msw * hidpi_scale
-        mh = msh * hidpi_scale
+        # Pixel (backing) dims = points × scale. `hidpi_scale` may be fractional
+        # (e.g. 2.5) — the mode table carries pixel and point dims as two
+        # independent resolutions, so any ratio is expressible; round to int px.
+        mw = int(msw * hidpi_scale + 0.5)
+        mh = int(msh * hidpi_scale + 0.5)
         m = 0x9C + 28 * i
         struct.pack_into(">IIII", di, m + 0x00, mw, mh, msw, msh)
         struct.pack_into(">d", di, m + 0x10, 60.0)

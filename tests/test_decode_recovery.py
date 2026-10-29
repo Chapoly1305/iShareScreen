@@ -10,10 +10,21 @@ from __future__ import annotations
 import errno
 import queue as _queue
 
+import pytest
+
+from isharescreen.proxy.media import hevc
 from isharescreen.proxy.media.hevc import (
     HevcDecoder, _TileSlot, _HWACCEL_SILENT_NALU_LIMIT,
 )
 from isharescreen.proxy.media.quality_gate import FrameQualityGate
+
+
+@pytest.fixture(autouse=True)
+def _session_wide_recovery(monkeypatch):
+    """These tests exercise the session-wide (`_dpb_has_idr`) recovery path;
+    per-tile recovery (now the default) is covered by test_pertile_recovery.py.
+    Pin per-tile off so `_try_recovery` takes the session-wide branch."""
+    monkeypatch.setattr(hevc, "_PERTILE_RECOVERY", False)
 
 
 def _make_decoder(num_tiles: int = 4) -> HevcDecoder:

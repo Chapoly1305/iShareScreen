@@ -32,10 +32,10 @@ import sys
 import time
 from typing import Optional
 
-# Enable faulthandler early so that native-thread crashes (e.g. QSV worker,
-# GPU renderer) print a Python traceback (or at least register the fault) to
-# stderr before the process dies. Works best for faults on a thread that holds
-# the GIL; for pure-native-thread crashes it at least lets WER catch the dump.
+# Enable faulthandler early so native-thread crashes (e.g. the QSV decode
+# worker, the GPU renderer) print a thread traceback to stderr before the
+# process dies, instead of a bare STATUS_ACCESS_VIOLATION (0xC0000005) exit
+# code. Best-effort for pure-native faults; lets WER catch the dump regardless.
 faulthandler.enable()
 
 from . import __version__
@@ -47,6 +47,26 @@ log = logging.getLogger("iss.cli")
 
 
 # ── argparse construction ────────────────────────────────────────────
+
+_HIDPI_MIN, _HIDPI_MAX = 1.0, 4.0
+
+
+def _hidpi_arg(v: str) -> str:
+    """--hidpi accepts auto/on/off OR a numeric display scale (1.0–4.0, e.g.
+    2.5). Returns a normalised string; the frontend/CLI resolve it to a float."""
+    s = str(v).strip().lower()
+    if s in ("auto", "on", "off"):
+        return s
+    try:
+        f = float(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--hidpi must be auto/on/off or a scale like 2.5 (got {v!r})")
+    if not (_HIDPI_MIN <= f <= _HIDPI_MAX):
+        raise argparse.ArgumentTypeError(
+            f"--hidpi scale must be between {_HIDPI_MIN} and {_HIDPI_MAX} (got {f})")
+    return repr(f) if f != int(f) else str(int(f))
+
 
 def _make_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -93,6 +113,13 @@ def _make_parser() -> argparse.ArgumentParser:
         "--bridge-port", type=int, default=4433,
         help="browser frontend: WebTransport/HTTP3 listen port (default 4433)",
     )
+    g.add_argument(
+        "--trust-cert-for-safari", action="store_true",
+        help="macOS only: install iss's WebTransport cert into the login "
+        "keychain (one-time auth prompt) so Safari works. Safari can't use "
+        "the self-signed cert otherwise — WebKit lacks serverCertificateHashes. "
+        "Chrome/Edge/Firefox don't need this.",
+    )
 
     g = p.add_argument_group("display")
     g.add_argument(
@@ -120,25 +147,26 @@ def _make_parser() -> argparse.ArgumentParser:
         help="advertise HDR-capable viewer to the host",
     )
     g.add_argument(
-        "--hidpi", choices=("auto", "on", "off"), default="auto",
+        "--display", metavar="N|all|combined", default=None,
         help=(
-            "HiDPI (Retina) rendering of the host display. 'on' = Retina 2x, "
-            "full quality (up to ~300 Mbps); 'off' = flat 1x quality (up to "
-            "~60 Mbps); 'auto' (default) = match the local display (2x on a "
-            "Retina client, 1x otherwise; downgrades to 1x when 2x wouldn't fit "
-            "the host backing cap)"
+            "when the host has multiple monitors it streams them as one "
+            "combined canvas. By default iss auto-opens one window per host "
+            "monitor (drag each onto a local screen and maximize); a "
+            "single-monitor host stays one window. 'N' (0-based) shows only "
+            "that monitor cropped to fill the window; 'combined' shows the "
+            "whole stacked canvas in a single window; 'all' is an explicit "
+            "alias for the per-monitor default. Desktop frontend only."
         ),
     )
     g.add_argument(
-        "--codec", choices=("auto", "hevc", "avc"), default="auto",
+        "--hidpi", type=_hidpi_arg, metavar="auto|on|off|SCALE", default="auto",
         help=(
-            "video codec to negotiate with the host. 'auto' (default) probes "
-            "whether this GPU can hardware-decode HEVC 4:4:4 and uses it if so, "
-            "otherwise falls back to H.264 4:2:0. 'hevc' = force Apple HEVC RExt "
-            "4:4:4 (best quality; slow CPU fallback on GPUs without 4:4:4 HW "
-            "decode). 'avc' = force H.264 High 4:2:0 (lower quality, but "
-            "hardware-decodes on virtually any GPU: D3D11VA / VAAPI / "
-            "VideoToolbox)."
+            "Display scale of the host UI — how large everything is drawn. "
+            "'auto' = match the local display (2x Retina / 1x otherwise); "
+            "'on' = 2x (Retina: normal-size UI on a 4K backing); 'off' = 1x "
+            "(flat, small UI, ~1/4 the bandwidth). Or a number 1.0-4.0 for a "
+            "custom scale (e.g. 2.5 = bigger UI than 2x); higher = larger UI. "
+            "The browser connect form exposes this as 'Display scale' (%%)."
         ),
     )
     g.add_argument(
@@ -149,6 +177,15 @@ def _make_parser() -> argparse.ArgumentParser:
             "vt-hevc444 / libav-hevc444 / qsv-hevc444 / libav-avc420 (legacy "
             "aliases vt / qsv / libav also accepted). Run --list-decoders to "
             "see the matrix and which are available on this machine."
+        ),
+    )
+    g.add_argument(
+        "--codec", choices=["auto", "hevc", "avc"], default="auto",
+        help=(
+            "video codec: 'auto' (default) probes GPU capability and picks "
+            "HEVC 4:4:4 when available, else H.264 4:2:0; 'hevc' forces "
+            "HEVC; 'avc' forces H.264 (hardware-decodable on Windows/Linux "
+            "where 4:4:4 isn't)"
         ),
     )
     g.add_argument(
@@ -167,20 +204,23 @@ def _make_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "--share-console", action="store_true",
         help=(
-            "when authenticating as a non-console user, ask the currently "
-            "logged-in user to share their session (Apple's 'Ask to share' "
-            "choice). The console user gets a permission popup; on accept, "
-            "this viewer joins their existing session in observe-only mode "
-            "instead of starting a separate alt-user session."
+            "force 'share the logged-in user's session'. This is now the "
+            "AUTO-DEFAULT: iss detects whether someone is logged in at the "
+            "console and shares their session unless --alt-session is given, "
+            "so this flag is rarely needed. The console user gets a "
+            "permission popup; on accept, this viewer joins their existing "
+            "session. Mutually exclusive with --alt-session."
         ),
     )
     g.add_argument(
         "--alt-session", action="store_true",
         help=(
-            "when authenticating as a non-console user, log them in to a "
-            "fresh virtual display via Apple's cmd=2 SessionSelect path. "
-            "No popup. Daemon spawns the alt-user's vdisplay and we get "
-            "their desktop. Mutually exclusive with --share-console."
+            "override the auto-default: instead of sharing the logged-in "
+            "user's session, log in to a fresh virtual display as the auth "
+            "user via Apple's cmd=2 SessionSelect path (no popup; the daemon "
+            "spawns the alt-user's vdisplay). Use this when someone is logged "
+            "in but you want your own separate desktop. Mutually exclusive "
+            "with --share-console."
         ),
     )
 
@@ -243,7 +283,7 @@ def _parse_advertise(spec: Optional[str]) -> Optional[AdvertiseDims]:
     try:
         w_str, h_str = geom_part.lower().split("x", 1)
         width, height = int(w_str), int(h_str)
-        hidpi = int(hidpi_part) if hidpi_part else 2
+        hidpi = float(hidpi_part) if hidpi_part else 2.0
     except ValueError as e:
         raise SystemExit(
             f"invalid --advertise value {spec!r}: expected 'WxH' or 'WxH@HIDPI' ({e})"
@@ -256,11 +296,36 @@ def _password_from_args(args: argparse.Namespace) -> Optional[str]:
     handles it interactively. We deliberately don't accept a password
     on the command line — argv shows up in `ps` and shell history."""
     if args.password_stdin:
+        if sys.stdin.isatty():
+            # Typed at a terminal, not piped: read it masked (getpass) so the
+            # password isn't echoed. Piped input (a GUI / script) is unaffected.
+            import getpass
+            return getpass.getpass("password: ")
         line = sys.stdin.readline()
         if not line:
             raise SystemExit("--password-stdin: no input on stdin")
         return line.rstrip("\r\n")
     return None
+
+
+def _ask_session_choice(console_user: str = "") -> str:
+    """Ask the launcher (the GUI) whether to share the console session or start
+    an alt-session by POSTing to its local HTTP server (URL passed in
+    ISS_SESSION_CHOICE_URL) and blocking on the reply. Returns "share_console"
+    on any error/timeout."""
+    url = os.environ.get("ISS_SESSION_CHOICE_URL")
+    if not url:
+        return "share_console"
+    import urllib.request
+    import urllib.parse
+    try:
+        data = urllib.parse.urlencode({"console_user": console_user}).encode()
+        with urllib.request.urlopen(url, data=data, timeout=60) as r:
+            choice = r.read().decode("utf-8").strip().lower()
+        return "alt_session" if choice.startswith("alt") else "share_console"
+    except Exception:
+        log.info("session-choice: no reply, defaulting to share-console")
+        return "share_console"
 
 
 # ── logging setup ────────────────────────────────────────────────────
@@ -273,7 +338,14 @@ def _setup_logging(args: argparse.Namespace) -> None:
     )
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
     if args.log_file:
-        handlers.append(logging.FileHandler(args.log_file, encoding="utf-8"))
+        # The browser launcher writes first-run logs below ~/.iss. On a clean
+        # machine that directory does not exist yet, and FileHandler does not
+        # create parent directories itself. Normalize user-provided paths and
+        # create the parent before opening so a fresh install can connect
+        # without requiring a manual `mkdir ~/.iss`.
+        log_path = os.path.abspath(os.path.expanduser(args.log_file))
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
     for h in handlers:
         h.setFormatter(fmt)
         h.setLevel(level)
@@ -293,17 +365,22 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
     cli_password = _password_from_args(args)
     cli_advertise = _parse_advertise(args.advertise)
     # For a fixed --advertise WxH, the --hidpi mode determines the backing
-    # scale (the auto/dynamic path resolves this in the frontend instead).
-    # 'on' → 2×, 'off' → 1×, 'auto' → 2× when the 2× backing fits the host's
-    # 3840×2160 cap (logical ≤ 1920×1080), else 1×.
-    if cli_advertise is not None:
-        w, h = cli_advertise.width, cli_advertise.height
-        if args.hidpi == "off":
-            scale = 1
+    # scale. 'on'/'off' are display-independent so we resolve them here
+    # (2×/1×). 'auto' must match the LOCAL display's backing scale (1× on a
+    # non-Retina Windows/Linux display, 2× on a Retina Mac) — but the CLI has
+    # no window/monitor handle, so we seed a safe 1× default and let the
+    # frontend (which calls _display_scale()) re-resolve 'auto' once GLFW can
+    # see the display. This avoids the old bug where 1366×768 auto blindly
+    # became 2× (2732×1536 backing = 4× the bytes + an oversized window).
+    if cli_advertise is not None and not (args.advertise and "@" in args.advertise):
+        # No explicit @scale in --advertise, so resolve it from --hidpi. (An
+        # explicit WxH@N — including a fractional @2.5 — is honoured as-is.)
+        if args.hidpi == "off" or args.hidpi == "auto":
+            scale = 1.0  # 'auto' seeds 1×; the frontend re-resolves to the display
         elif args.hidpi == "on":
-            scale = 2
-        else:  # auto
-            scale = 2 if (w * 2 <= 3840 and h * 2 <= 2160) else 1
+            scale = 2.0
+        else:  # numeric --hidpi, e.g. "2.5"
+            scale = float(args.hidpi)
         cli_advertise = dataclasses.replace(cli_advertise, hidpi_scale=scale)
     # Dynamic resolution: explicit --dynamic/--no-dynamic wins; otherwise
     # default it on exactly when no fixed geometry was given (advertise is
@@ -320,7 +397,7 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
     if missing:
         raise SystemExit(
             "missing required arg(s): " + ", ".join(missing) +
-            " (interactive prompt is the TUI -- run plain `iss` for that)"
+            " (run plain `iss` for the interactive connect GUI)"
         )
     return SessionConfig(
         host=args.host, port=args.port,
@@ -330,10 +407,10 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
         dynamic_resolution=dynamic_resolution,
         hdr=args.hdr,
         hidpi=args.hidpi,
-        video_codec=args.codec,
         curtain=args.curtain,
         audio=args.audio,
         share_console=args.share_console, alt_session=args.alt_session,
+        on_session_choice=_ask_session_choice if os.environ.get("ISS_SESSION_CHOICE_URL") else None,
         control_socket=args.control_socket,
         record_pcap=args.record,
     )
@@ -382,8 +459,40 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
     WebCodecs, H.264 pass-through) since every machine has a browser; the
     native wgpu/desktop viewer stays available via --frontend desktop."""
     if args.frontend == "desktop":
+        # Auto codec ladder: offer HEVC when this machine has a HEVC 4:4:4
+        # hardware decoder (VideoToolbox / generic HW / QSV), else fall back to
+        # H.264 (libav-avc420, HW with SW floor). Only force AVC here — when
+        # HEVC HW is present we leave ISS_VIDEO_CODEC unset so the proven
+        # "both"-bank offer (Apple-byte-identical → server sends HEVC) is
+        # unchanged. An explicit --codec / --decoder still wins (env already set).
+        if args.codec == "auto" and "ISS_VIDEO_CODEC" not in os.environ:
+            from .proxy.media.registry import resolve_codec
+            if resolve_codec("auto") == "avc":
+                os.environ["ISS_VIDEO_CODEC"] = "avc"
         from isharescreen.frontend.desktop.app import run as run_desktop
-        return run_desktop(config, auto_quit_secs=args.auto_quit_secs)
+        # --display: default (omitted) auto-opens one window per host monitor if
+        # the host has more than one; a single-monitor host stays one window with
+        # dynamic resolution intact. 'combined' = the old single window showing
+        # the whole stacked multi-monitor canvas. 'N' = crop to host monitor N in
+        # one window. 'all' = explicit alias for the per-monitor default.
+        display_all = True   # auto per-monitor is the default
+        display_idx = -1
+        if args.display is not None:
+            _d = str(args.display).strip().lower()
+            if _d == "all":
+                display_all = True
+            elif _d == "combined":
+                display_all = False           # whole stacked canvas, one window
+            else:
+                try:
+                    display_idx = int(args.display)
+                    display_all = False        # crop to one monitor, one window
+                except ValueError:
+                    log.warning("--display %r not understood (want N, 'all', or "
+                                "'combined') — auto-opening one window per "
+                                "monitor", args.display)
+        return run_desktop(config, auto_quit_secs=args.auto_quit_secs,
+                           display=display_idx, display_all=display_all)
     # browser (default): H.264 pass-through needs the AVC codec path. The
     # Session reads ISS_VIDEO_CODEC at construction, so force it unless the
     # user explicitly chose a codec.
@@ -400,7 +509,10 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
     # cleanly with one decoder, no compositing.
     os.environ.setdefault("ISS_TILES_PER_FRAME", "1")
     from isharescreen.frontend.wt.server import run as run_browser
-    return run_browser(config, port=args.bridge_port)
+    return run_browser(
+        config, port=args.bridge_port,
+        trust_cert_for_safari=getattr(args, "trust_cert_for_safari", False),
+    )
 
 
 # ── entry point ──────────────────────────────────────────────────────
@@ -408,11 +520,12 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
 def main(argv: Optional[list[str]] = None) -> int:
     args = _make_parser().parse_args(argv)
     _setup_logging(args)
-
     if args.list_decoders:
         from .proxy.media import registry
         print(registry.describe())
         return 0
+    # `--decoder` feeds the registry override via the env var session.py reads
+    # (keeps the protocol layer free of a CLI dependency).
     if getattr(args, "decoder", "auto") and args.decoder != "auto":
         import os as _os
         _os.environ["ISS_DECODER"] = args.decoder

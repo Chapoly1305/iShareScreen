@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import socket
 import threading
 import time
@@ -32,7 +33,7 @@ from typing import Optional
 from aiohttp import web
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.asyncio.server import serve as quic_serve
-from aioquic.h3.connection import H3_ALPN, H3Connection
+from aioquic.h3.connection import H3_ALPN, H3Connection, SettingsError
 from aioquic.h3.events import (
     DatagramReceived,
     DataReceived,
@@ -45,13 +46,116 @@ from aioquic.quic.events import ProtocolNegotiated, QuicEvent
 
 from ...proxy.session import Session, SessionConfig
 from ...proxy.media.avc_nalu import au_is_keyframe, au_has_sps
+from ...proxy.media.avc import _patch_avc_sps_dpb
 from .audio import OpusEncoder
-from .cert import write_cert
+from .capsule import CapsuleType, H3Capsule, H3CapsuleDecoder
+from .cert import write_cert, trust_cert_in_keychain, is_cert_trusted
 
 
 log = logging.getLogger(__name__)
 
+# Diagnostic flag: dump each browser's/our HTTP/3 SETTINGS on connect (reveals
+# which WebTransport draft the client speaks). Off by default (not spammy).
+_DEBUG_SETTINGS = os.environ.get("ISS_WT_DEBUG_SETTINGS", "0") == "1"
+
+# Apple's H.264 SPS declares max_num_ref_frames=8 / level 5.2, but under motion
+# + packet loss its encoder references past 8 pictures (short-term + long-term
+# refs) for loss robustness. A *strict* WebCodecs decoder — verified on Chrome
+# for Windows (d3d11va) — honors the declared 8, can't hold the extra
+# references, and the decoder freezes to a stale/black frame until the next
+# keyframe. Chrome-on-macOS uses VideoToolbox, which ignores the limit and
+# decodes fine — which is why this only bites on Windows. iss already patches
+# the SPS DPB ceiling (→16, level 6.0) for its *own* libav decoder
+# (media/avc.py) but forwarded Apple's ORIGINAL SPS to the browser. Patch the
+# forwarded SPS too so the browser's decoder sizes its DPB to hold Apple's full
+# reference set. ISS_BROWSER_SPS_PATCH=0 restores the old (raw) behavior for A/B.
+_BROWSER_SPS_PATCH = os.environ.get("ISS_BROWSER_SPS_PATCH", "1") != "0"
+
+# --- HTTP/3 SETTINGS codepoints for WebTransport ----------------------
+# aioquic 1.3 only knows the draft-02 ENABLE_WEBTRANSPORT (0x2b603742) and the
+# RFC 9297 H3_DATAGRAM (0x33). Chrome speaks draft-02, so it works out of the
+# box. Safari/WebKit speaks the standardized draft (draft-ietf-webtrans-http3),
+# which gates sessions on SETTINGS_WT_MAX_SESSIONS (0xc671706a) and runs the
+# Capsule Protocol on the CONNECT stream (see _WebTransportH3 and the session-
+# stream routing in _BridgeProtocol). We advertise BOTH the draft-02 and the
+# standardized codepoints so a single endpoint serves Chrome and Safari — this
+# mirrors the web-platform-tests h3 WebTransport server, which is interop-tested
+# against both engines.
+_H3_DATAGRAM_RFC = 0x33          # RFC 9297
+_H3_DATAGRAM_DRAFT04 = 0xFFD277  # draft-ietf-masque-h3-datagram-04
+_ENABLE_CONNECT_PROTOCOL = 0x08  # RFC 9220
+_WT_MAX_SESSIONS = 0xC671706A    # draft-ietf-webtrans-http3 (Safari keys on this)
+
+
+class _WebTransportH3(H3Connection):
+    """aioquic's H3Connection extended to advertise the standardized-draft
+    WebTransport settings and to track which HTTP-datagram format the peer
+    negotiated (so we know datagrams are usable and in which encoding)."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # None until SETTINGS arrive; then _H3_DATAGRAM_RFC / _DRAFT04.
+        self.datagram_setting: Optional[int] = None
+
+    def _get_local_settings(self):  # type: ignore[no-untyped-def]
+        # Base already adds ENABLE_WEBTRANSPORT (0x2b603742) + H3_DATAGRAM
+        # (0x33) + ENABLE_CONNECT_PROTOCOL when enable_webtransport=True; keep
+        # those (Chrome requires the draft-02 codepoint) and add the
+        # standardized ones Safari needs.
+        settings = super()._get_local_settings()
+        settings[_H3_DATAGRAM_RFC] = 1
+        settings[_H3_DATAGRAM_DRAFT04] = 1
+        settings[_ENABLE_CONNECT_PROTOCOL] = 1
+        settings[_WT_MAX_SESSIONS] = 1
+        if _DEBUG_SETTINGS:
+            log.info("server SENT H3 SETTINGS: %s",
+                     {hex(k): v for k, v in settings.items()})
+        return settings
+
+    def _validate_settings(self, settings) -> None:  # type: ignore[no-untyped-def]
+        if _DEBUG_SETTINGS:
+            log.info("browser H3 SETTINGS: %s",
+                     {hex(k): v for k, v in settings.items()})
+        # Record the datagram format the peer offered (gates send_datagram so we
+        # never blast audio at a peer that can't receive it).
+        if settings.get(_H3_DATAGRAM_RFC) == 1:
+            self.datagram_setting = _H3_DATAGRAM_RFC
+        elif settings.get(_H3_DATAGRAM_DRAFT04) == 1:
+            self.datagram_setting = _H3_DATAGRAM_DRAFT04
+        else:
+            self.datagram_setting = None
+            log.warning("peer negotiated no HTTP-datagram support; "
+                        "audio-over-datagram disabled for this session")
+        # Run aioquic's real validation (the 0/1-value checks run first, so
+        # malformed settings are still rejected) but tolerate ONLY its datagram/
+        # WebTransport strictness: it predates the standardized WebTransport +
+        # RFC 9297 drafts Safari speaks and raises SettingsError on Safari's
+        # otherwise-valid SETTINGS. Video still flows over streams; audio is
+        # already gated above, so leniency here is safe.
+        try:
+            super()._validate_settings(settings)
+        except SettingsError as e:
+            log.debug("tolerating H3 SETTINGS strictness for standardized-draft "
+                      "peer: %s", e)
+
 _STATIC_DIR = Path(__file__).parent / "static"
+
+# Experiment flag (feature/single-stream-video-transport): send all video
+# frames over ONE long-lived unidirectional stream (length-prefixed) instead
+# of a fresh stream per frame. Set ISS_WT_VIDEO_SINGLE_STREAM=1 to enable.
+_VIDEO_SINGLE_STREAM = os.environ.get("ISS_WT_VIDEO_SINGLE_STREAM", "0") == "1"
+# Single-stream drop-when-behind threshold: when the one video stream's unacked
+# backlog exceeds this, DELTA frames stop being written (and a keyframe is
+# requested) until the stream drains, bounding end-to-end latency. Roughly this
+# many bytes of video is the worst-case added latency before dropping kicks in
+# (~100ms at 20 Mbit/s for 256 KB). Lower = tighter latency but more frequent
+# keyframe resyncs; tune via ISS_WT_SINGLE_STREAM_HIGH_WATER. The per-frame
+# transport bounds latency for free via QUIC's stream-count limit; the single
+# stream needs this explicit.
+_SINGLE_STREAM_HIGH_WATER = int(
+    os.environ.get("ISS_WT_SINGLE_STREAM_HIGH_WATER", str(256 * 1024)))
+# Profiling: log iss-side forward gaps (>80ms between AUs) to localize stutter.
+_PROFILE = os.environ.get("ISS_WT_PROFILE", "0") == "1"
 
 # Send a fresh keyframe whenever a new viewer joins, so they don't
 # wait for the next periodic intra-refresh column to complete.
@@ -66,6 +170,8 @@ class _ViewerSession:
         "session_id", "stream_id", "h3", "loop", "transmit",
         "needs_keyframe", "input_stream_id", "input_buffer",
         "input_callback", "dgrams_sent", "last_seen_t",
+        "video_stream_id", "frames_dropped", "video_discontinuity",
+        "capsule_decoder", "use_single_stream", "request_keyframe",
     )
 
     def __init__(
@@ -76,6 +182,8 @@ class _ViewerSession:
         loop: asyncio.AbstractEventLoop,
         transmit,
         input_callback,
+        use_single_stream: bool = False,
+        request_keyframe=None,
     ) -> None:
         self.session_id = session_id
         # The stream_id of the CONNECT request — closing this closes
@@ -96,31 +204,57 @@ class _ViewerSession:
         self.input_callback = input_callback
         self.dgrams_sent = 0
         self.last_seen_t = time.monotonic()
+        # Single-stream video mode: the one long-lived uni stream all
+        # frames are length-prefixed onto (None until first frame).
+        self.video_stream_id: Optional[int] = None
+        self.frames_dropped = 0
+        # True after a drop, until the next keyframe resyncs the client —
+        # while set we drop ALL deltas (sending one would reference a frame
+        # the client never received).
+        self.video_discontinuity = False
+        # Standardized-draft (Safari) sessions run the Capsule Protocol on the
+        # CONNECT stream. Decode bytes that arrive there as capsules rather than
+        # HTTP DATA frames. draft-02 (Chrome) sends nothing here, so this stays
+        # idle for those sessions.
+        self.capsule_decoder = H3CapsuleDecoder()
+        # Per-viewer transport: single long-lived uni stream (Safari, to stay
+        # under its WT uni-stream credit) vs one stream per frame (default).
+        self.use_single_stream = use_single_stream
+        # Callback to ask the source for a fresh keyframe (FIR) — used by the
+        # single-stream reset-on-backlog path to resync after discarding a
+        # stale backlog. None in contexts without a bridge (e.g. tests).
+        self.request_keyframe = request_keyframe
 
     def send_frame(self, payload: bytes) -> None:
-        """Push one encoded-frame envelope on a fresh unidirectional stream.
-        Caller schedules this from the event loop.
+        """Deliver one encoded-frame envelope to the browser.
 
-        A stream PER FRAME (not one persistent stream): a slow/behind client
-        backs up at the QUIC stream-count limit, so iss stops being able to
-        open new streams and effectively DROPS the newest frames rather than
-        buffering them forever — that bounds end-to-end latency. A single
-        reliable stream instead buffers unboundedly (latency creeps up until a
-        keyframe head-of-line stall flushes it = a periodic freeze).
+        Two transports, selected by ISS_WT_VIDEO_SINGLE_STREAM:
 
-        aioquic bug-workaround: `QuicStreamReceiver.__init__` ignores its
-        `readable` flag, so for outbound unidirectional streams
-        `receiver.is_finished` never flips to True → the stream is never pruned
-        from `_streams_queue` after its FIN is acked. At 60 fps that queue grows
-        and the per-pass rebuild becomes O(N²). Force `receiver.is_finished =
-        True` on creation; the sender still tracks FIN-ack, so it's pruned once
-        delivered.
+        - default (per-frame): a fresh unidirectional stream PER FRAME. A
+          slow/behind client backs up at the QUIC stream-count limit, so iss
+          stops being able to open new streams and effectively DROPS the newest
+          frames rather than buffering them forever — bounding latency. Cost:
+          no ordering between streams, so the client reorders by seq (jitter),
+          and the WT stream-credit limit breaks Safari.
+
+        - single-stream: ONE long-lived uni stream, each envelope length-
+          prefixed ([u32 len][envelope]). Ordered (no client reorder), 1 stream
+          credit (Safari-friendly). Cost: head-of-line blocking on loss, and it
+          can buffer unboundedly if the client falls behind (no drop yet).
         """
+        if _VIDEO_SINGLE_STREAM or self.use_single_stream:
+            self._send_frame_single(payload)
+            return
         try:
             quic = self.h3._quic
             new_id = self.h3.create_webtransport_stream(
                 session_id=self.session_id, is_unidirectional=True,
             )
+            # aioquic bug-workaround: QuicStreamReceiver.__init__ ignores its
+            # `readable` flag, so for outbound unidirectional streams
+            # receiver.is_finished never flips True → the stream is never pruned
+            # after its FIN is acked, making the per-pass rebuild O(N²) at 60fps.
+            # Force it; the sender still tracks FIN-ack so it's pruned on deliver.
             stream = quic._streams.get(new_id)
             if stream is not None:
                 stream.receiver.is_finished = True
@@ -129,11 +263,85 @@ class _ViewerSession:
         except Exception as e:
             log.debug("frame send failed (viewer %d): %s", self.session_id, e)
 
+    def _send_frame_single(self, payload: bytes) -> None:
+        """Single-stream path: length-prefix each envelope onto ONE long-lived
+        unidirectional stream. Used only for viewers whose WebTransport stack
+        can't sustain the per-frame default (Safari, which grants ~100 uni-stream
+        credits total and replenishes them slowly, so a stream-per-frame runs it
+        out of credit in a second or two).
+
+        Drop-when-behind (bounds latency): a reliable ordered stream can't drop
+        stale data, so if the consumer lags the producer, frames pile into the
+        QUIC send buffer under flow-control backpressure and latency grows without
+        bound (the known failure mode of a single reliable stream). We keep the
+        buffer bounded by NOT feeding it: once the unacked backlog crosses the
+        high-water mark we stop writing DELTA frames and ask the source for a
+        fresh keyframe, so the decoder resyncs quickly instead of waiting for a
+        periodic intra-refresh. Keyframes and config/cursor always pass; a
+        keyframe ends the drop window.
+
+        We deliberately do NOT RESET_STREAM to shed the backlog: each reset would
+        consume one of Safari's finite cumulative uni-stream credits, so a lossy
+        link that reset a few times a second would exhaust credit and freeze the
+        session permanently — trading bounded stutter for a dead stream. One
+        stream, opened once, held for the whole session."""
+        try:
+            quic = self.h3._quic
+            t = payload[0] if payload else -1
+
+            # Lazy-open the one persistent stream (never reset — see docstring).
+            if self.video_stream_id is None:
+                self.video_stream_id = self.h3.create_webtransport_stream(
+                    session_id=self.session_id, is_unidirectional=True,
+                )
+                fresh = quic._streams.get(self.video_stream_id)
+                if fresh is not None:
+                    fresh.receiver.is_finished = True
+
+            # Deltas are droppable; keyframes/config/cursor are not.
+            if t == _TYPE_VIDEO_DELTA:
+                if self.video_discontinuity:
+                    return                      # waiting for the resync keyframe
+                stream = quic._streams.get(self.video_stream_id)
+                backlog = 0
+                if stream is not None:
+                    backlog = stream.sender._buffer_stop - stream.sender._buffer_start
+                if backlog > _SINGLE_STREAM_HIGH_WATER:
+                    # Stop feeding the stream (bounds the backlog) and resync
+                    # from a keyframe rather than resetting the stream.
+                    self.video_discontinuity = True
+                    self.frames_dropped += 1
+                    if self.request_keyframe is not None:
+                        self.request_keyframe()
+                    if self.frames_dropped in (1, 10, 100) or \
+                            self.frames_dropped % 500 == 0:
+                        log.info("single-stream: backlog %dKB over high-water "
+                                 "(viewer %d, drop #%d) — dropping deltas, "
+                                 "requesting keyframe", backlog // 1024,
+                                 self.session_id, self.frames_dropped)
+                    return
+            elif t == _TYPE_VIDEO_KEY:
+                self.video_discontinuity = False   # clean resync point
+
+            framed = len(payload).to_bytes(4, "big") + payload
+            quic.send_stream_data(
+                stream_id=self.video_stream_id, data=framed, end_stream=False,
+            )
+            self.transmit()
+        except Exception as e:
+            log.debug("single-stream send failed (viewer %d): %s", self.session_id, e)
+
     def send_datagram(self, payload: bytes) -> None:
         """Send a WebTransport datagram (HTTP/3 DATAGRAM, RFC 9297).
         Used for audio packets — one UDP datagram per Opus frame, no
         per-frame stream-creation cost (which choked QUIC's stream
         credit at ~160 streams/sec)."""
+        # Skip when the peer negotiated no HTTP-datagram support (Safari's
+        # standardized-draft stack exposes no datagram writer and disables its
+        # datagram reader): send_datagram would either raise per packet — an
+        # audio-rate log flood — or drop silently into a channel nothing reads.
+        if getattr(self.h3, "datagram_setting", None) is None:
+            return
         try:
             self.h3.send_datagram(stream_id=self.session_id, data=payload)
             self.transmit()
@@ -186,7 +394,7 @@ class _BridgeProtocol(QuicConnectionProtocol):
         if isinstance(event, ProtocolNegotiated):
             log.info("QUIC ALPN negotiated: %s", event.alpn_protocol)
             if event.alpn_protocol in H3_ALPN:
-                self._h3 = H3Connection(self._quic, enable_webtransport=True)
+                self._h3 = _WebTransportH3(self._quic, enable_webtransport=True)
         if self._h3 is not None:
             for h3_evt in self._h3.handle_event(event):
                 self._h3_event(h3_evt)
@@ -201,8 +409,17 @@ class _BridgeProtocol(QuicConnectionProtocol):
                 "H3 HEADERS stream=%d method=%s path=%s protocol=%s",
                 event.stream_id, method, path, protocol,
             )
-            if method == "CONNECT" and protocol == "webtransport" and path == "/wt":
-                self._accept_webtransport(event.stream_id)
+            base_path, _, query = path.partition("?")
+            if (method == "CONNECT"
+                    and protocol in ("webtransport", "webtransport-h3")
+                    and base_path == "/wt"):
+                # draft-02 uses :protocol=webtransport; draft-08+ (Safari) uses
+                # webtransport-h3. Accept both. The client requests the single-
+                # long-lived-stream transport via ?transport=single (Safari does,
+                # to stay under its WebTransport uni-stream credit); the global
+                # env flag forces it for everyone.
+                single = _VIDEO_SINGLE_STREAM or "transport=single" in query
+                self._accept_webtransport(event.stream_id, single)
             elif method == "GET":
                 self._serve_get(event.stream_id, path)
             else:
@@ -218,16 +435,62 @@ class _BridgeProtocol(QuicConnectionProtocol):
             if viewer.input_stream_id == event.stream_id:
                 viewer.feed_input_bytes(event.data)
         elif isinstance(event, DataReceived):
-            # GET/POST body bytes — we don't need them for /wt.
-            pass
+            viewer = self._viewers.get(event.stream_id)
+            if viewer is not None:
+                # Bytes on the CONNECT stream of an established WebTransport
+                # session are Capsule Protocol records (Safari's draft), not
+                # HTTP body. Decode them; the one we act on is
+                # CLOSE_WEBTRANSPORT_SESSION (orderly teardown).
+                self._recv_session_capsules(viewer, event.data,
+                                            event.stream_ended)
+            # else: GET/POST body bytes — not needed for /wt.
         elif isinstance(event, DatagramReceived):
             viewer = self._viewers.get(event.stream_id)
             if viewer is not None:
                 self._bridge.handle_input_datagram(viewer, event.data)
 
+    def _recv_session_capsules(
+        self, viewer: "_ViewerSession", data: bytes, stream_ended: bool,
+    ) -> None:
+        """Decode Capsule Protocol records arriving on a session's CONNECT
+        stream. We only need CLOSE_WEBTRANSPORT_SESSION for lifecycle; other
+        capsule types (e.g. flow-control) are skipped, matching the WPT
+        reference server which relies on SETTINGS-based initial credit."""
+        try:
+            if data:
+                viewer.capsule_decoder.append(data)
+            if stream_ended:
+                viewer.capsule_decoder.final()
+            for capsule in viewer.capsule_decoder:
+                if capsule.type == CapsuleType.CLOSE_WEBTRANSPORT_SESSION:
+                    log.info("WT viewer %d sent CLOSE_WEBTRANSPORT_SESSION",
+                             viewer.session_id)
+                    self._close_viewer(viewer)
+                    return
+        except Exception as e:  # noqa: BLE001
+            # A malformed / oversized capsule (or a decoder left half-consumed)
+            # is a protocol error on the session stream — don't keep feeding a
+            # wedged decoder; tear the viewer down.
+            log.warning("capsule decode error (viewer %d): %s — closing viewer",
+                        viewer.session_id, e)
+            self._close_viewer(viewer)
+            return
+        if stream_ended:
+            # Peer half-closed the CONNECT stream without a close capsule; the
+            # session is over either way.
+            self._close_viewer(viewer)
+
+    def _close_viewer(self, viewer: "_ViewerSession") -> None:
+        if self._viewers.pop(viewer.session_id, None) is not None:
+            self._bridge.remove_viewer(viewer)
+            log.info("WT viewer %d disconnected (total=%d)",
+                     viewer.session_id, len(self._bridge.viewers))
+
     # -- request handlers ---------------------------------------------
 
-    def _accept_webtransport(self, stream_id: int) -> None:
+    def _accept_webtransport(
+        self, stream_id: int, use_single_stream: bool = False,
+    ) -> None:
         assert self._h3 is not None
         self._h3.send_headers(
             stream_id=stream_id,
@@ -255,11 +518,14 @@ class _BridgeProtocol(QuicConnectionProtocol):
             loop=asyncio.get_event_loop(),
             transmit=self.transmit,
             input_callback=self._bridge.handle_input_event,
+            use_single_stream=use_single_stream,
+            request_keyframe=self._bridge.request_keyframe,
         )
         self._viewers[stream_id] = viewer
         self._bridge.add_viewer(viewer)
-        log.info("WT viewer %d connected (total=%d)",
-                 stream_id, len(self._bridge.viewers))
+        log.info("WT viewer %d connected (total=%d, transport=%s)",
+                 stream_id, len(self._bridge.viewers),
+                 "single-stream" if use_single_stream else "per-frame")
 
     def _serve_get(self, stream_id: int, path: str) -> None:
         assert self._h3 is not None
@@ -308,9 +574,16 @@ class WebTransportBridge:
         bitrate_kbps: int = 5000,
         framerate: int = 60,
         tile3_crop_rows: int = 0,
+        trust_cert_for_safari: bool = False,
     ) -> None:
         self._config = config
         self._port = port
+        # Opt-in: install our self-signed cert into the macOS login
+        # keychain so Safari (which ignores serverCertificateHashes) can
+        # do WebTransport. Set True once trusted — the page then connects
+        # without hashes for Safari.
+        self._trust_cert_for_safari = trust_cert_for_safari
+        self._safari_trusted = False
         self._bitrate_kbps = bitrate_kbps
         self._fps = framerate
         # 0 = auto-derive from canvas height. Non-zero forces a
@@ -342,6 +615,23 @@ class WebTransportBridge:
         cache = Path.home() / ".cache" / "iss"
         cert_path, key_path, sha256 = write_cert(cache)
         self.cert_sha256 = sha256
+        # Install into the login keychain only if asked AND not already trusted
+        # (avoids a redundant prompt). The cert is reused across runs, so a
+        # prior --trust-cert-for-safari (or the standalone trust step) makes it
+        # trusted for good.
+        if self._trust_cert_for_safari and not is_cert_trusted(cert_path):
+            ok, detail = trust_cert_in_keychain(cert_path)
+            if not ok:
+                log.warning(
+                    "Safari trust: could NOT install cert (%s). Safari will "
+                    "still fail — approve the keychain prompt, or use "
+                    "Chrome/Edge/Firefox.", detail)
+        # Report ACTUAL keychain trust, not just whether the flag was passed —
+        # so Safari connects whenever the cert is trusted, even on a plain `iss`
+        # run after it was trusted once.
+        self._safari_trusted = is_cert_trusted(cert_path)
+        if self._safari_trusted:
+            log.info("Safari trust: cert is keychain-trusted (Safari can connect)")
         # Match aioquic's reference http3_server.py exactly. The
         # additions I had (`max_data`, `max_stream_data`,
         # `max_datagram_size=1500`) caused TLS handshake completion to
@@ -410,8 +700,12 @@ class WebTransportBridge:
         except OSError as e:
             log.debug("v4 bind skipped (dual-stack already covers it): %s", e)
         await self._start_http_bootstrap()
-        local_ip = _detect_local_ip()
-        url = f"http://{local_ip}:{self._port}/"
+        # Use localhost, not the LAN IP: Chrome/Edge only expose WebTransport in
+        # a secure context, and http://localhost qualifies while http://<LAN-IP>
+        # does not. localhost also matches the self-signed cert (cert.py issues
+        # it for localhost / 127.0.0.1, not the LAN address), and the dual-stack
+        # listeners above exist precisely so localhost (::1 / 127.0.0.1) works.
+        url = f"http://localhost:{self._port}/"
         log.info("WebTransport bridge ready:")
         log.info("  open this URL in Chrome/Edge/Firefox: %s", url)
         log.info("  (HTML on tcp/%d, WebTransport on udp/%d)",
@@ -438,6 +732,20 @@ class WebTransportBridge:
         async def cert_hash(_req: web.Request) -> web.Response:
             return web.Response(
                 text=self.cert_sha256, headers=nocache,
+            )
+
+        async def wt_config(_req: web.Request) -> web.Response:
+            """Client bootstrap config. `safariTrusted` tells the page
+            whether our cert is installed in the keychain — if so, Safari
+            connects WITHOUT serverCertificateHashes (which WebKit doesn't
+            support) and validates via the system trust store instead."""
+            return web.json_response(
+                {"safariTrusted": self._safari_trusted,
+                 "videoSingleStream": _VIDEO_SINGLE_STREAM,
+                 # In dynamic ("Auto") mode the page reports its window size so
+                 # the host re-encodes to match; a fixed --advertise is left
+                 # untouched (respect the user's explicit resolution choice).
+                 "dynamic": bool(self._config.dynamic_resolution)}, headers=nocache,
             )
 
         async def audio_worklet(_req: web.Request) -> web.Response:
@@ -493,10 +801,11 @@ class WebTransportBridge:
         app = web.Application()
         app.router.add_get("/", index)
         app.router.add_get("/cert-hash", cert_hash)
+        app.router.add_get("/wt-config", wt_config)
         app.router.add_get("/audio-worklet.js", audio_worklet)
         app.router.add_post("/log", log_event)
         app.router.add_get("/stats", stats_endpoint)
-        runner = web.AppRunner(app)
+        runner = web.AppRunner(app, access_log=None)  # don't log every /stats poll
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", self._port)
         await site.start()
@@ -533,6 +842,14 @@ class WebTransportBridge:
                 # _on_video_au) follows for this viewer to start decoding.
                 if self._last_config_env is not None:
                     self._broadcast_frame(self._last_config_env)
+                # Replay the most-recent cached keyframe so the joiner can paint
+                # right away. On an idle host (where the FIR below goes
+                # unanswered) this is the ONLY way it gets a decodable frame;
+                # on an active host the fresh IDR re-syncs immediately after.
+                # Existing viewers drop it (older seq than what they've seen),
+                # so a broadcast only reaches the fresh joiner.
+                for kf_env in list(getattr(self, "_last_keyframe_env", {}).values()):
+                    self._broadcast_frame(kf_env)
                 if _FORCE_KEYFRAME_ON_JOIN:
                     try:
                         self._session.request_fir(None)
@@ -549,6 +866,22 @@ class WebTransportBridge:
                      viewer.session_id, len(self.viewers))
             if not self.viewers:
                 self._teardown_session()
+
+    def request_keyframe(self) -> None:
+        """Rate-limited FIR request, shared by recovery paths (decoder reset,
+        single-stream reset-on-backlog). macOS answers a FIR with an IDR in
+        ~75ms; suppress a redundant request while one is still in flight
+        (_kf_req_fir_t is cleared in _on_video_au when the IDR arrives)."""
+        now = time.monotonic()
+        pending = getattr(self, "_kf_req_fir_t", 0.0)
+        if pending and (now - pending) <= 0.3:
+            return
+        try:
+            if self._session is not None:
+                self._session.request_fir(None)
+                self._kf_req_fir_t = now
+        except Exception:  # noqa: BLE001
+            pass
 
     # -- session + encoder lifecycle ----------------------------------
 
@@ -567,7 +900,16 @@ class WebTransportBridge:
             # reassembled per-tile AUs in _on_video_au.
             self._config_sent = False
             self._last_config_env = None
+            # Most-recent keyframe envelope per tile — replayed to a late-joining
+            # viewer so it can paint immediately even when the host is idle and
+            # won't answer a FIR with a fresh IDR (see add_viewer).
+            self._last_keyframe_env = {}
             self._au_seq = 0
+            # Reset dynamic-resolution dedup state so a reconnect at the SAME
+            # window size still re-advertises (the new session starts at the
+            # host's default canvas, not the previous re-advertised size).
+            self._last_resize_wh = None
+            self._last_config_wh = None
             session.set_video_au_callback(self._on_video_au)
             # Cursor (RFB enc 1104): forward pixmaps so the browser paints the
             # host cursor shape as the canvas CSS cursor — and, crucially, the
@@ -674,6 +1016,8 @@ class WebTransportBridge:
         """WebCodecs codec id 'avc1.PPCCLL' from the SPS (profile/constraint/
         level bytes). Falls back to High@5.0 if the SPS isn't available yet."""
         sps, _ = session.video_params()
+        if sps and _BROWSER_SPS_PATCH:
+            sps = _patch_avc_sps_dpb(sps)
         if len(sps) >= 4:
             return "avc1." + sps[1:4].hex()
         return "avc1.640032"
@@ -688,6 +1032,17 @@ class WebTransportBridge:
         if loop is None or session is None:
             return
         is_key = au_is_keyframe(au_bytes)
+        if _PROFILE:
+            now = time.monotonic()
+            last = getattr(self, "_prof_last_au", 0.0)
+            if last:
+                gap = (now - last) * 1000
+                if gap > 80:
+                    log.info("iss FORWARD GAP %.0fms (key=%s, tile=%d, bytes=%d)",
+                             gap, is_key, tile_idx, len(au_bytes))
+            self._prof_last_au = now
+            if is_key:
+                log.info("iss KEYFRAME (tile=%d, bytes=%d)", tile_idx, len(au_bytes))
         if is_key:
             # An IDR arrived — clear any in-flight FIR request (see the
             # keyframe-request gating in handle_input_event).
@@ -699,15 +1054,46 @@ class WebTransportBridge:
             # 'Decoding error' on every keyframe.
             sps, all_pps = session.video_params()
             if sps:
+                if _BROWSER_SPS_PATCH:
+                    sps = _patch_avc_sps_dpb(sps)
                 pps = next(iter(all_pps.values()), b"")
                 au_bytes = (b"\x00\x00\x00\x01" + sps
                             + b"\x00\x00\x00\x01" + pps + au_bytes)
-        if not self._config_sent:
-            cw, ch = session.canvas_dims
+        cw, ch = session.canvas_dims
+        # Per-host-display rects within the combined canvas (0x451 layout). Lets
+        # a viewer crop to a single host monitor (?display=N) so a multi-monitor
+        # host isn't shown as one squished/black canvas, and drives the Displays
+        # picker. The layout can arrive/change AFTER the first keyframe (the
+        # 0x451 is async on the control channel), so re-send config when it
+        # changes even if the canvas size didn't.
+        drects = [
+            {"id": r.display_id, "x": r.x, "y": r.y, "w": r.w, "h": r.h}
+            for r in session.display_rects
+        ]
+        _content = session.display_content_rect
+        content_rect = (
+            {"x": _content.x, "y": _content.y, "w": _content.w, "h": _content.h}
+            if _content is not None else None
+        )
+        # (Re)send config on the first frame, and again when the canvas size
+        # changes mid-session (dynamic resolution) — but only on a keyframe, so
+        # the browser re-inits its decoder at the new size on a clean IDR that
+        # already carries the new SPS (a delta at the new size would fail).
+        if (not self._config_sent
+                or (is_key and (cw, ch) != getattr(self, "_last_config_wh", None))
+                or (is_key and drects != getattr(self, "_last_config_drects", None))
+                or (is_key and content_rect
+                    != getattr(self, "_last_config_content_rect", None))):
             nt = max(1, session.num_tiles)
+            self._last_config_wh = (cw, ch)
+            self._last_config_drects = drects
+            self._last_config_content_rect = content_rect
             cfg = json.dumps({
                 "num_tiles": nt, "canvas_w": cw, "canvas_h": ch,
                 "tile_h": ch // nt, "codec": self._codec_string(session),
+                "display_rects": drects,
+                "content_rect": content_rect,
+                "hidpi_scale": self._display_scale(),
             }).encode()
             self._last_config_env = _config_envelope(cfg)
             self._config_sent = True
@@ -716,8 +1102,18 @@ class WebTransportBridge:
         # order). The browser reorders by this before decoding.
         seq = self._au_seq
         self._au_seq = (self._au_seq + 1) & 0xFFFFFFFF
-        self._broadcast_frame(
-            _frame_envelope(au_bytes, is_key, ts & 0xFFFFFFFFFFFFFFFF, tile_idx, seq))
+        # Stamp iss's own monotonic send time in µs (the browser decodes with a
+        # synthetic timestamp and ignores this field, so it's free to carry a
+        # real-time send clock for end-to-end latency measurement — the source
+        # RTP ts here ran at ~90kHz, which read as µs looked like 0.9s/s of fake
+        # "latency growth").
+        send_us = int(time.monotonic() * 1_000_000) & 0xFFFFFFFFFFFFFFFF
+        env = _frame_envelope(au_bytes, is_key, send_us, tile_idx, seq)
+        if is_key:
+            # Cache the latest keyframe (SPS/PPS already prepended above) to
+            # bootstrap late joiners on an idle host — see add_viewer.
+            self._last_keyframe_env[tile_idx] = env
+        self._broadcast_frame(env)
 
     def _gate_pump_loop(self) -> None:
         """Drain get_frame() for every tile so the quality gate + FIR recovery
@@ -818,74 +1214,128 @@ class WebTransportBridge:
                         self._kf_req_fir_t = now
                 except Exception:
                     pass
+                # Also replay the cached keyframe. The browser just reset its
+                # decoder (nextSeq=-1) so it accepts this even though the seq is
+                # older than what it had seen — letting it repaint immediately
+                # instead of waiting on the FIR, which an IDLE host won't answer.
+                # On an active host the fresh IDR follows and supersedes it.
+                for kf_env in list(getattr(self, "_last_keyframe_env", {}).values()):
+                    self._broadcast_frame(kf_env)
             return
         if kind == "stats":
             # Track whether any viewer is actively listening to audio
             # so the audio thread can skip Opus encode otherwise.
             if msg.get("audio_ctx") == "running":
                 self._audio_listener_last_t = time.monotonic()
-            # Verdict: the stream is "working" if decode_fps>0 AND
-            # canvas pixels show variance (std>10 typical for real
-            # content, <5 = frozen/grey, gray_frac<0.5 = not all
-            # concealment).
+            # The reliable "broken picture" signal is the CANVAS, not the frame
+            # rate: a static/idle screen reads 0 fps but its last frame is real
+            # and on-screen (high pixel variance, low grey). Only a genuinely
+            # corrupt/concealed picture goes flat or grey. So classify by pixels
+            # FIRST, and treat 0 fps with a healthy canvas as NO_FRAMES — purely
+            # informational, not a freeze to storm IDRs at.
             verdict = "ok"
             if msg.get("decoder_errored"):
                 verdict = "DECODER_ERROR"
-            elif msg.get("decode_fps", 0) < 1:
-                verdict = "NO_FRAMES"
-            elif msg.get("pixel_std", 0) < 5:
+            elif msg.get("pixel_std", 0) < 5 and msg.get("decode_fps", 0) < 1:
+                # FLAT canvas (low variance) AND frames stopped = a real freeze.
+                # A flat canvas WITH frames still flowing is dark/low-contrast
+                # CONTENT decoding fine — FIR-ing that every few seconds was the
+                # stutter, so require frames to have stalled. (Concealment is
+                # caught by MOSTLY_GREY below, not here — it's mid-gray, not flat.)
                 verdict = "FROZEN/GREY"
             elif msg.get("gray_frac", 0) > 0.5:
+                # >50% mid-gray-128 + desaturated = decoder concealment fill from
+                # a broken reference chain — NOT dark content (near-black, not
+                # mid-gray). Recover regardless of fps: WebCodecs can emit
+                # concealed gray frames at full rate WITHOUT raising an error, so
+                # this is the only signal for a frames-flowing gray corruption.
                 verdict = "MOSTLY_GREY"
+            elif msg.get("decode_fps", 0) < 1:
+                verdict = "NO_FRAMES"
             elif msg.get("decoder_queue", 0) > 10:
                 verdict = "DECODE_LAG"
-            log.info(
-                "browser[%s]: decode=%.1f fps streams=%.1f/s %.1f Mbit/s "
-                "queue=%d canvas=%dx%d pixel(mean=%.1f std=%.1f gray=%.0f%%) "
-                "audio[%s/ctx=%s pkts=%d frames=%d derr=%d serr=%d] "
-                "total=%.1f MB",
-                verdict,
-                msg.get("decode_fps", 0), msg.get("stream_fps", 0),
-                msg.get("mbps", 0), msg.get("decoder_queue", 0),
-                msg.get("canvas_w", 0), msg.get("canvas_h", 0),
-                msg.get("pixel_mean", 0), msg.get("pixel_std", 0),
-                msg.get("gray_frac", 0) * 100,
-                msg.get("audio_state", "?"),
-                msg.get("audio_ctx", "?"),
-                msg.get("audio_packets", 0),
-                msg.get("audio_frames", 0),
-                msg.get("audio_decode_err", 0),
-                msg.get("audio_submit_err", 0),
-                msg.get("total_mb", 0),
-            )
+            # The browser's own decoder is the authoritative picture. When it's
+            # actively decoding a GOOD frame ("ok"), tell the session so it
+            # suppresses the session-side libav gate's false-positive FIRs (the
+            # "recovering via FIR" spam on a healthy stream). Keyed STRICTLY on
+            # "ok" — never on gray/frozen, which may be a silent d3d11va wedge
+            # that genuinely needs the gate's FIR to recover.
+            if verdict == "ok" and self._session is not None:
+                self._session.note_browser_healthy()
+            # Throttle the routine "ok" heartbeat to once per 30s — a per-second
+            # stats line is log spam. Anything NOT "ok" (a real problem) logs
+            # immediately so issues stay visible.
+            now = time.monotonic()
+            if verdict == "ok" and (now - getattr(self, "_last_stats_log_t", 0.0)) < 30.0:
+                pass
+            else:
+                self._last_stats_log_t = now
+                log.info(
+                    "browser[%s]: decode=%.1f fps streams=%.1f/s %.1f Mbit/s "
+                    "queue=%d canvas=%dx%d pixel(mean=%.1f std=%.1f gray=%.0f%%) "
+                    "audio[%s/ctx=%s pkts=%d frames=%d derr=%d serr=%d] "
+                    "total=%.1f MB",
+                    verdict,
+                    msg.get("decode_fps", 0), msg.get("stream_fps", 0),
+                    msg.get("mbps", 0), msg.get("decoder_queue", 0),
+                    msg.get("canvas_w", 0), msg.get("canvas_h", 0),
+                    msg.get("pixel_mean", 0), msg.get("pixel_std", 0),
+                    msg.get("gray_frac", 0) * 100,
+                    msg.get("audio_state", "?"),
+                    msg.get("audio_ctx", "?"),
+                    msg.get("audio_packets", 0),
+                    msg.get("audio_frames", 0),
+                    msg.get("audio_decode_err", 0),
+                    msg.get("audio_submit_err", 0),
+                    msg.get("total_mb", 0),
+                )
             err = msg.get("decoder_error")
             if err:
                 log.warning("browser decoder error: %s", err)
-            # If the browser reports persistent gray/frozen output for
-            # the canvas while iss is happily encoding 60 fps, the
-            # downstream decoder has lost references and our heuristic
-            # gate didn't catch it (partial-tile concealment leaves
-            # whole-tile std looking healthy). Fire a FIR storm: all
-            # tiles get a fresh-IDR request so the next IDR closes the
-            # failure. Rate-limited to ≥3 s between bursts.
-            stuck = verdict in ("MOSTLY_GREY", "FROZEN/GREY", "NO_FRAMES")
+            # FIR-storm ONLY when the canvas is actually broken (flat/grey = lost
+            # references) — not on 0 fps alone. A healthy static frame reads 0 fps
+            # and is perfectly fine; storming IDRs there is futile and noisy.
+            # Partial-tile concealment that leaves whole-tile std looking healthy
+            # is caught by the grey-fraction check. Rate-limited to ≥3 s.
             now = time.monotonic()
+            # A gray/frozen CANVAS and gray/frozen CONTENT are identical pixels,
+            # so the pixel verdict alone can never be trusted to FIR — a gray
+            # desktop would loop forever. Concealment gray only happens for a
+            # REASON: a broken reference chain, which comes from packet loss, or a
+            # real browser decode error. So require a reliable signal — the
+            # source->iss loss counter grew recently, or the browser flagged a
+            # decode error — before treating the verdict as recoverable. On a
+            # clean stream (no loss, no error) gray is just content: never FIR.
+            cur_loss = getattr(self._session, "_lost_pkts", 0) if self._session else 0
+            if cur_loss > getattr(self, "_last_seen_loss", cur_loss):
+                self._last_browser_loss_t = now
+            self._last_seen_loss = cur_loss
+            recent_loss = (now - getattr(self, "_last_browser_loss_t", 0.0)) < 5.0
+            reliable = recent_loss or bool(msg.get("decoder_errored"))
+            stuck = reliable and verdict in ("MOSTLY_GREY", "FROZEN/GREY")
             if stuck:
                 self._stuck_streak = getattr(self, "_stuck_streak", 0) + 1
             else:
                 self._stuck_streak = 0
+            # The FIR-storm is needed at startup too: a viewer that connects after
+            # the burst missed its IDR and needs a fresh one to begin decoding. It
+            # just must be rate-limited to >=3s. The bug: the timestamp was only
+            # stamped on request_fir() SUCCESS, which raises before the stream is
+            # up, so the limit never engaged and it re-fired every tick (11 IDRs in
+            # 12s). Stamp it BEFORE the request so >=3s holds regardless.
             last_fir_t = getattr(self, "_last_browser_fir_t", 0.0)
             if (
-                self._stuck_streak >= 2
+                self._session is not None
+                and self._stuck_streak >= 2
                 and (now - last_fir_t) >= 3.0
             ):
+                self._last_browser_fir_t = now
                 log.warning(
-                    "browser reports %s for %ds — forcing IDR on all tiles",
-                    verdict, self._stuck_streak,
+                    "browser reports %s for %ds with recent packet loss — "
+                    "forcing IDR on all tiles", verdict, self._stuck_streak,
                 )
                 try:
                     self._session.request_fir()
-                    self._last_browser_fir_t = now
                 except Exception as e:
                     log.debug("request_fir from browser-stuck path failed: %s", e)
             return
@@ -958,8 +1408,53 @@ class WebTransportBridge:
                 self._session.input.key_event(
                     bool(msg.get("down")), int(msg["keysym"]),
                 )
+            elif kind == "resize":
+                self._handle_resize(int(msg["w"]), int(msg["h"]))
         except Exception as e:
             log.debug("input dispatch error: %s", e)
+
+    def _display_scale(self) -> float:
+        """Numeric display scale from --hidpi: auto/on → 2×, off → 1×, or a
+        custom float like 2.5. The browser advertises its window at
+        logical = physical/scale so the host draws the UI at `scale` while the
+        backing stays = the window's physical pixels (WYSIWYG bandwidth)."""
+        h = str(getattr(self._config, "hidpi", "auto") or "auto").strip().lower()
+        if h == "off":
+            return 1.0
+        if h in ("on", "auto"):
+            return 2.0
+        try:
+            return min(4.0, max(1.0, float(h)))
+        except ValueError:
+            return 2.0
+
+    def _handle_resize(self, w: int, h: int) -> None:
+        """The browser reported a new viewport size — re-advertise the host
+        display to match, so the stream is encoded at the window's resolution
+        instead of the host's full canvas (dynamic-resolution parity with the
+        desktop frontend; this is what makes the connect form's "Auto" actually
+        track the browser window). Clamp to sane bounds and de-dup: the client
+        debounces so it only sends the settled size once per resize gesture, so
+        no server-side throttle is needed beyond ignoring an unchanged size."""
+        if not self._config.dynamic_resolution:
+            return  # fixed --advertise: respect the user's explicit resolution
+        w = max(640, min(3840, w & ~1))
+        h = max(480, min(2160, h & ~1))
+        if (w, h) == getattr(self, "_last_resize_wh", None):
+            return
+        self._last_resize_wh = (w, h)
+        if self._session is not None:
+            try:
+                # The host makes the backing canvas w*scale; the browser already
+                # reported w = physical/scale (see index.html), so backing =
+                # the window's physical pixels (crisp 1:1). `scale` is the user's
+                # Display-scale (--hidpi); it sets the host UI size, and both ends
+                # MUST use the same value or the UI size / bandwidth are wrong.
+                self._session.send_dynamic_resolution(
+                    w, h, hidpi_scale=self._display_scale())
+                log.info("browser resize → re-advertising host display %dx%d", w, h)
+            except Exception as e:
+                log.debug("send_dynamic_resolution failed: %s", e)
 
 
 # ── wire envelope ────────────────────────────────────────────────────
@@ -1011,20 +1506,13 @@ def _cursor_envelope(width: int, height: int, hx: int, hy: int, rgba: bytes) -> 
             + hx.to_bytes(2, "big") + hy.to_bytes(2, "big") + rgba)
 
 
-def _detect_local_ip() -> str:
-    """Best-effort guess of an externally-routable LAN IP."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            return s.getsockname()[0]
-    except Exception:
-        return "localhost"
-
-
 # ── module entry ─────────────────────────────────────────────────────
 
-def run(config: SessionConfig, *, port: int = 4433, **_unused: object) -> int:
-    return WebTransportBridge(config, port=port).run()
+def run(config: SessionConfig, *, port: int = 4433,
+        trust_cert_for_safari: bool = False, **_unused: object) -> int:
+    return WebTransportBridge(
+        config, port=port, trust_cert_for_safari=trust_cert_for_safari,
+    ).run()
 
 
 __all__ = ["WebTransportBridge", "run"]

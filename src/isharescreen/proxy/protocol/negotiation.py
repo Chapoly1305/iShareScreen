@@ -77,7 +77,10 @@ class AdvertiseDims:
     """
     width: int = 1920
     height: int = 1080
-    hidpi_scale: int = 2   # 2 = Retina (backing 2× points); 1 = flat (backing == points)
+    # backing:point ratio. 2.0 = Retina (backing 2× points); 1.0 = flat. May be
+    # fractional (e.g. 2.5) — the mode table carries pixel & point dims
+    # independently, so any ratio is expressible on the wire.
+    hidpi_scale: float = 2.0
     width_mm: float = 300.0
     height_mm: float = 168.75  # proportional to 1920×1080
 
@@ -173,9 +176,11 @@ def build_0x1c(
     # Without bit 2 on the cmd=2 alt-session path, the agent bakes the
     # alt-user's cursor into the framebuffer at top-left and never
     # updates it — visible as a cursor stuck in the corner of every
-    # tile. We set bit 2 only for alt-session because the standard
-    # console-user path's cursor is expected to update via the encoder
-    # (the local mouse drives it).
+    # tile. We set bit 2 unconditionally for alt-session here, AND for the
+    # standard console-user path via the elif below (default on; disabled
+    # only by ISS_LEGACY_CURSOR=1). In both cases the local enc-1104 overlay
+    # renders the cursor, so the agent never bakes it into encoded frames —
+    # which is what keeps cursor motion from generating needless frames.
     config_flags = 3
     if alt_session:
         config_flags = (config_flags & ~2) | 4   # drop bit 1, set bit 2
@@ -187,17 +192,16 @@ def build_0x1c(
         # to the old "cursor baked into framebuffer" behaviour.
         config_flags |= 4
     # BIG-endian u32. DO NOT "correct" this to little-endian on the strength of
-    # screensharingd's disassembly alone — that is a trap. screensharingd loads
-    # this word at body+0x06 with an un-byteswapped `ldur w3, [body+6]`
-    # (sub_1000352ac @0x10003ce84) and forwards it to ScreensharingAgent as a
-    # SetMediaStreamConfiguration MIG argument. The do_not_send_cursor (bit
-    # 0x04) decision is made by the AGENT (sub_10001c7e4, `& 4`) AFTER the
-    # scalar crosses the MIG/NDR boundary, where it is byte-swapped — so the
-    # effective byte order at the test is the INVERSE of screensharingd's raw
-    # load. Empirically (test host 192.168.1.180): big-endian `00 00 00 07`
-    # makes the host honor do_not_send_cursor; little-endian `07 00 00 00`
-    # leaves it clear and the host bakes the cursor into the video → the
-    # double-cursor regression returns. The runtime behavior is authoritative.
+    # the host's framebuffer-config read alone — that is a trap. The host loads
+    # this word at body+0x06 un-byteswapped and forwards it to the streaming
+    # agent as a SetMediaStreamConfiguration argument. The do_not_send_cursor
+    # (bit 0x04) decision is made by the AGENT (`& 4`) AFTER the scalar crosses
+    # the IPC/NDR boundary, where it is byte-swapped — so the effective byte
+    # order at the agent is the INVERSE of the host's raw load. Empirically:
+    # big-endian `00 00 00 07` makes the host honor do_not_send_cursor;
+    # little-endian `07 00 00 00` leaves it clear and the host bakes the cursor
+    # into the video → the double-cursor regression returns. The runtime
+    # behavior is authoritative.
     struct.pack_into(">I", buf, 6, config_flags)
     struct.pack_into(">H", buf, 10, AS)
     struct.pack_into(">H", buf, 12, VS)
@@ -372,6 +376,41 @@ def _read_ss_prompt(sock: socket.socket) -> Optional[tuple[int, str]]:
     return flags, console_user
 
 
+def _peek_ss_prompt(sock: socket.socket, wait: float = 2.0) -> bool:
+    """Non-destructively test whether the daemon appended a SessionSelect
+    prompt after ServerInit. The daemon emits it only when the auth user ≠
+    the console user (i.e. someone else is logged in), so its presence is the
+    auto-detect signal — no pre-set --share-console/--alt-session needed.
+
+    Uses MSG_PEEK: when a prompt is absent (the auth user IS the console
+    user), the next bytes stay in the socket buffer for the normal
+    post-ServerInit handshake, so always calling this is safe."""
+    sock.settimeout(wait)
+    try:
+        peek = sock.recv(4, socket.MSG_PEEK)
+    except (TimeoutError, socket.timeout, OSError):
+        return False
+    finally:
+        sock.settimeout(15)
+    return peek == _SS_MAGIC
+
+
+def _peek_ss_console_user(sock: socket.socket, wait: float = 2.0) -> str:
+    """Non-destructively read the console user's name from the SessionSelect
+    prompt (offset 0xc, null-terminated) so a launcher prompt can name them.
+    Returns '' if absent/short; the bytes stay buffered for _read_ss_prompt."""
+    sock.settimeout(wait)
+    try:
+        peek = sock.recv(76, socket.MSG_PEEK)
+    except (TimeoutError, socket.timeout, OSError):
+        return ""
+    finally:
+        sock.settimeout(15)
+    if len(peek) < 0xd or peek[:4] != _SS_MAGIC:
+        return ""
+    return peek[0xc:].split(b"\x00", 1)[0].decode("utf-8", "replace")
+
+
 def _phase_session_select(
     sock: socket.socket,
     *,
@@ -538,10 +577,17 @@ APPLE_HP_MSG_AUTO_FRAMEBUFFER_UPDATE = 0x09
 def build_auto_framebuffer_update(width: int, height: int) -> bytes:
     """Apple HP AutoFrameBufferUpdate (msg 0x09) — a 16-byte fixed record.
 
+    NOTE: currently unused. Arming this message makes the daemon's
+    `SendFrameBuffer` loop *free-run* TCP-side updates, which pulls full
+    video frames on a static screen (~800 pps idle). Our RE notes confirm
+    msg 0x09 is NOT a cursor re-arm — the enc-1104 cursor works without it
+    (the periodic 1x1 incremental FBU poll re-arms the cursor sender). Kept
+    here only for protocol reference; do not call it on the idle path.
+
     This is the message that arms the daemon's `SendFrameBuffer` loop to
     *free-run* TCP-side updates (including the cursor pseudo-encoding 1104
     SELECTs) without a fresh FramebufferUpdateRequest per frame. The native
-    client (applehpdebug.c::send_auto_framebuffer_update) re-sends it — paired
+    client re-sends it — paired
     with a non-incremental FramebufferUpdateRequest — at startup and at every
     AppleDisplayLayout (0x451) transition, which is what keeps the cursor
     shape updating after a login/lock/agent switch.
@@ -599,29 +645,8 @@ def _phase_media_offer(
         except OSError as e:
             log.warning("msg 0x03 send failed: %s", e)
 
-    def _arm_auto_fbu(cv: tuple[int, int, int]) -> None:
-        # Arm the daemon's free-running TCP update sender once we know the
-        # canvas. The native client pairs a non-incremental FBU request
-        # (sent above) with AutoFrameBufferUpdate (0x09) so the cursor
-        # pseudo-encoding (enc 1104) SELECTs free-run without a per-frame
-        # request. Use backing/pixel dims for the region, like the native
-        # (applehpdebug.c uses apple_hp_backing_width/height).
-        if os.environ.get("ISS_LEGACY_CURSOR") == "1":
-            return
-        if not (cv[0] and cv[1]):
-            return
-        try:
-            sock.sendall(cipher.encrypt_message(
-                build_auto_framebuffer_update(cv[0], cv[1])
-            ))
-            log.info("msg 0x09 AutoFrameBufferUpdate sent (%dx%d, cursor re-arm)",
-                     cv[0], cv[1])
-        except OSError as e:
-            log.warning("msg 0x09 send failed: %s", e)
-
     canvas = _read_video_answer(sock, cipher, leftover_msgs)
     if canvas[0] and canvas[1]:
-        _arm_auto_fbu(canvas)
         return keys, canvas
 
     for attempt in range(_DEGENERATE_RETRY_LIMIT):
@@ -638,7 +663,6 @@ def _phase_media_offer(
         canvas = _read_video_answer(sock, cipher, leftover_msgs)
         if canvas[0] and canvas[1]:
             break
-    _arm_auto_fbu(canvas)
     return keys, canvas
 
 
@@ -658,6 +682,7 @@ def connect_and_negotiate(
     video_offer: Optional[bytes] = None,
     share_console: bool = False,
     alt_session: bool = False,
+    on_session_choice=None,   # callable () -> "share_console" | "alt_session"
     recorder=None,
 ) -> NegotiationResult:
     """Drive the full handshake. The returned socket is in encrypted-RFB
@@ -693,7 +718,24 @@ def connect_and_negotiate(
                                 recorder)
     server_w, server_h = _phase_client_init(sock)
 
-    if share_console or alt_session:
+    # Auto-detect the SessionSelect prompt rather than requiring a pre-set
+    # flag: the daemon emits it only when someone other than the auth user is
+    # logged in. Peek non-destructively — if absent, the bytes stay buffered
+    # for the normal handshake below; if present, route by flag (default
+    # share-console = view their session; --alt-session = log in separately).
+    if _peek_ss_prompt(sock):
+        # Neither mode was forced and the launcher gave us a way to ask the
+        # user (a different user is logged in at the host's console): prompt
+        # now for share-console vs alt-session and route on their answer.
+        if not alt_session and not share_console and on_session_choice is not None:
+            console_user = _peek_ss_console_user(sock)
+            try:
+                choice = on_session_choice(console_user)
+            except Exception:
+                log.exception("session-choice prompt failed; defaulting to share")
+                choice = "share_console"
+            alt_session = (choice == "alt_session")
+            log.info("session-select: %r chose %s", console_user, choice)
         # Apple Screen Sharing's two-TCP convention for the cmd=2 alt-session
         # path: open conn1, do SRP, see the SessionSelect prompt, close
         # conn1, then open a fresh conn2 and redo SRP from scratch

@@ -12,3 +12,10 @@ tools/*
 *.pcap
 *.pcapng
 *.key
+*.log
+
+# macOS Finder metadata
+.DS_Store
+
+# Local agent / editor session scratch
+.claude/

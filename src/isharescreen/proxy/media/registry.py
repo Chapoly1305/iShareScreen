@@ -50,17 +50,10 @@ class DecoderSpec:
 
 # ── availability probes (delegate to hwcaps; lazy import) ────────────────
 
-def _libav_hw() -> bool:
-    """Generic libav hwaccel HEVC 4:4:4 (d3d11va RExt / vaapi / cuda / VT)."""
-    from .hwcaps import libav_hevc444_hwdecode
-    return libav_hevc444_hwdecode()
-
-
-def _qsv_hw() -> bool:
-    """Intel Quick Sync HEVC 4:4:4 — probed independently of `_libav_hw` so the
-    registry can prefer this vendor decoder when both are available."""
-    from .hwcaps import qsv_hevc444_hwdecode
-    return qsv_hevc444_hwdecode()
+def _hevc444_method() -> Optional[str]:
+    """'qsv' | 'libav' | None — how HEVC 4:4:4 can be HW-decoded here."""
+    from .hwcaps import hevc444_decode_method
+    return hevc444_decode_method()
 
 
 def _vt_available() -> bool:
@@ -99,7 +92,6 @@ def _build_libav_hevc(num_tiles, *, enable_quality_gate=True, on_frame_published
 
 
 def _build_libav_hevc_sw(num_tiles, *, enable_quality_gate=True, on_frame_published=None, **_):
-    # Forced software, regardless of the caller's prefer_hwaccel.
     from .hevc import HevcDecoder
     return HevcDecoder(num_tiles=num_tiles, enable_quality_gate=enable_quality_gate,
                        on_frame_published=on_frame_published, prefer_hwaccel=False)
@@ -113,42 +105,43 @@ def _build_avc(num_tiles, *, enable_quality_gate=True, on_frame_published=None,
 
 
 # ── the registry ─────────────────────────────────────────────────────────
-# Priority ladder (higher = preferred within a codec):
-#   100  vt-hevc444        vendor-specific HW (macOS)
-#    90  qsv-hevc444       vendor-specific HW (Intel, Windows/Linux) — the ONLY
-#                          working HW path for HEVC 4:4:4 on Windows today.
-#                          d3d11va/d3d12va reject 4:4:4 RExt packets (EPERM on
-#                          avcodec_send_packet) because PyAV's bundled FFmpeg
-#                          (8.1.1) does not contain the HEVC RExt DXVA GUID patch
-#                          (submitted to ffmpeg-devel 2024-11, not yet merged).
-#                          When a future PyAV/FFmpeg release adds those GUIDs,
-#                          libav-hevc444 will start passing its probe on Windows
-#                          and can be promoted — but qsv-hevc444 should remain
-#                          preferred (vendor path, lower latency overhead).
-#    60  libav-hevc444     generic libav HW hwaccel — vaapi/cuda on Linux,
-#                          VideoToolbox hwaccel fallback on macOS. On Windows,
-#                          probe currently fails (see note above); this slot is
-#                          reserved for future d3d11va RExt support.
-#    20  libav-hevc444-sw  SOFTWARE HEVC 4:4:4 — last resort when HEVC is
-#                          explicitly requested. Slow for live 4-tile streams
-#                          but preserves full 4:4:4 chroma fidelity.
-#     1  libav-avc420      H.264 4:2:0 — experimental; absolute last resort.
+# Connection ladder (best-first). The cross-codec auto path (cli.py) offers
+# HEVC whenever any HEVC 4:4:4 HW decoder is available here, else H.264; within
+# a codec, build_best() picks by (hardware-before-software, priority):
+#   100  vt-hevc444        macOS native VideoToolbox HW.
+#    60  libav-hevc444     generic libav HW hwaccel — discrete GPUs: NVIDIA cuda,
+#                          AMD/Intel vaapi (Linux) / d3d11va RExt (Windows).
+#                          Preferred over QSV: discrete > integrated. On Windows
+#                          its 4:4:4 probe currently FAILS (PyAV's FFmpeg 8.1.1
+#                          lacks the HEVC RExt DXVA GUID patch, submitted to
+#                          ffmpeg-devel 2024-11, unmerged) → availability gating
+#                          skips it and QSV is used instead. Promotes itself once
+#                          a future PyAV/FFmpeg ships those GUIDs.
+#    50  qsv-hevc444       Intel Quick Sync (integrated). Lower than generic HW
+#                          (weaker than discrete), but the ONLY working HEVC
+#                          4:4:4 HW path on Windows today (see above).
+#    50  libav-avc420      H.264 4:2:0 — libav + platform hwaccel, SW floor
+#                          (covers NVIDIA/AMD/Intel; HW by default, opt back to
+#                          SW via ISS_AVC_HWACCEL=0). The H.264 rung of the
+#                          cross-codec ladder.
+#    20  libav-hevc444-sw  SOFTWARE HEVC 4:4:4 — manual override only (slow for
+#                          live 4-tile streams); not on the auto ladder.
 _REGISTRY: list[DecoderSpec] = [
     DecoderSpec("vt-hevc444", "hevc", "444", ("darwin",), "hardware", 100,
                 available=lambda: _vt_available(), build=_build_vt,
                 note="direct VideoToolbox (VTDecompressionSession, no libav RPS layer)"),
-    DecoderSpec("qsv-hevc444", "hevc", "444", ("win32", "linux"), "hardware", 90,
-                available=lambda: _qsv_hw(), build=_build_qsv,
-                note="Intel Quick Sync (hevc_qsv) — only working HW HEVC 4:4:4 path on Windows; preferred over generic libav on all platforms"),
     DecoderSpec("libav-hevc444", "hevc", "444", ("*",), "hardware", 60,
-                available=lambda: _libav_hw(), build=_build_libav_hevc,
-                note="libav generic hwaccel — vaapi/cuda on Linux, VT-hwaccel on macOS; Windows d3d11va RExt pending FFmpeg patch (ffmpeg-devel 2024-11)"),
+                available=lambda: _hevc444_method() == "libav", build=_build_libav_hevc,
+                note="libav generic hwaccel — d3d11va RExt / vaapi / cuda (VT-hwaccel fallback on mac)"),
+    DecoderSpec("qsv-hevc444", "hevc", "444", ("win32", "linux"), "hardware", 50,
+                available=lambda: _hevc444_method() == "qsv", build=_build_qsv,
+                note="Intel Quick Sync (hevc_qsv) — fallback where generic DXVA lacks 4:4:4"),
     DecoderSpec("libav-hevc444-sw", "hevc", "444", ("*",), "software", 20,
                 available=lambda: True, build=_build_libav_hevc_sw,
-                note="libav SOFTWARE HEVC 4:4:4 (CPU; slow for 4-tile live — last-resort fallback)"),
-    DecoderSpec("libav-avc420", "avc", "420", ("*",), "hardware", 1,
+                note="libav software HEVC 4:4:4 — last resort; slow for live 4-tile streams"),
+    DecoderSpec("libav-avc420", "avc", "420", ("*",), "hardware", 50,
                 available=lambda: True, build=_build_avc,
-                note="libav H.264 4:2:0 (EXPERIMENTAL) — platform hwaccel + SW fallback, AMD POC-wrap workaround"),
+                note="libav H.264 + platform hwaccel (HW by default; SW fallback, opt back to SW via ISS_AVC_HWACCEL=0)"),
 ]
 
 
@@ -191,9 +184,8 @@ def candidates(codec: str, chroma: Optional[str] = None) -> list[DecoderSpec]:
 
 
 def can_decode(codec: str, chroma: str, *, hardware_only: bool = False) -> bool:
-    """True if any available decoder here handles (codec, chroma). With
-    `hardware_only`, ignores software decoders — used by codec negotiation so a
-    GPU lacking HW 4:4:4 falls to AVC rather than slow CPU HEVC."""
+    """True if any available decoder here handles (codec, chroma). Drives codec
+    negotiation. Pass hardware_only=True to exclude software decoders."""
     specs = candidates(codec, chroma)
     if hardware_only:
         specs = [s for s in specs if s.kind == "hardware"]
@@ -239,38 +231,18 @@ def build_best(codec: str, *, override: Optional[str], num_tiles: int, **opts):
 
 # ── codec negotiation (moved here from hwcaps to break the import cycle) ──
 
-def _codec_implied_by_decoder(decoder_name: str) -> Optional[str]:
-    """Return the codec ('hevc' or 'avc') implied by a specific decoder name,
-    or None if the name is 'auto'/empty/unknown. Used by resolve_codec so that
-    forcing --decoder libav-avc420 also drives codec negotiation to 'avc',
-    preventing a mismatch where the server sends HEVC but the decoder is AVC."""
-    if not decoder_name or decoder_name in ("auto", ""):
-        return None
-    resolved = _ALIASES.get(decoder_name, decoder_name)
-    for s in _REGISTRY:
-        if s.name == resolved:
-            return s.codec
-    return None
-
-
 def resolve_codec(choice: str) -> str:
     """Resolve a `--codec` value to a concrete 'hevc' / 'avc'. 'auto' offers
-    HEVC when any 4:4:4 decoder is available here, else H.264 4:2:0.
+    HEVC when any 4:4:4 hardware decoder is available, else H.264 4:2:0.
 
-    Priority: HW HEVC 4:4:4 > AVC 4:2:0. Software HEVC 4:4:4 remains available
-    when HEVC is requested explicitly, but does not drive auto negotiation.
+    Priority: HW HEVC 4:4:4 > AVC 4:2:0. Software HEVC 4:4:4 is available
+    when HEVC is requested explicitly but does not drive auto negotiation.
 
-    When codec='auto', ISS_DECODER is also consulted: if the user forced a
-    decoder that only handles one codec (e.g. libav-avc420 → AVC), the codec
-    negotiation follows suit so the server sends the right stream."""
+    Codec and decoder are orthogonal: call sites that derive a codec from a
+    decoder name (e.g. the TUI) must pass the resolved codec explicitly via
+    ISS_VIDEO_CODEC / --codec rather than relying on this function."""
     if choice != "auto":
         return choice
-    import os as _os
-    _iss_dec = _os.environ.get("ISS_DECODER", "").strip().lower()
-    _implied = _codec_implied_by_decoder(_iss_dec)
-    if _implied:
-        log.info("codec=auto: ISS_DECODER=%s implies codec=%s", _iss_dec, _implied)
-        return _implied
     if can_decode("hevc", "444", hardware_only=True):
         log.info("codec=auto: a HEVC 4:4:4 hardware decoder is available -> hevc")
         return "hevc"

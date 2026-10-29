@@ -9,7 +9,6 @@ per-call dynamic fields: session_id, timestamp, and the CallID UUID.
 from __future__ import annotations
 
 import logging
-import os
 import platform
 import plistlib
 import secrets
@@ -31,11 +30,25 @@ def tiles_per_frame() -> int:
     macOS honors it, so this is also the number of video SSRCs/tiles to expect
     in the stream. Default 4 = Apple SS.app's byte-identical offer (4 parallel
     H.264 sub-streams); ISS_TILES_PER_FRAME=1 asks for a single picture per
-    frame (browser-WebCodecs-decodable, no cross-tile references)."""
+    frame (browser-WebCodecs-decodable, no cross-tile references).
+
+    Codec-dependent default: AVC defaults to 1, HEVC to 4. Apple's 4-tile
+    stream uses CROSS-TILE references (a tile's P-frames reference POCs owned
+    by other tiles). Our HEVC path decodes through native VideoToolbox, which
+    matches Apple's own reference model and follows that structure fine. The
+    AVC path decodes the four interleaved H.264 sub-streams in one shared
+    libav context, which resolves the cross-tile references to the wrong
+    tile's pictures — no decode error, so the corrupted frame is published and
+    drift/ghosting ("fleas") accumulates under motion. Requesting a single
+    self-contained picture per frame removes the cross-tile dimension so libav
+    decodes cleanly (the same workaround the browser frontend already uses).
+    An explicit ISS_TILES_PER_FRAME always wins."""
+    codec = _os.environ.get("ISS_VIDEO_CODEC", "").lower()
+    default = "1" if codec == "avc" else "4"
     try:
-        return max(1, int(_os.environ.get("ISS_TILES_PER_FRAME", "4")))
+        return max(1, int(_os.environ.get("ISS_TILES_PER_FRAME", default)))
     except ValueError:
-        return 4
+        return 1 if codec == "avc" else 4
 
 
 # ── protobuf helpers ──────────────────────────────────────────────────
@@ -102,23 +115,36 @@ def _build_audio_f9_entry(f1: int, f2: int, f3: Optional[int]) -> bytes:
 _APPLE_AUDIO_F9 = b"".join(_build_audio_f9_entry(*t) for t in _AUDIO_F9_TIERS)
 
 
-# ── HEVC + AVC feature-list strings ───────────────────────────────────
-#
-# Each video codec bank carries a semicolon-delimited feature-list string
-# (FLS, field 3). The codec a bank represents is keyed off its RTP payload
-# *number* (field 1) by the host: PT 123 → H.264/AVC, PT 100 → HEVC RExt
-# 4:4:4. `LTR;` advertises long-term-reference capability (LTRP on by default).
-_AVC_PARAMS = (
+# ── HEVC + AVC parameter strings ──────────────────────────────────────
+
+# `LTR;` advertises the long-term-reference capability. LTRP is ON by default
+# for HEVC (set ISS_LTRP=0 to disable). It must stay OFF for AVC: the H.264
+# decoder has no clean DONL to acknowledge, so advertising the feature there is
+# a protocol mismatch. Live diagnostics showed that Apple can still use its own
+# H.264 long-term references with LTRP disabled; SSRC-generation mixing, not
+# this capability bit alone, caused the observed 17-picture DPB overflow.
+import os as _os
+_HEVC_PARAMS_LTR = (
     b"FLS;MS:-1;LF:-1;LTR;CABAC;POS:0;EOD:1;HTS:2;RR:3;"
     b"AR:16/9,5/8;XR:16/9,5/8;"
 )
-_HEVC_PARAMS = (
-    (b"FLS;MS:-1;LF:-1;LTR;CABAC;POS:0;EOD:1;HTS:2;RR:3;"
-     b"AR:16/9,5/8;XR:16/9,5/8;")
-    if _os.environ.get("ISS_LTRP", "1") != "0" else
-    (b"FLS;MS:-1;LF:-1;CABAC;POS:0;EOD:1;HTS:2;RR:3;"
-     b"AR:16/9,5/8;XR:16/9,5/8;")
+_HEVC_PARAMS_NO_LTR = (
+    b"FLS;MS:-1;LF:-1;CABAC;POS:0;EOD:1;HTS:2;RR:3;"
+    b"AR:16/9,5/8;XR:16/9,5/8;"
 )
+_AVC_PARAMS = (
+    b"FLS;LF:-1;POS:5;EOD:1;HTS:2;RR:3;POSE:4;"
+    b"AR:16/9,5/8;XR:16/9,5/8;"
+)
+
+
+def _ltrp_enabled_for_codec(codec: str) -> bool:
+    """LTRP is implemented end-to-end only for HEVC.
+
+    Evaluate this at offer-build time rather than module import time: the CLI
+    resolves ``--codec`` after importing the protocol modules.
+    """
+    return codec != "avc" and _os.environ.get("ISS_LTRP", "1") != "0"
 
 
 def _build_remote_endpoint_info() -> bytes:
@@ -164,56 +190,77 @@ _REMOTE_ENDPOINT_INFO = _build_remote_endpoint_info()
 
 # ── offer construction ───────────────────────────────────────────────
 
-def _build_mediablob(mode: int, session_id: int, timestamp: int) -> bytes:
+# Audio-description field4 gate values (see the mode-8 branch below for the
+# full RE note). Apple's default 24191 selects the single system-audio tier;
+# a sub-floor value makes the server send no audio, which is how --no-audio
+# turns audio off on the wire.
+_AUDIO_F4_ON = 24191
+_AUDIO_F4_OFF = 1000
+
+
+def _build_mediablob(
+    mode: int, session_id: int, timestamp: int, *, audio_enabled: bool = True,
+) -> bytes:
     """Build the MediaBlob protobuf. mode 7 = video, mode 8 = audio. Output
-    matches Apple's createOffer modulo the dynamic fields."""
+    matches Apple's createOffer modulo the dynamic fields. `audio_enabled`
+    only affects mode 8: when False, the audio-stream gate (field4) is set
+    below the server's tier floor so no audio is transmitted."""
     if mode == 7:
-        # Per-resolution VideoRuleCollection sub-message. Field map CONFIRMED
-        # against AVConference.arm64e (15.7.5/24G624): the readFrom: parser's
-        # IVAR-offset table at 0x1ecd7a140 maps each wire field to an IVAR, and
-        # the accessors + dictionaryRepresentation range-checks pin the names:
-        #   f1 = transport       enum, validated != 1 && != 2  (1=wifi, 2=cellular)
-        #   f2 = operation       enum, validated != 1 && != 2  (1=encode, 2=decode)
-        #   f3 = formats         the (width,fps) bitmap; NOT range-checked
-        #   f4 = preferredFormat varint
-        # 0xC3C3 is the formats bitmap, so it belongs in f3 — exactly as below.
-        # Do NOT "move" it to f1: f1 is the transport enum, and any value other
-        # than 1/2 makes selectBestVideoRuleForTransport: find no matching rule
-        # and breaks video. (f1/f3 are easy to read swapped from the parser; the
-        # IVAR table is authoritative.) The two variants differ only in
-        # operation (encode vs decode). Confirmed byte-for-byte against a
-        # decrypted NATIVE Screen Sharing 5.3 offer: AVC bank = 4 rules
-        # [op1,op2,op1,op2], HEVC bank = 2 rules [op1,op2], all transport=1,
-        # formats=0xC3C3 — i.e. native does NOT emit transport=2 (cellular)
-        # rules for screen share, so this layout is verbatim, not a deviation.
+        # Codec selection is consulted before building the banks because the
+        # bank that yields AVC uses the HEVC-labelled parameter string (Apple's
+        # response mapping is inverted; see below). LTR therefore has to be
+        # removed from that string as well as from structured field 7.
+        _codec = _os.environ.get("ISS_VIDEO_CODEC", "both").lower()
+        ltrp_on = _ltrp_enabled_for_codec(_codec)
+        hevc_params = _HEVC_PARAMS_LTR if ltrp_on else _HEVC_PARAMS_NO_LTR
         res_entry = _field_varint(1, 1) + _field_varint(2, 1) + _field_varint(3, 50115) + _field_varint(4, 0)
         res_entry_alt = _field_varint(1, 1) + _field_varint(2, 2) + _field_varint(3, 50115) + _field_varint(4, 0)
-        # AVC/H.264 bank — RTP PT 123. (4 res entries + field4=1, verbatim
-        # from Apple's createOffer.) Host has only H.264 Main/ConstrainedBaseline
-        # → always 4:2:0.
-        avc_bank = (
+        hevc_bank = (
             _field_varint(1, 123)
             + _field_bytes(2, res_entry) + _field_bytes(2, res_entry_alt)
             + _field_bytes(2, res_entry) + _field_bytes(2, res_entry_alt)
-            + _field_bytes(3, _AVC_PARAMS)
+            + _field_bytes(3, hevc_params)
             + _field_varint(4, 1)
         )
-        # HEVC RExt 4:4:4 bank — RTP PT 100. (2 res entries + field4=14.)
-        hevc_bank = (
+        avc_bank = (
             _field_varint(1, 100)
             + _field_bytes(2, res_entry) + _field_bytes(2, res_entry_alt)
-            + _field_bytes(3, _HEVC_PARAMS)
+            + _field_bytes(3, _AVC_PARAMS)
             + _field_varint(4, 14)
         )
-        # ISS_VIDEO_CODEC selects codec bank(s). LTRP on by default (ISS_LTRP=0 to disable).
-        ltrp_on = _os.environ.get("ISS_LTRP", "1") != "0"
+        # VideoSettings fields (per CoreDevice media-stream-offer RE):
+        #   2 = allowRTCPFB, 6 = tilesPerFrame, 7 = ltrpEnabled.
+        # tilesPerFrame: macOS HONORS this — we request 4, so the server tiles
+        # the screen into 4 horizontal H.264 sub-streams (which a native ffmpeg
+        # decoder handles but browser WebCodecs can't, due to cross-tile
+        # references). ISS_TILES_PER_FRAME=1 requests a SINGLE picture per frame
+        # — decodable by any standard decoder. (iOS CoreDevice defaults to 1.)
         _tiles_per_frame = tiles_per_frame()
-        _codec = _os.environ.get("ISS_VIDEO_CODEC", "both").lower()
+        # Codec selection. Default "both" is byte-identical to Apple's native
+        # offer (HEVC 4:4:4 + the H.264 4:2:0 fallback bank). ISS_VIDEO_CODEC=avc
+        # advertises ONLY the H.264 bank (codec const 100 = H.264 per the GFT
+        # plist) so the server sends H.264 4:2:0 — which hardware-decodes on the
+        # GPUs that can't HW-decode HEVC 4:4:4. This is a TEST gate: confirm the
+        # server actually switches codecs (NAL types in the profile snapshot)
+        # before wiring a real H.264 decode path. ISS_VIDEO_CODEC=hevc forces
+        # HEVC-only.
+        # DANGER — the bank variables are named for the PARAMS they carry, but
+        # the server's response is INVERTED from that. Live testing PROVED:
+        #   hevc_bank (field1=123, HEVC params) → server sends H.264 4:2:0
+        #   avc_bank  (field1=100, AVC params)  → server sends HEVC 4:4:4
+        # So selecting "the bank named for the codec you want" is WRONG and
+        # was the 84f475e regression (AVC request → HEVC stream → burst starved).
+        # Select by OUTPUT via these aliases; do NOT collapse them back to the
+        # name-matching form.
+        bank_yields_h264 = hevc_bank   # field1=123
+        bank_yields_hevc = avc_bank    # field1=100
         if _codec == "avc":
-            _codec_banks = _field_bytes(3, avc_bank)    # AVC bank, PT 123
+            _codec_banks = _field_bytes(3, bank_yields_h264)
         elif _codec == "hevc":
-            _codec_banks = _field_bytes(3, hevc_bank)   # HEVC bank, PT 100
+            _codec_banks = _field_bytes(3, bank_yields_hevc)
         else:
+            # "both" = Apple's byte-identical order (123 then 100); server picks
+            # its preferred (HEVC 4:4:4) — the default native path.
             _codec_banks = _field_bytes(3, hevc_bank) + _field_bytes(3, avc_bank)
         desc = (
             _field_varint(1, session_id) + _field_varint(2, 1 if ltrp_on else 0)
@@ -224,9 +271,25 @@ def _build_mediablob(mode: int, session_id: int, timestamp: int) -> bytes:
         )
         desc_field = _field_bytes(5, desc)
     elif mode == 8:
+        # field4 is the viewer's requested audio bitrate — Apple's
+        # `preferredMediaBitRate` (reversed from AVConference). The host parses
+        # it into the negotiated AVCAudioStreamConfig and feeds it to
+        # `VCAudioTierPicker tierForAudioBitrate:`, which selects an AAC-ELD
+        # tier. For screen-share system audio there is effectively ONE tier
+        # (~21 kbps), so any value above its floor gives a flat 21 kbps (Apple's
+        # own client sends 24191); this is NOT a proportional bitrate. But a
+        # value BELOW the tier floor makes the picker find "no corresponding
+        # tier" and the host sends no audio (~0.4 kbps residual). A live sweep
+        # put the floor at ~5 kbps (<=4000 = off, >=6000 = on). This is the only
+        # negotiated audio knob: the audio section is mandatory (omitting it
+        # degenerates negotiation) and screen-share audio has no direction/enable
+        # field, so honoring --no-audio means requesting a sub-floor bitrate.
+        # ISS_AUDIO_F4 overrides for testing.
+        _default_f4 = _AUDIO_F4_ON if audio_enabled else _AUDIO_F4_OFF
+        _af4 = int(_os.environ.get("ISS_AUDIO_F4", str(_default_f4)))
         desc = (
             _field_varint(1, session_id) + _field_varint(2, 0)
-            + _field_varint(3, 0) + _field_varint(4, 24191)
+            + _field_varint(3, 0) + _field_varint(4, _af4)
             + _field_varint(5, 0) + _field_varint(6, 0)
         )
         desc_field = _field_bytes(3, desc)
@@ -244,14 +307,17 @@ def _build_mediablob(mode: int, session_id: int, timestamp: int) -> bytes:
     )
 
 
-def create_offers() -> tuple[bytes, bytes]:
+def create_offers(*, audio_enabled: bool = True) -> tuple[bytes, bytes]:
     """Generate fresh (video, audio) offer plists. Each call produces a new
-    session_id, timestamp, and CallID UUID."""
+    session_id, timestamp, and CallID UUID. `audio_enabled=False` builds an
+    audio offer that negotiates the stream (the daemon requires the section)
+    but gates the server's audio transmitter off — see `_build_mediablob`."""
 
     def _plist(mode: int) -> bytes:
         session_id = secrets.randbits(32)
         timestamp = time.time_ns()
-        blob = _build_mediablob(mode, session_id, timestamp)
+        blob = _build_mediablob(
+            mode, session_id, timestamp, audio_enabled=audio_enabled)
         plist = {
             "avcMediaStreamOptionRemoteEndpointInfo": _REMOTE_ENDPOINT_INFO,
             "avcMediaStreamNegotiatorMode": mode,

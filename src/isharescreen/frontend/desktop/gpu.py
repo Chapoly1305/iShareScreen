@@ -43,13 +43,21 @@ struct VsOut {
 // uv_scale maps the viewport's [0,1] sampling range onto just the
 // decoded-content sub-region of the LUMA texture, cropping out any black
 // padding the encoder left when the real frame is smaller than the
-// allocated canvas. chroma_scale is uv_scale shrunk by the chroma
-// subsample ratio (== uv_scale for 4:4:4; half for 4:2:0), so the shader
-// samples the half-res chroma in the top-left sub-region and the bilinear
-// sampler upsamples it to luma resolution. (1,1) = sample the whole texture.
+// allocated canvas. (1,1) = sample the whole texture.
+// chroma_scale is uv_scale shrunk by the chroma subsample ratio (== uv_scale
+// for 4:4:4; half for 4:2:0). H.264/AVC is 4:2:0, so its half-res chroma is
+// written into the top-left of the full-size U/V textures; chroma_scale makes
+// the shader sample just that sub-region and the bilinear sampler upsamples
+// chroma to luma resolution — no CPU 4:2:0→4:4:4 upsample needed.
+// uv_offset shifts the sampling origin so we can show an arbitrary sub-rect of
+// the canvas (not just the top-left content crop): used to present ONE host
+// monitor out of a combined multi-display canvas (--display N). Default (0,0)
+// samples from the top-left, i.e. the whole content — unchanged behavior.
 struct Uniforms {
     uv_scale: vec2<f32>,
+    uv_offset: vec2<f32>,
     chroma_scale: vec2<f32>,
+    chroma_offset: vec2<f32>,
 };
 @group(0) @binding(4) var<uniform> U: Uniforms;
 
@@ -80,8 +88,8 @@ fn vs(@builtin(vertex_index) i: u32) -> VsOut {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    let luv = in.uv * U.uv_scale;
-    let cuv = in.uv * U.chroma_scale;
+    let luv = in.uv * U.uv_scale + U.uv_offset;
+    let cuv = in.uv * U.chroma_scale + U.chroma_offset;
     let y  = textureSample(y_tex, samp, luv).r;
     let cb = textureSample(u_tex, samp, cuv).r - 0.5;
     let cr = textureSample(v_tex, samp, cuv).r - 0.5;
@@ -94,7 +102,8 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 
 
 # Biplanar variant: chroma comes from ONE rg8unorm texture carrying the
-# interleaved UV plane verbatim (Apple nv24 `v is None` passthrough). Texel
+# interleaved UV plane verbatim (Apple nv24 `v is None` passthrough — the
+# native VideoToolbox decoder and libav's nv24 path both emit it). Texel
 # .r = Cb (U), .g = Cr (V). Deinterleaving here — a free GPU texture fetch —
 # instead of on the CPU removes the single biggest cost in the live decode
 # pipeline (~half a core at 4-tile/60fps; see hevc.py _LEGACY_CHROMA). Same
@@ -104,7 +113,13 @@ struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
 };
-struct Uniforms { uv_scale: vec2<f32>, chroma_scale: vec2<f32>, };
+// Shares the same uniform buffer as the planar pipeline; reads only the first
+// two vec2s (uv_scale, uv_offset). Biplanar luma+chroma sample at the same uv,
+// so no separate chroma_scale/offset is needed here.
+struct Uniforms {
+    uv_scale: vec2<f32>,
+    uv_offset: vec2<f32>,
+};
 @group(0) @binding(3) var<uniform> U: Uniforms;
 
 @vertex
@@ -131,10 +146,9 @@ fn vs(@builtin(vertex_index) i: u32) -> VsOut {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    let luv = in.uv * U.uv_scale;
-    let cuv = in.uv * U.chroma_scale;
-    let y  = textureSample(y_tex, samp, luv).r;
-    let c  = textureSample(uv_tex, samp, cuv);
+    let uv = in.uv * U.uv_scale + U.uv_offset;
+    let y  = textureSample(y_tex, samp, uv).r;
+    let c  = textureSample(uv_tex, samp, uv);
     let cb = c.r - 0.5;
     let cr = c.g - 0.5;
     let r = y + 1.5748   * cr;
@@ -191,20 +205,18 @@ class Renderer:
         self._device = device
         self._w = canvas_w
         self._h = canvas_h
-        # Real decoded-content extent within the canvas textures, grown
-        # as tiles upload. 0 until the first tile lands (content_dims
-        # then falls back to the full canvas). Lets draw() crop the
-        # black texture padding and letterbox the real frame.
+
+        # Real decoded-content extent within the canvas textures, grown as
+        # tiles upload. 0 until the first tile lands (content_dims then
+        # falls back to the full canvas). Lets draw() crop the black texture
+        # padding and letterbox the real frame.
         self._content_w = 0
         self._content_h = 0
-
-        # Chroma subsample ratio (chroma_dims / luma_dims), locked from the
-        # first uploaded tile. 1.0 = 4:4:4 (Apple HEVC nv24 / yuv444p);
-        # 0.5 = 4:2:0 (H.264/AVC nv12 / yuv420p). Feeds the `chroma_scale`
-        # uniform so the shader samples half-res chroma with GPU bilinear
-        # upsampling instead of a CPU swscale 4:2:0→4:4:4 pass.
-        self._chroma_rw = 1.0
-        self._chroma_rh = 1.0
+        # Diagnostics: last uv_scale written + per-tile upload extents, so the
+        # render-geom trace can show WHERE decoded rows actually land (the outer
+        # surface/canvas dims look healthy even when tile packing is wrong).
+        self._dbg_uv = (1.0, 1.0)
+        self._dbg_tiles: dict = {}
 
         # Two chroma layouts are supported and chosen per session from the
         # first uploaded tile (see `upload_tile`):
@@ -212,10 +224,19 @@ class Renderer:
         #                 software / yuv444p fallback path).
         #   * biplanar  — Y r8unorm + one rg8unorm UV texture carrying the
         #                 host's interleaved chroma verbatim, deinterleaved in
-        #                 the shader (Apple nv24 passthrough, the hot path).
-        # Both texture sets are built up front (~5 bytes/px canvas, trivial)
-        # so `draw` can render the pre-cleared canvas before any tile lands.
+        #                 the shader (Apple nv24 passthrough, the hot path —
+        #                 the native VideoToolbox decoder emits it directly).
+        # The planar texture set is built up front (~5 bytes/px canvas,
+        # trivial) so `draw` can render the pre-cleared canvas before any
+        # tile lands; the biplanar pipeline is built lazily on the first
+        # nv24 tile (see `_ensure_biplanar`).
         self._mode: "str | None" = None
+        # Chroma subsample ratio (chroma_width/width, chroma_height/height),
+        # captured from the first tile. (1,1) for 4:4:4 (HEVC), (0.5,0.5) for
+        # 4:2:0 (H.264/AVC). draw() multiplies uv_scale by this to get the
+        # shader's chroma_scale, so half-res chroma sampled correctly.
+        self._chroma_ratio: tuple[float, float] = (1.0, 1.0)
+
         tex_kw = dict(
             format=wgpu.TextureFormat.r8unorm,
             usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
@@ -260,25 +281,42 @@ class Renderer:
             mag_filter=wgpu.FilterMode.linear,
             min_filter=wgpu.FilterMode.linear,
         )
-        # 16-byte uniform: vec2 uv_scale + vec2 chroma_scale. Updated
-        # per-draw with the content/canvas ratio and the chroma ratio.
+        # 32-byte uniform, 4× vec2: uv_scale, uv_offset, chroma_scale,
+        # chroma_offset. Updated per-draw. Shared by the planar (reads all four)
+        # and biplanar (reads uv_scale + uv_offset) pipelines — the shared
+        # layout is why offset follows scale rather than trailing the chroma
+        # pair. Default = full-content crop from the origin (offsets 0).
         self._uniform_buf = device.create_buffer(
-            size=16,
+            size=32,
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
         )
         device.queue.write_buffer(
             self._uniform_buf, 0,
-            np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32).tobytes(),
+            np.array([1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0],
+                     dtype=np.float32).tobytes(),
         )
+        # Optional display crop: a sub-rect of the canvas (in canvas texels) to
+        # present instead of the full content — used to show ONE host monitor
+        # from a combined multi-display canvas (--display N). None = full
+        # content (default). (x, y, w, h).
+        self._src_rect: "tuple[int, int, int, int] | None" = None
         tex_entry = {
             "visibility": wgpu.ShaderStage.FRAGMENT,
             "texture": {"sample_type": wgpu.TextureSampleType.float, "view_dimension": "2d"},
         }
-        sampler_entry = {"binding": None, "visibility": wgpu.ShaderStage.FRAGMENT,
-                         "sampler": {}}
-        uniform_entry = {"binding": None, "visibility": wgpu.ShaderStage.FRAGMENT,
+        uniform_entry = {"visibility": wgpu.ShaderStage.FRAGMENT,
                          "buffer": {"type": wgpu.BufferBindingType.uniform}}
-        uniform_resource = {"buffer": self._uniform_buf, "offset": 0, "size": 16}
+        uniform_resource = {"buffer": self._uniform_buf, "offset": 0, "size": 32}
+        # Captured for the lazy nv24 (biplanar) pipeline build — see
+        # _ensure_biplanar. It's deferred until the first nv24 tile so platforms
+        # that only ever hit the planar yuv444p path (every non-Mac build, where
+        # libav emits yuv444p) never compile WGSL_BIPLANAR — whose nv24 shader
+        # some GPU backends (notably d3d on Windows) can't translate.
+        self._surface_format = surface_format
+        self._sampler = sampler
+        self._tex_entry = tex_entry
+        self._uniform_entry = uniform_entry
+        self._uniform_resource = uniform_resource
 
         # ── planar pipeline: Y + U + V (3× r8unorm) ─────────────────────
         planar_shader = device.create_shader_module(code=WGSL)
@@ -286,8 +324,8 @@ class Renderer:
             {"binding": 0, **tex_entry},
             {"binding": 1, **tex_entry},
             {"binding": 2, **tex_entry},
-            {**sampler_entry, "binding": 3},
-            {**uniform_entry, "binding": 4},
+            {"binding": 3, "visibility": wgpu.ShaderStage.FRAGMENT, "sampler": {}},
+            {"binding": 4, **uniform_entry},
         ])
         self._pipeline_planar = device.create_render_pipeline(
             layout=device.create_pipeline_layout(bind_group_layouts=[planar_layout]),
@@ -309,32 +347,10 @@ class Renderer:
             ],
         )
 
-        # ── biplanar pipeline: Y (r8) + interleaved UV (rg8) ────────────
-        biplanar_shader = device.create_shader_module(code=WGSL_BIPLANAR)
-        biplanar_layout = device.create_bind_group_layout(entries=[
-            {"binding": 0, **tex_entry},
-            {"binding": 1, **tex_entry},
-            {**sampler_entry, "binding": 2},
-            {**uniform_entry, "binding": 3},
-        ])
-        self._pipeline_biplanar = device.create_render_pipeline(
-            layout=device.create_pipeline_layout(bind_group_layouts=[biplanar_layout]),
-            vertex={"module": biplanar_shader, "entry_point": "vs"},
-            fragment={
-                "module": biplanar_shader, "entry_point": "fs",
-                "targets": [{"format": surface_format}],
-            },
-            primitive={"topology": wgpu.PrimitiveTopology.triangle_list},
-        )
-        self._bind_biplanar = device.create_bind_group(
-            layout=biplanar_layout,
-            entries=[
-                {"binding": 0, "resource": self._y_tex.create_view()},
-                {"binding": 1, "resource": self._uv_tex.create_view()},
-                {"binding": 2, "resource": sampler},
-                {"binding": 3, "resource": uniform_resource},
-            ],
-        )
+        # nv24 (biplanar) pipeline is built lazily on the first nv24 tile —
+        # see _ensure_biplanar. Stays None on platforms that never see nv24.
+        self._pipeline_biplanar = None
+        self._bind_biplanar = None
 
         # ── cursor overlay ──────────────────────────────────────────────
         # The host sends the cursor separately (enc 1104) and we render it
@@ -348,10 +364,11 @@ class Renderer:
         self._cur_w = self._cur_h = 0
         self._cur_hx = self._cur_hy = 0
         self._cursor_pos: "tuple[int, int] | None" = None  # pointer, canvas texels
-        # Render scale for the cursor sprite = the local display's content
-        # scale (Retina factor). A cursor is a UI element drawn at the local
-        # display resolution, so its size must NOT scale with the video
-        # letterbox (which shrinks the remote canvas into the window).
+        # Calibration multiplier for the cursor sprite (default 1.0,
+        # ISS_CURSOR_SCALE). The base on-screen size is computed in draw() by
+        # scaling the sprite with the video's uniform letterbox factor (1
+        # sprite pixel = 1 content texel), so the cursor tracks the zoomed
+        # content rather than staying frozen at native size.
         self._cursor_scale = 1.0
         self._cursor_sampler = device.create_sampler(
             mag_filter=wgpu.FilterMode.nearest,
@@ -395,6 +412,41 @@ class Renderer:
             primitive={"topology": wgpu.PrimitiveTopology.triangle_strip},
         )
 
+    def _ensure_biplanar(self) -> None:
+        """Lazily build the nv24 (Y r8 + interleaved-UV rg8) render pipeline on
+        first use. Deferred from __init__ so platforms that only ever hit the
+        planar yuv444p path never compile WGSL_BIPLANAR — some GPU backends
+        (notably d3d on Windows) can't translate its nv24 shader, and failing
+        there for a pipeline they'll never use is pointless. Idempotent."""
+        if self._pipeline_biplanar is not None:
+            return
+        device = self._device
+        biplanar_shader = device.create_shader_module(code=WGSL_BIPLANAR)
+        biplanar_layout = device.create_bind_group_layout(entries=[
+            {"binding": 0, **self._tex_entry},
+            {"binding": 1, **self._tex_entry},
+            {"binding": 2, "visibility": wgpu.ShaderStage.FRAGMENT, "sampler": {}},
+            {"binding": 3, **self._uniform_entry},
+        ])
+        self._pipeline_biplanar = device.create_render_pipeline(
+            layout=device.create_pipeline_layout(bind_group_layouts=[biplanar_layout]),
+            vertex={"module": biplanar_shader, "entry_point": "vs"},
+            fragment={
+                "module": biplanar_shader, "entry_point": "fs",
+                "targets": [{"format": self._surface_format}],
+            },
+            primitive={"topology": wgpu.PrimitiveTopology.triangle_list},
+        )
+        self._bind_biplanar = device.create_bind_group(
+            layout=biplanar_layout,
+            entries=[
+                {"binding": 0, "resource": self._y_tex.create_view()},
+                {"binding": 1, "resource": self._uv_tex.create_view()},
+                {"binding": 2, "resource": self._sampler},
+                {"binding": 3, "resource": self._uniform_resource},
+            ],
+        )
+
     def upload_tile(self, tile_index: int, tile, slot_height: int) -> None:
         """Write tile's Y/U/V into the canvas-tile slice at row
         `tile_index * slot_height`.
@@ -414,21 +466,28 @@ class Renderer:
         if rows <= 0:
             return
         # Lock the chroma layout to the decoder's output on the first tile.
-        # A session's decode path is stable (Apple HW → nv24 biplanar; the
-        # software fallback → planar yuv444p), so this never flips mid-stream.
+        # A session's decode path is stable (Apple HW / VideoToolbox → nv24
+        # biplanar; the software fallback → planar yuv444p), so this never
+        # flips mid-stream.
         if self._mode is None:
             self._mode = "biplanar" if tile.is_nv12_passthrough else "planar"
-            self._chroma_rw = (tile.chroma_width / tile.width) if tile.width else 1.0
-            self._chroma_rh = (tile.chroma_height / tile.height) if tile.height else 1.0
+            self._chroma_ratio = (
+                tile.chroma_width / tile.width if tile.width else 1.0,
+                tile.chroma_height / tile.height if tile.height else 1.0,
+            )
+            if self._mode == "biplanar":
+                self._ensure_biplanar()
         origin = (0, origin_y, 0)
         # Grow the real decoded-content extent so draw() can crop the
-        # texture's black padding and letterbox what the encoder
-        # actually filled (≤ canvas when the host fell back to a
-        # smaller resolution than we advertised).
+        # texture's black padding and letterbox what the encoder actually
+        # filled (≤ canvas when the host fell back to a smaller resolution
+        # than we advertised).
         if w > self._content_w:
             self._content_w = w
         if origin_y + rows > self._content_h:
             self._content_h = origin_y + rows
+        # Diagnostics: how this tile actually landed in the texture.
+        self._dbg_tiles[tile_index] = (w, tile.height, slot_height, origin_y, rows)
 
         y = np.frombuffer(tile.y, dtype=np.uint8)
         if tile.y_stride == w:
@@ -444,16 +503,11 @@ class Renderer:
         )
 
         cw, ch = tile.chroma_width, tile.chroma_height
-        # Chroma may be subsampled (4:2:0 → half-res). It stacks in the
-        # top-left at the chroma-scaled origin; the `chroma_scale` uniform
-        # maps sampling onto that sub-region (GPU bilinear upsamples). For
-        # 4:4:4 (rh=1) this reduces to the luma origin/bounds, byte-for-byte.
-        chroma_origin_y = int(round(origin_y * self._chroma_rh))
-        chroma_rows = min(ch, int(round(rows * self._chroma_rh)),
-                          max(0, self._h - chroma_origin_y))
+        # Same canvas-bound for chroma as for luma so the last tile's
+        # padding chroma rows don't get uploaded.
+        chroma_rows = min(ch, slot_height, max(0, self._h - origin_y))
         if chroma_rows <= 0:
             return
-        chroma_origin = (0, chroma_origin_y, 0)
 
         if tile.v is None:
             # Biplanar passthrough (Apple nv24): the interleaved UV plane goes
@@ -463,7 +517,7 @@ class Renderer:
             uv = np.frombuffer(tile.u, dtype=np.uint8)
             uv = uv[: tile.uv_stride * ch].reshape(ch, tile.uv_stride)
             self._device.queue.write_texture(
-                {"texture": self._uv_tex, "origin": chroma_origin},
+                {"texture": self._uv_tex, "origin": origin},
                 np.ascontiguousarray(uv[:chroma_rows]),
                 {"offset": 0, "bytes_per_row": tile.uv_stride},
                 (cw, chroma_rows, 1),
@@ -479,13 +533,13 @@ class Renderer:
             u = u[: tile.uv_stride * ch].reshape(ch, tile.uv_stride)[:, :cw]
             v = v[: tile.uv_stride * ch].reshape(ch, tile.uv_stride)[:, :cw]
         self._device.queue.write_texture(
-            {"texture": self._u_tex, "origin": chroma_origin},
+            {"texture": self._u_tex, "origin": origin},
             np.ascontiguousarray(u[:chroma_rows]),
             {"offset": 0, "bytes_per_row": cw},
             (cw, chroma_rows, 1),
         )
         self._device.queue.write_texture(
-            {"texture": self._v_tex, "origin": chroma_origin},
+            {"texture": self._v_tex, "origin": origin},
             np.ascontiguousarray(v[:chroma_rows]),
             {"offset": 0, "bytes_per_row": cw},
             (cw, chroma_rows, 1),
@@ -500,6 +554,25 @@ class Renderer:
         cw = self._content_w or self._w
         ch = self._content_h or self._h
         return (min(cw, self._w), min(ch, self._h))
+
+    def set_source_rect(self, rect: "tuple[int, int, int, int] | None") -> None:
+        """Present only `rect` (x, y, w, h, in canvas texels) of the canvas,
+        scaled to fill the window — used to show ONE host monitor from a
+        combined multi-display canvas. None restores the full-content view.
+        The crop is clamped to the decoded content in draw()."""
+        self._src_rect = rect
+
+    def source_rect(self) -> "tuple[int, int, int, int]":
+        """The effective presented sub-rect (x, y, w, h) in canvas texels —
+        the display crop if set, else the full decoded content. Input mapping
+        uses this to translate window coords back to canvas coords."""
+        cw, ch = self.content_dims()
+        if self._src_rect is None:
+            return (0, 0, cw, ch)
+        rx, ry, rw, rh = self._src_rect
+        rx = max(0, min(rx, cw)); ry = max(0, min(ry, ch))
+        rw = max(1, min(rw, cw - rx)); rh = max(1, min(rh, ch - ry))
+        return (rx, ry, rw, rh)
 
     def set_cursor_image(self, img) -> None:
         """Upload a new cursor pixmap (`_CursorImage`: RGBA8888 + hotspot) as
@@ -519,13 +592,33 @@ class Renderer:
             usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
             size=(w, h, 1),
         )
-        rgba = np.frombuffer(img.rgba, dtype=np.uint8)[: w * h * 4].reshape(h, w, 4)
-        self._device.queue.write_texture(
-            {"texture": tex, "origin": (0, 0, 0)},
-            np.ascontiguousarray(rgba),
-            {"offset": 0, "bytes_per_row": w * 4},
-            (w, h, 1),
-        )
+        rgba = np.frombuffer(img.rgba, dtype=np.uint8)[: w * h * 4].reshape(h, w * 4)
+        # wgpu requires the source `bytes_per_row` to be a multiple of 256
+        # (COPY_BYTES_PER_ROW_ALIGNMENT). A small cursor (e.g. 17px wide → 68
+        # bytes/row) is unaligned, so write_texture throws and leaves the
+        # overlay with no texture — the cursor never appears. Pad each row up
+        # to the 256-byte stride; the copy still reads only the real w*4 bytes.
+        w4 = w * 4
+        bpr = ((w4 + 255) // 256) * 256
+        if bpr == w4:
+            data = np.ascontiguousarray(rgba)
+        else:
+            data = np.zeros((h, bpr), dtype=np.uint8)
+            data[:, :w4] = rgba
+        try:
+            self._device.queue.write_texture(
+                {"texture": tex, "origin": (0, 0, 0)},
+                np.ascontiguousarray(data),
+                {"offset": 0, "bytes_per_row": bpr},
+                (w, h, 1),
+            )
+        except Exception as e:
+            log.warning("cursor write_texture FAILED w=%d h=%d w4=%d bpr=%d "
+                        "data=%r: %s", w, h, w4, bpr,
+                        getattr(data, "shape", None), e)
+            self._cursor_tex = None
+            self._cursor_bind_group = None
+            return
         self._cursor_tex = tex
         self._cur_w, self._cur_h = w, h
         self._cur_hx, self._cur_hy = int(img.hotspot_x), int(img.hotspot_y)
@@ -545,9 +638,10 @@ class Renderer:
         self._cursor_pos = pos
 
     def set_cursor_scale(self, scale: float) -> None:
-        """Local display content scale (Retina factor) — the cursor sprite is
-        drawn at `pixmap_size * scale` surface pixels, matching the size the
-        OS would show it, independent of the video letterbox."""
+        """Calibration multiplier for the cursor overlay (default 1.0). The
+        sprite's base on-screen size is `pixmap_size * letterbox_scale` (set in
+        draw, so 1 sprite pixel = 1 content texel and the cursor tracks the
+        video zoom); this multiplier (ISS_CURSOR_SCALE) tunes it further."""
         self._cursor_scale = max(0.1, float(scale))
 
     def draw(
@@ -567,34 +661,39 @@ class Renderer:
         Apple's viewer. `uv_scale` separately crops sampling to the content
         sub-rect, so black texture padding (host fell back to a frame
         smaller than the advertised canvas) is never sampled."""
-        cw, ch = self.content_dims()
-        # uv_scale crops texture sampling to the decoded content sub-rect
-        # (top-left of the textures); padding outside content_dims is never
-        # sampled. Per-axis: the real frame can be smaller than the canvas
-        # on either axis independently.
+        # The presented sub-rect (crop) in canvas texels: the full decoded
+        # content by default, or one host monitor when a display crop is set.
+        rx, ry, cw, ch = self.source_rect()
+        # uv_scale maps the viewport's [0,1] onto the crop's width/height in the
+        # texture; uv_offset shifts sampling to the crop's origin. Together they
+        # sample exactly the crop sub-rect (never the black padding outside the
+        # decoded content). Default crop = (0,0,content) → offset 0, unchanged.
         ux = cw / self._w if self._w else 1.0
         uy = ch / self._h if self._h else 1.0
-        # chroma_scale = uv_scale × chroma-subsample ratio. The half-res
-        # chroma content occupies the top-left (content×ratio) texels, so
-        # its sampling range shrinks by the ratio. 4:4:4 (ratio 1) →
-        # chroma_scale == uv_scale (the unchanged HEVC path).
-        csx = ux * self._chroma_rw
-        csy = uy * self._chroma_rh
+        ox = rx / self._w if self._w else 0.0
+        oy = ry / self._h if self._h else 0.0
+        self._dbg_uv = (round(ux, 3), round(uy, 3))
+        # chroma_scale/offset = the luma values shrunk by the chroma subsample
+        # ratio (== luma for 4:4:4, half for 4:2:0). The half-res chroma is
+        # written into the top-left of the full-size U/V textures, so scaling
+        # both the span and the offset by the ratio lands sampling on the same
+        # region of content — the bilinear sampler upsamples to luma res.
+        crx, cry = self._chroma_ratio
         self._device.queue.write_buffer(
             self._uniform_buf, 0,
-            np.array([ux, uy, csx, csy], dtype=np.float32).tobytes(),
+            np.array([ux, uy, ox, oy, ux * crx, uy * cry, ox * crx, oy * cry],
+                     dtype=np.float32).tobytes(),
         )
-        # Aspect-preserving fit: one uniform scale (same factor on both
-        # axes) sized to the largest content rect that fits the target,
-        # then centered. Preserves the decoded aspect — never stretched —
-        # and the leftover falls out as symmetric letter/pillarbox bars.
-        if cw > 0 and ch > 0 and target_w > 0 and target_h > 0:
-            scale = min(target_w / cw, target_h / ch)
-            vw, vh = cw * scale, ch * scale
-        else:
-            scale = 1.0
-            vw, vh = float(target_w), float(target_h)
-        viewport = ((target_w - vw) * 0.5, (target_h - vh) * 0.5, vw, vh)
+        # Fill the whole window (the pre-rework baseline behavior). The window
+        # is aspect-locked to the content (see app.py), so a free resize fills
+        # with no distortion; when the window can't hold the aspect (maximize
+        # overrides the lock) the content stretches to fill rather than showing
+        # black bars. `uv_scale` (above) still crops sampling to the decoded
+        # sub-rect, so texture padding is never shown (no green/black bottom).
+        viewport = (0.0, 0.0, float(target_w), float(target_h))
+        # Per-axis content->screen scale, for placing the cursor overlay.
+        sclx = target_w / cw if cw > 0 else 1.0
+        scly = target_h / ch if ch > 0 else 1.0
         encoder = self._device.create_command_encoder()
         rpass = encoder.begin_render_pass(color_attachments=[{
             "view": target_view,
@@ -631,12 +730,15 @@ class Renderer:
                 )
         if _overlay_ok:
             cx, cy = self._cursor_pos
-            vx, vy = viewport[0], viewport[1]
-            d = self._cursor_scale
-            # Pointer maps through the letterbox; the sprite is sized to the
-            # local display (a cursor must not shrink with the video zoom).
-            px = vx + cx * scale
-            py = vy + cy * scale
+            # Content texels map onto the full window per-axis (fill). Place
+            # the cursor by the per-axis scale; size the sprite by the smaller
+            # axis so it stays square (never stretched). `_cursor_scale` is a
+            # calibration / ISS_CURSOR_SCALE multiplier (default 1.0).
+            d = min(sclx, scly) * self._cursor_scale
+            # cx,cy are full-canvas texels; the presented crop starts at (rx,ry),
+            # so shift into crop-local space before scaling to the window.
+            px = (cx - rx) * sclx
+            py = (cy - ry) * scly
             sw = self._cur_w * d
             sh = self._cur_h * d
             sx = px - self._cur_hx * d

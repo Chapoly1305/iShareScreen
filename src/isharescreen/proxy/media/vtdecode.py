@@ -90,6 +90,10 @@ class VTHevcDecoder:
         self.num_tiles = num_tiles
         self._on_frame_published = on_frame_published
         self._tiles = [_VTSlot() for _ in range(num_tiles)]
+        # API parity with HevcDecoder: session.py reads last_clean_donl[0] for
+        # the LTRP DON-ack. VideoToolbox steers its own references and never
+        # uses iss-side LTRP, so this stays all-None → session.py acks no DON.
+        self.last_clean_donl: list = [None] * num_tiles
         # Per-tile NAL-unit-type histogram (diagnostic; read by the snapshot).
         self.nalu_counts_per_tile: list = [{} for _ in range(num_tiles)]
         # session.py reads `_decoder._gate._states[ti].bad_streak` (stall
@@ -115,6 +119,12 @@ class VTHevcDecoder:
         self._decode_errors = 0                # benign VT conceals (diagnostic)
         self._lock = threading.Lock()          # guards session create/teardown
         self._seen_fmt = False
+        self._fmt_warned = False                # H1: warn once on non-nv24 output
+        # Decode latency monitoring: EMA of submit→frame round-trip (ms).
+        # VT decode is synchronous on the RX thread, so this is the HW decode
+        # time per NAL. Shared with the control-socket snapshot.
+        self._decode_latency_ms: float = 0.0
+        self._submit_t: float = 0.0
 
     # -- params / session ---------------------------------------------------
 
@@ -177,11 +187,17 @@ class VTHevcDecoder:
                 if idx < len(nalus):
                     self.feed_nalu(nalus[idx], ti)
 
-    def feed_nalu(self, nalu: bytes, tile_idx: int) -> None:
+    def feed_nalu(self, nalu: bytes, tile_idx: int,
+                  donl: Optional[int] = None) -> None:
         """Wrap one NAL unit in a length-prefixed CMSampleBuffer and submit it
         for async decode. The output is dispatched to `tile_idx` by the closure
         below. No RPS pre-check / no drop: VT manages its own DPB and conceals
-        missing refs instead of blocking."""
+        missing refs instead of blocking.
+
+        `donl` (the libav path's HEVC decoding-order number, used there for
+        DON-based LTRP reference tracking) is accepted for API parity with
+        `HevcDecoder.feed_nalu` and intentionally ignored: VideoToolbox owns
+        its own DPB + decode ordering, so iss does not steer its references."""
         session = self._session
         if session is None or not nalu:
             return
@@ -219,6 +235,7 @@ class VTHevcDecoder:
             return
         self._seq += 1
         seq = self._seq
+        self._submit_t = time.monotonic()
         def _handler(status, info_flags, image_buffer, pts, dur,
                      _ti=tile_idx, _seq=seq):
             self._on_decoded(_ti, _seq, status, image_buffer)
@@ -308,6 +325,9 @@ class VTHevcDecoder:
                     log.info("VT publish gap %.2fs — host idle (fed %d)", gap, fed)
         self._last_pub_t = now
         self._feeds_at_last_pub = self._feed_total
+        if self._submit_t > 0.0:
+            latency_ms = (now - self._submit_t) * 1000
+            self._decode_latency_ms = 0.1 * latency_ms + 0.9 * self._decode_latency_ms
         # The clean-frame half of the gate's two-condition recovery clear
         # (pairs with mark_idr_observed). Lets `keyframe_required` discharge
         # so the FIR storm stops once a real frame flows again.
@@ -325,6 +345,18 @@ class VTHevcDecoder:
             w = _Q.CVPixelBufferGetWidth(buf)
             h = _Q.CVPixelBufferGetHeight(buf)
             if _Q.CVPixelBufferGetPlaneCount(buf) < 2:
+                return None
+            # H1: only nv24 (444f) is the biplanar 4:4:4 layout the rest of the
+            # pipeline assumes. The fallback decode session (set_params) can
+            # hand us a VT-chosen format (e.g. 4:2:0 biplanar) that would pass
+            # the plane-count guard above and be mislabeled 4:4:4 → garbage
+            # chroma. Reject it rather than render garbage.
+            fmt = _Q.CVPixelBufferGetPixelFormatType(buf)
+            if fmt != _NV24_FMT:
+                if not self._fmt_warned:
+                    self._fmt_warned = True
+                    log.warning("VTHevcDecoder: non-nv24 output format 0x%x — "
+                                "dropping frames (expected 444f)", fmt)
                 return None
             y_rb = _Q.CVPixelBufferGetBytesPerRowOfPlane(buf, 0)
             uv_rb = _Q.CVPixelBufferGetBytesPerRowOfPlane(buf, 1)
@@ -382,6 +414,38 @@ class VTHevcDecoder:
     @property
     def good_counts(self) -> list:
         return [t.good_count for t in self._tiles]
+
+    @property
+    def clean_counts(self) -> list:
+        """Per-tile CLEAN (non-concealed) published-frame totals, the signal
+        session.py uses to flag GRAY tiles (high frame rate, ~0 clean = gray).
+        VideoToolbox conceals missing refs internally at Apple quality and does
+        not publish the libav-style persistent-gray frames this metric exists
+        to catch, so every published (good) frame counts as clean. Aliasing
+        good_counts keeps API parity with HevcDecoder.clean_counts."""
+        return [t.good_count for t in self._tiles]
+
+    @property
+    def bad_tiles(self) -> set:
+        """Tiles the gate considers gray/concealing and awaiting recovery.
+        Delegates to the gate (decoder-agnostic), matching HevcDecoder."""
+        return self._gate.bad_tiles
+
+    @property
+    def decode_latency_ms(self) -> float:
+        return self._decode_latency_ms
+
+    @property
+    def decode_queue_depth(self) -> int:
+        return 0  # synchronous VT path has no queue
+
+    @property
+    def decode_queue_cap(self) -> int:
+        return 0
+
+    @property
+    def decode_queue_drops(self) -> int:
+        return 0
 
     # -- lifecycle ----------------------------------------------------------
 

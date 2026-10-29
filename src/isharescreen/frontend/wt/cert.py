@@ -13,6 +13,9 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import logging
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -130,4 +133,65 @@ def write_cert(
     return cert_p, key_p, sha256_hex
 
 
-__all__ = ["make_self_signed", "write_cert"]
+def _login_keychain() -> str:
+    """Path to the current user's login keychain (modern macOS uses the
+    ``-db`` suffix; fall back to the legacy name)."""
+    new = os.path.expanduser("~/Library/Keychains/login.keychain-db")
+    if os.path.exists(new):
+        return new
+    return os.path.expanduser("~/Library/Keychains/login.keychain")
+
+
+def is_cert_trusted(cert_path: Path) -> bool:
+    """True if `security` already trusts this cert for the SSL policy —
+    i.e. Safari would accept it without `serverCertificateHashes`. Used
+    to skip the (auth-prompting) install when nothing changed."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        r = subprocess.run(
+            ["security", "verify-cert", "-c", str(cert_path), "-p", "ssl"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return r.returncode == 0
+    except Exception as e:  # noqa: BLE001 — diagnostic only
+        log.debug("verify-cert failed: %s", e)
+        return False
+
+
+def trust_cert_in_keychain(cert_path: Path) -> tuple[bool, str]:
+    """Install `cert_path` into the user's login keychain, trusted for
+    SSL, so Safari accepts it for WebTransport.
+
+    WebKit deliberately does not implement `serverCertificateHashes`
+    (the self-signed escape hatch Chrome/Edge/Firefox use), so Safari
+    can only do WebTransport against a cert that chains to a trusted
+    root — well-known *or* locally installed. Trusting our cert in the
+    login keychain satisfies that without admin/sudo (it uses a one-time
+    GUI auth prompt, not the System keychain).
+
+    Returns ``(trusted, message)``. Idempotent: if the cert is already
+    trusted it returns immediately without prompting."""
+    if sys.platform != "darwin":
+        return False, "keychain trust is only available on macOS (Safari is macOS-only)"
+    if is_cert_trusted(cert_path):
+        return True, "already trusted"
+    keychain = _login_keychain()
+    try:
+        r = subprocess.run(
+            ["security", "add-trusted-cert", "-r", "trustRoot",
+             "-p", "ssl", "-k", keychain, str(cert_path)],
+            capture_output=True, text=True, timeout=120,
+        )
+    except Exception as e:  # noqa: BLE001
+        return False, f"add-trusted-cert could not run: {e}"
+    if r.returncode == 0:
+        return True, "installed into login keychain"
+    err = (r.stderr or r.stdout or "").strip()
+    return False, err or f"add-trusted-cert exited {r.returncode}"
+
+
+__all__ = [
+    "make_self_signed", "write_cert",
+    "is_cert_trusted", "trust_cert_in_keychain",
+]

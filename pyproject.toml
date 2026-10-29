@@ -48,13 +48,6 @@ dependencies = [
     # Linux X11 falls back to xclip/xsel and on GNOME-Wayland uses
     # GPaste D-Bus (else wl-clipboard).
     "pyperclip>=1.9",
-    # Terminal UI: the default `iss` invocation is a Textual app that
-    # supervises the wgpu viewer as a child process and renders live
-    # stats from its control socket. `iss --headless` bypasses the TUI
-    # entirely for CI / scripted use. `rich` is used directly for one
-    # markup-escape call and also comes in transitively via textual.
-    "textual>=0.50",
-    "rich>=13",
     # macOS: native VideoToolbox HEVC decode path (src/.../media/vtdecode.py).
     # VideoToolbox manages the DPB the way Apple's own viewer does, avoiding
     # libav's hwaccel DPB mismanagement that periodically wedges the stream.
