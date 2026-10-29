@@ -34,6 +34,7 @@ import os
 import queue
 import sys
 import threading
+import time
 from typing import Callable, Optional
 
 
@@ -94,6 +95,8 @@ _PERTILE_RECOVERY = os.environ.get("ISS_PERTILE_RECOVERY", "1") != "0"
 # Decode-worker queue + lifecycle.
 _QUEUE_MAX = 512                           # NALUs in flight to the decoder
 _WORKER_DEQUEUE_TIMEOUT_S = 0.5
+_AMD_DOWNLOAD_BATCH_MAX = 4
+_AMD_DOWNLOAD_WAIT_S = 0.004
 _WORKER_JOIN_TIMEOUT_S = 2.0
 
 # HW-accel fallback thresholds — empirical (Windows D3D11VA, Linux iGPU
@@ -182,6 +185,9 @@ class HevcDecoder:
         self.num_tiles = num_tiles
         self._prefer_hwaccel = prefer_hwaccel
         self._amd_only = amd_only
+        # At most four GPU outputs; only the decode producer owns this.
+        self._pending_downloads: list[tuple[int, av.VideoFrame, bool]] = []
+        self._pending_since = 0.0
         self._on_frame_published = on_frame_published
 
         self._codec: Optional[av.codec.context.CodecContext] = None
@@ -396,6 +402,7 @@ class HevcDecoder:
                         self._fallback_to_software(tile_nalu_cache)
                         return
         finally:
+            self._flush_downloads()
             self._sync_decode_mode = False
 
         good = sum(t.good_count for t in self._tiles)
@@ -509,8 +516,8 @@ class HevcDecoder:
         tile; its healthy siblings keep publishing from their own intact
         DPB history.
         """
-        # A hardware download must finish before restart releases its device.
-        # This also serializes use of the shared presentation reformatter.
+        # Other hardware paths may still convert here. AMD returns prepared
+        # CPU tiles; its producer owns conversion and is joined at teardown.
         with self._lifecycle_lock:
             return self._get_frame_locked(tile_idx)
 
@@ -522,15 +529,19 @@ class HevcDecoder:
         slot = self._tiles[tile_idx]
         with slot.lock:
             frame = slot.raw_frame
+            prepared_error = slot.prepared_error
             count = slot.good_count
             already_evaluated = count <= slot.last_evaluated_count
 
         if frame is None or already_evaluated:
             return None
 
-        tile_frame, had_decode_error = _av_frame_to_tile(
-            frame, self._reformatter, self._seen_fmts,
-        )
+        if isinstance(frame, TileFrame):
+            tile_frame, had_decode_error = frame, prepared_error
+        else:
+            tile_frame, had_decode_error = _av_frame_to_tile(
+                frame, self._reformatter, self._seen_fmts,
+            )
         with slot.lock:
             slot.last_evaluated_count = count
 
@@ -799,9 +810,39 @@ class HevcDecoder:
         flg = getattr(frame, "flags", 0)
         had_error = bool(err) or bool(flg & 0x01)
 
+        if self._amd_only:
+            if not self._pending_downloads:
+                self._pending_since = time.perf_counter()
+            self._pending_downloads.append((ti, frame, had_error))
+            if len(self._pending_downloads) >= min(self.num_tiles, _AMD_DOWNLOAD_BATCH_MAX):
+                self._flush_downloads()
+            return
+        self._store_frame(ti, frame, had_error)
+
+    def _flush_downloads(self) -> None:
+        # Submit several decode operations before waiting on their readbacks.
+        # The decode producer is the only GPU-frame consumer; the window sees
+        # CPU-owned bytes only. Do not hold a codec/lifecycle lock while joining
+        # this producer during shutdown.
+        pending, self._pending_downloads = self._pending_downloads, []
+        for ti, frame, had_error in pending:
+            try:
+                tile, conversion_error = _av_frame_to_tile(
+                    frame, self._reformatter, self._seen_fmts,
+                )
+            except Exception:
+                log.exception("AMD frame preparation failed for tile %d", ti)
+                continue
+            if tile is not None:
+                self._store_frame(ti, tile, had_error or conversion_error)
+
+    def _store_frame(
+        self, ti: int, frame: av.VideoFrame | TileFrame, had_error: bool,
+    ) -> None:
         slot = self._tiles[ti]
         with slot.lock:
             slot.raw_frame = frame
+            slot.prepared_error = had_error
             slot.good_count += 1
             if not had_error:
                 slot.clean_count += 1
@@ -970,6 +1011,7 @@ class HevcDecoder:
         try:
             for frame in codec.decode(None):
                 self._publish_frame(frame)
+            self._flush_downloads()
         except Exception as e:
             log.debug("drain_codec_to_slots: %s", e)
 
@@ -1011,14 +1053,21 @@ class HevcDecoder:
             return
         while not self._stop.is_set():
             try:
-                item = q.get(timeout=_WORKER_DEQUEUE_TIMEOUT_S)
+                timeout = _WORKER_DEQUEUE_TIMEOUT_S
+                if self._pending_downloads:
+                    # Never wait indefinitely for a quiet or unchanged tile.
+                    timeout = max(0.0, _AMD_DOWNLOAD_WAIT_S - (time.perf_counter() - self._pending_since))
+                item = q.get(timeout=timeout)
             except queue.Empty:
+                self._flush_downloads()
                 continue
             if item is None:
                 break
             nalu, tile_idx = item
             try:
                 self._decode_one(nalu, tile_idx)
+                if self._pending_downloads and time.perf_counter() - self._pending_since >= _AMD_DOWNLOAD_WAIT_S:
+                    self._flush_downloads()
             except Exception as e:
                 log.warning("hevc-decode worker swallowed error: %s", e)
 
@@ -1176,6 +1225,7 @@ class HevcDecoder:
         can't be mid-decode when we null `_codec` — that's the path
         that produced SIGSEGV in libavcodec's HEVC decoder."""
         self._stop_worker()
+        self._pending_downloads.clear()
         with self._codec_lock:
             if self._codec is not None:
                 try:
@@ -1190,6 +1240,7 @@ class HevcDecoder:
         for slot in self._tiles:
             with slot.lock:
                 slot.raw_frame = None
+                slot.prepared_error = False
                 slot.good_count = 0
                 slot.clean_count = 0
                 slot.last_evaluated_count = 0

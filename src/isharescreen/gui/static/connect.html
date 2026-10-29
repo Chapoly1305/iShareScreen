@@ -49,8 +49,8 @@
    <option value="444">4:4:4 — full color detail</option>
    <option value="420">4:2:0 — reduced color detail</option>
   </select>
-  <p class="hint">Codec controls compression. Chroma controls color detail. This client currently supports H.264 with 4:2:0; HEVC can request either. The Mac determines the negotiated stream.</p>
-  <p class="hint" id="video-hint">Browser viewing uses H.264. Choose Desktop for HEVC and manual decoder selection.</p>
+  <label for="bandwidth">Target video bandwidth <output id="bandwidth-value" for="bandwidth">Auto</output></label>
+  <input type="range" id="bandwidth" name="bandwidth_mbps" min="0" max="200" step="1" value="0" style="width:100%;accent-color:#4f8cff">
   <label>Resolution</label>
   <select name="advertise" title="The encoded pixel resolution = how much bandwidth you use. Higher = sharper + more bandwidth. UI size is set separately by Display scale.">
    <option value="auto" selected>Auto — track window size</option>
@@ -92,8 +92,14 @@
 
  const form = document.querySelector('form');
  const storageKey = 'isharescreen.connection.v1';
- const fields = ['host','user','port','auth','frontend','codec','chroma','decoder','advertise','scale','audio','curtain','remember_password'];
+ const fields = ['host','user','port','auth','frontend','codec','chroma','decoder','advertise','scale','bandwidth_mbps','audio','curtain','remember_password'];
  const status = document.getElementById('settings-status');
+ function updateBandwidth(){
+   const slider=form.elements.bandwidth_mbps;
+   const label=Number(slider.value)===0?'Auto':slider.value+' Mbps';
+   document.getElementById('bandwidth-value').value=label;
+   slider.setAttribute('aria-valuetext',label);
+ }
  function saveSettings(){
    const settings = {};
    for(const name of fields){const el=form.elements[name]; settings[name]=el.type==='checkbox'?el.checked:el.value;}
@@ -118,6 +124,7 @@
    if(!saved)form.elements.auth.value='srp';
  } catch(e){status.textContent='Saved settings could not be read. You can still connect.';}
  function updateVideo(){
+   updateBandwidth();
    const browser=form.elements.frontend.value==='browser';
    for(const option of form.elements.codec.options) option.disabled=browser&&option.value==='hevc';
    if(browser && form.elements.codec.value==='hevc')form.elements.codec.value='auto';
@@ -129,10 +136,9 @@
      option.disabled=(form.elements.codec.value!=='auto' && !!option.dataset.codec && option.dataset.codec!==form.elements.codec.value)||(option.value==='amd-hevc420'&&form.elements.chroma.value==='444');
    }
    if(form.elements.decoder.selectedOptions[0]?.disabled)form.elements.decoder.value='auto';
-   document.getElementById('video-hint').textContent=browser?'Browser viewing uses H.264; the browser manages decoding.':'Decoder chooses how video is decoded, not which GPU draws the window. Auto tries available hardware; Intel QSV can decode HEVC 4:4:4.';
  }
  updateVideo();
- form.addEventListener('input',saveSettings);
+ form.addEventListener('input',()=>{updateBandwidth();saveSettings();});
  form.addEventListener('change',()=>{updateVideo();saveSettings();});
  document.getElementById('advanced').addEventListener('toggle',saveSettings);
  document.getElementById('reset-settings').addEventListener('click',()=>{

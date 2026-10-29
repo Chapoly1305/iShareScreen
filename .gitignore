@@ -11,6 +11,8 @@ tools/*
 !tools/dissector/
 *.pcap
 *.pcapng
+*.etl
+*.etl.NGENPDB/
 *.key
 *.log
 

@@ -85,7 +85,8 @@ class _TileSlot:
     """The latest decoded frame for one tile + its bookkeeping. Locked so
     the decode worker (writer) and the consumer's `get_frame()` (reader)
     don't tear."""
-    raw_frame: Optional[av.VideoFrame] = None
+    raw_frame: Optional[av.VideoFrame | TileFrame] = None
+    prepared_error: bool = False
     good_count: int = 0
     # Frames published WITHOUT a libav decode-error flag — i.e. actually
     # clean video, not concealed gray. `good_count` counts every published
@@ -151,7 +152,8 @@ def _av_frame_to_tile(
         if reformatter_holder[0] is None:
             from av.video.reformatter import VideoReformatter
             reformatter_holder[0] = VideoReformatter()
-        # GPU-owned AMD frames defer the blocking download until presentation.
+        # AMD downloads GPU frames on the decode producer after a bounded batch,
+        # before notifying the display consumer.
         # Preserve their native software format: forcing 4:4:4 would quadruple
         # chroma storage for a 4:2:0 source and add an unnecessary conversion.
         software_format = getattr(frame, "sw_format", None)

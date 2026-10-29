@@ -1,3 +1,5 @@
+import pytest
+
 from io import StringIO
 from types import SimpleNamespace
 
@@ -6,7 +8,9 @@ from isharescreen.gui import connect as C
 from isharescreen.tui import storage
 
 
-def test_gui_passes_auth_options_and_keeps_secrets_out_of_argv_and_profile(monkeypatch, tmp_path):
+@pytest.mark.parametrize("bandwidth", ["0", "30", "200"])
+def test_gui_passes_auth_options_and_keeps_secrets_out_of_argv_and_profile(monkeypatch, tmp_path, bandwidth):
+    monkeypatch.setenv("ISS_VIDEO_BITRATE_BPS", "99999999")
     monkeypatch.setattr(C, "_kerberos_supported", lambda: True)
     monkeypatch.setattr(storage, "_state_dir", lambda: tmp_path)
     monkeypatch.setattr(C, "_kill_current", lambda: None)
@@ -31,8 +35,10 @@ def test_gui_passes_auth_options_and_keeps_secrets_out_of_argv_and_profile(monke
     monkeypatch.setattr(C.subprocess, "Popen", popen)
     C._launch(dict(host="mac.local", port="5901", user="alice", password="secret-value",
                    auth="kerberos", krb_realm="EXAMPLE.COM", krb_service="vnc/mac.local@EXAMPLE.COM",
-                   remember_password="on", decoder="libav-avc420"))
+                   remember_password="on", decoder="libav-avc420", bandwidth_mbps=bandwidth))
     cmd, kwargs = launched[0]
+    assert kwargs["env"].get("ISS_VIDEO_BITRATE_BPS") == (
+        str(int(bandwidth) * 1_000_000) if bandwidth != "0" else None)
     assert "secret-value" not in repr(cmd) + repr(kwargs["env"])
     assert stream.contents == "secret-value\n"
     assert cmd[cmd.index("--auth") + 1] == "kerberos"
@@ -96,6 +102,8 @@ def test_form_has_advanced_controls_and_secret_free_storage_allowlist(monkeypatc
     assert "'password'" not in fields
     assert "'codec'" in fields and "'decoder'" in fields
     assert "localStorage.setItem" in html
+    assert "'bandwidth_mbps'" in fields
+    assert 'type="range" id="bandwidth"' in html
 
 
 def test_new_login_defaults_to_srp_without_remembering_password(monkeypatch):
@@ -126,3 +134,12 @@ def test_unsupported_kerberos_does_not_stop_current_session(monkeypatch):
     monkeypatch.setattr(C, "_emit", lambda kind, text: messages.append(text))
     C._launch(dict(host="mac", user="alice", auth="kerberos"))
     assert "choose Password (SRP)" in messages[0]
+
+
+@pytest.mark.parametrize("value", ["-1", "201", "30.5", "bad", "", None])
+def test_invalid_bandwidth_preserves_running_session(monkeypatch, value):
+    monkeypatch.setattr(C, "_kill_current", lambda: pytest.fail("stopped session"))
+    messages = []
+    monkeypatch.setattr(C, "_emit", lambda *args: messages.append(args))
+    C._launch(dict(host="mac", user="alice", bandwidth_mbps=value))
+    assert "target video bandwidth" in messages[-1][1]

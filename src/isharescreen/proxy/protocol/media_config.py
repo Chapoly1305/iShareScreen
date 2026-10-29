@@ -369,6 +369,9 @@ class MediaOfferConfig:
                 pass
         if "ISS_AUDIO_F4" in os.environ:
             config.audio.payload_flags = int(os.environ["ISS_AUDIO_F4"])
+        bitrate = os.environ.get("ISS_VIDEO_BITRATE_BPS")
+        if bitrate is not None:
+            config.set_video_bitrate(int(bitrate))
         return config
 
     def set_video_bitrate(self, bps: int) -> MediaOfferConfig:

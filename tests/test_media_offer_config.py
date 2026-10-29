@@ -271,3 +271,12 @@ def test_srtp_grouping_accepts_offered_tile_count_without_global_environment(mon
     decryptor._counts.update({100: 10, 101: 20, 102: 30, 103: 40})
     assert decryptor.get_primary_ssrc_group(group_size=1) == {103}
     assert decryptor.get_primary_ssrc_group(group_size=4) == {100, 101, 102, 103}
+
+
+def test_environment_bandwidth_reaches_serialized_offers(monkeypatch):
+    monkeypatch.setenv("ISS_VIDEO_BITRATE_BPS", "25000000")
+    video, audio = offers.create_offers()
+    assert _desktop_caps(_blob(video)) == [25_000_000]
+    assert _desktop_caps(_blob(audio)) == [25_000_000]
+    monkeypatch.delenv("ISS_VIDEO_BITRATE_BPS")
+    assert MediaOfferConfig.from_environment().bandwidth == MediaOfferConfig().bandwidth

@@ -298,6 +298,13 @@ def _launch(values: dict) -> None:
         if spec.codec != effective_codec:
             _emit("log", "[gui] selected decoder does not support the selected codec; choose Auto or a matching decoder")
             return
+    try:
+        bandwidth_mbps = int(values.get("bandwidth_mbps", "0"))
+        if not 0 <= bandwidth_mbps <= 200:
+            raise ValueError
+    except (TypeError, ValueError):
+        _emit("log", "[gui] target video bandwidth must be Auto (0) or 1–200 Mbps")
+        return
     _kill_current()            # Reconnect / new connection replaces the old one
     # Also clear any ORPHANED iss bridge (a previous GUI session that crashed,
     # was force-quit, or had a failed WebTransport handshake) still holding the
@@ -351,6 +358,10 @@ def _launch(values: dict) -> None:
         cmd.append("--trust-cert-for-safari")
 
     env = dict(os.environ)
+    # Auto explicitly restores protocol defaults, including after a prior cap.
+    env.pop("ISS_VIDEO_BITRATE_BPS", None)
+    if bandwidth_mbps:
+        env["ISS_VIDEO_BITRATE_BPS"] = str(bandwidth_mbps * 1_000_000)
     if _GUI_PORT:
         # iss POSTs here (blocking) to ask share-vs-alt when a different user is
         # at the console; the /session-choice handler answers from the modal.
