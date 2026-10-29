@@ -1067,6 +1067,13 @@ class HevcDecoder:
             # ignores this setting.
             c.thread_type = "SLICE"
             c.thread_count = 0
+            if self._amd_only:
+                # D3D11 uses a fixed surface pool. Leave room beyond the HEVC
+                # reference pictures for four published tiles and in-flight
+                # frames. Hardware provides parallelism; CPU slice workers
+                # must not inflate surface demand on this low-delay path.
+                c.thread_count = 1
+                c.options = {"extra_hw_frames": "16"}
             c.flags = _CODEC_FLAG_LOW_DELAY
             c.flags2 = _CODEC_FLAG2_FAST
             c.open()

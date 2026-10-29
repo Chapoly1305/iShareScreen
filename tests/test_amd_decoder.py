@@ -30,3 +30,14 @@ def test_amd_decoder_disallows_internal_software_fallback():
     decoder = HevcDecoder(4, amd_only=True)
     with pytest.raises(RuntimeError, match="AMD hardware"):
         decoder._make_sw_context(b"")
+
+
+def test_amd_context_reserves_surfaces_without_cpu_worker_fanout(monkeypatch):
+    from isharescreen.proxy.media import hevc, amd
+    context = SimpleNamespace(open=lambda: None)
+    monkeypatch.setattr(amd, "hardware_accel", lambda: object())
+    monkeypatch.setattr(hevc, "av", SimpleNamespace(CodecContext=SimpleNamespace(create=lambda *a, **kw: context)))
+    decoder = HevcDecoder(4, amd_only=True)
+    assert decoder._try_hwaccel("d3d11va", b"params") is context
+    assert context.thread_count == 1
+    assert context.options == {"extra_hw_frames": "16"}
