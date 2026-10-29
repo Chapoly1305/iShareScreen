@@ -69,3 +69,28 @@ def test_first_kerberos_form_does_not_require_manual_realm(monkeypatch):
     assert all(f'name="{field}"' not in html for field in ("krb_realm", "krb_principal", "krb_service"))
     assert "First connection:" not in html
     assert "authMode" not in html
+
+
+def test_gui_rejects_incompatible_video_before_stopping_session(monkeypatch):
+    monkeypatch.setattr(C, "_kill_current", lambda: (_ for _ in ()).throw(AssertionError("must preserve running session")))
+    messages = []
+    monkeypatch.setattr(C, "_emit", lambda kind, text: messages.append(text))
+    for settings in (
+        dict(frontend="desktop", codec="avc", decoder="qsv-hevc444"),
+        dict(frontend="browser", codec="hevc"),
+        dict(frontend="desktop", decoder="unknown"),
+    ):
+        C._launch(dict(host="mac.local", user="alice", **settings))
+    assert len(messages) == 3
+
+
+def test_form_has_advanced_controls_and_secret_free_storage_allowlist(monkeypatch):
+    monkeypatch.setattr(C, "load_last", lambda: None)
+    monkeypatch.setattr(C, "_decoder_options_html", lambda: "")
+    html = C._form_page().decode()
+    assert '<details id="advanced">' in html
+    assert 'name="codec"' in html and 'name="decoder"' in html
+    fields = html.split("const fields = ", 1)[1].split(";", 1)[0]
+    assert "'password'" not in fields
+    assert "'codec'" in fields and "'decoder'" in fields
+    assert "localStorage.setItem" in html

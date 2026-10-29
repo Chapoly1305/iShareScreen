@@ -17,6 +17,7 @@ from __future__ import annotations
 import http.server
 import json
 import os
+from pathlib import Path
 import queue
 import signal
 import socket
@@ -253,6 +254,23 @@ def _launch(values: dict) -> None:
         _STATE["status"] = "idle"
         _emit("status", dict(_STATE))
         return
+    # Validate manual selections before replacing the running session.
+    from isharescreen.proxy.media.registry import all_specs, normalize_override
+    codec = values.get("codec", "auto").strip() or "auto"
+    decoder = values.get("decoder", "auto").strip() or "auto"
+    frontend = values.get("frontend", "browser")
+    names = {spec.name for spec in all_specs()}
+    normalized = normalize_override(decoder, codec if codec != "auto" else "hevc")
+    if (frontend not in ("browser", "desktop") or codec not in ("auto", "avc", "hevc")
+            or (normalized is not None and normalized not in names)
+            or (frontend == "browser" and codec == "hevc")):
+        _emit("log", "[gui] invalid video settings; browser viewing requires H.264 or Auto")
+        return
+    if codec != "auto" and normalized is not None:
+        spec = next(spec for spec in all_specs() if spec.name == normalized)
+        if spec.codec != codec:
+            _emit("log", "[gui] selected decoder does not support the selected codec; choose Auto or a matching decoder")
+            return
     _kill_current()            # Reconnect / new connection replaces the old one
     # Also clear any ORPHANED iss bridge (a previous GUI session that crashed,
     # was force-quit, or had a failed WebTransport handshake) still holding the
@@ -295,30 +313,9 @@ def _launch(values: dict) -> None:
             cmd += ["--advertise", advertise]
     else:
         cmd += ["--hidpi", scale]
-    decoder = values.get("decoder", "auto").strip()
-    if decoder and decoder != "auto":
-        cmd += ["--decoder", decoder]        # explicit pin — session honours it
-    elif frontend == "desktop" and "ISS_VIDEO_CODEC" not in os.environ:
-        # "Auto" on the desktop frontend: the GUI already probed hardware at
-        # startup, so pin the DECODER here → the session skips its decoder-build
-        # probe (and "hevc444 probe: unavailable" log noise) at stream start.
-        # Only pass --codec for AVC: that matches what the cli already forces on
-        # a non-HEVC box (where the probe noise actually is), and it lets the
-        # session skip resolve_codec too. For HEVC we deliberately do NOT pass
-        # --codec — forcing it would change the media offer from the default
-        # "both"-bank (byte-identical to Apple's) to a single-HEVC bank
-        # (offers.py DANGER note); the session resolves the codec itself
-        # (cheap on a HEVC-capable box). Skipped if the user set ISS_VIDEO_CODEC.
-        try:
-            from isharescreen.proxy.media.registry import resolve_codec, select
-            codec = resolve_codec("auto")
-            spec = select(codec)
-            if spec is not None:
-                cmd += ["--decoder", spec.name]
-                if codec == "avc":
-                    cmd += ["--codec", "avc"]
-        except Exception:
-            pass  # fall back to the session's own auto resolution
+    decoder = values.get("decoder", "auto").strip() or "auto"
+    codec = values.get("codec", "auto").strip() or "auto"
+    cmd += ["--decoder", decoder, "--codec", codec]
     if values.get("curtain") != "on":
         cmd.append("--no-curtain")
     if values.get("audio") != "on":
@@ -385,85 +382,7 @@ _HEAD = """<meta charset="utf-8"><meta name="viewport" content="width=device-wid
 <style> :root { color-scheme: dark; } * { box-sizing: border-box; }
  body { margin:0; background:#16171a; color:#e8e8ea; font:15px -apple-system,"Segoe UI",system-ui,sans-serif; } </style>"""
 
-_FORM = """<!doctype html><html><head><title>iShareScreen — Connect</title>__HEAD__
-<style>
- body { min-height:100vh; display:grid; place-items:center; }
- .card { width:360px; background:#1e1f22; border:1px solid #2c2e33; border-radius:16px; padding:28px 28px 24px; box-shadow:0 12px 40px #0008; }
- h1 { margin:0 0 2px; font-size:22px; } .sub { margin:0 0 20px; color:#9aa0a6; font-size:13px; }
- label { display:block; margin:0 0 6px; color:#c7c9cf; font-size:13px; }
- input[type=text],input[type=password],input[type=number],select { width:100%; margin:0 0 14px; padding:10px 12px; font-size:15px; color:#e8e8ea; background:#2b2d31; border:1px solid #3a3d42; border-radius:9px; outline:none; }
- input:focus,select:focus { border-color:#4f8cff; }
- .row { display:flex; gap:10px; align-items:center; margin:2px 0 12px; } .row input { width:auto; margin:0; }
- button { width:100%; margin-top:8px; padding:12px; font-size:15px; font-weight:600; color:#fff; background:#4f8cff; border:0; border-radius:9px; cursor:pointer; } button:hover { background:#5f97ff; }
-</style></head><body>
- <form class="card" method="post" action="/connect" onsubmit="return prepVideo()">
-  <h1>iShareScreen</h1><p class="sub">Connect to a Mac</p>
-  <label>Host</label><input type="text" name="host" placeholder="Mac hostname or IP" value="__HOST__" autofocus>
-  <label>Port</label><input type="number" name="port" value="__PORT__" min="1" max="65535" required>
-  <label>User</label><input type="text" name="user" placeholder="macOS account" value="__USER__">
-  <label>Authentication</label><select name="auth">
-   <option value="srp" __SRP_SEL__>Password (SRP)</option>
-   <option value="nonsrp" __NONSRP_SEL__>Password (legacy RSA1)</option>
-   <option value="kerberos" __KERBEROS_SEL__>Kerberos</option>
-  </select>
-  <label>Password</label><input type="password" name="password" placeholder="Leave blank to use saved password" autocomplete="current-password">
-  <div class="row"><input type="checkbox" name="remember_password" id="remember-password" __REMEMBER__><label for="remember-password" style="margin:0">Remember password in system credential store</label></div>
-  <button type="button" onclick="forgetPassword()" style="background:#2b2d31;font-size:13px;margin-bottom:14px">Forget saved password</button>
-  <p id="credential-status" role="status" style="font-size:13px;color:#9aa0a6"></p>
-  <label>Frontend</label>
-  <select name="frontend"><option value="browser" __BROWSER_SEL__>browser (WebTransport + WebCodecs)</option><option value="desktop" __DESKTOP_SEL__>desktop (native window)</option></select>
-  <label>Resolution</label>
-  <select name="advertise" title="The encoded pixel resolution = how much bandwidth you use. Higher = sharper + more bandwidth. UI size is set separately by Display scale.">
-   <option value="auto" selected>Auto — track window size</option>
-   <option value="3840x2160">3840 × 2160 (4K UHD)</option>
-   <option value="3440x1440">3440 × 1440 (UWQHD)</option>
-   <option value="2560x1600">2560 × 1600 (WQXGA)</option>
-   <option value="2560x1440">2560 × 1440 (QHD)</option>
-   <option value="1920x1200">1920 × 1200 (WUXGA)</option>
-   <option value="1920x1080">1920 × 1080 (FHD)</option>
-   <option value="1680x1050">1680 × 1050 (WSXGA+)</option>
-   <option value="1600x900">1600 × 900 (HD+)</option>
-   <option value="1366x768">1366 × 768 (WXGA)</option>
-   <option value="1280x720">1280 × 720 (HD)</option>
-   <option value="1024x768">1024 × 768 (XGA)</option>
-   <option value="800x600">800 × 600 (SVGA)</option>
-  </select>
-  <label>Display scale</label>
-  <select name="scale" title="How large the host UI is drawn — like Windows display scaling (100%–400%). Higher = bigger text/UI. This does NOT change bandwidth; Resolution does.">
-   <option value="1.0">100% — smallest UI, most desktop space</option>
-   <option value="1.5">150%</option>
-   <option value="2.0" selected>200% — Retina (normal UI, crisp)</option>
-   <option value="2.5">250%</option>
-   <option value="3.0">300% — large UI</option>
-   <option value="3.5">350%</option>
-   <option value="4.0">400% — largest UI</option>
-  </select>
-  <label>Decoder</label>
-  <select name="decoder" title="Only decoders available on this computer are listed. 'Auto' picks the best one; the rest are for pinning a specific path when debugging.">
-   __DECODER_OPTIONS__
-  </select>
-  <div class="row"><input type="checkbox" name="audio" id="audio" checked><label for="audio" style="margin:0">Audio</label></div>
-  <div class="row"><input type="checkbox" name="curtain" id="curtain" checked><label for="curtain" style="margin:0">Curtain (private virtual display)</label></div>
-  <button type="submit">Connect</button>
- </form>
- <script>
- async function forgetPassword(){
-   const status=document.getElementById('credential-status');
-   status.textContent='Removing saved password…';
-   try{
-     const form=document.querySelector('form'), body=new URLSearchParams();
-     for(const key of ['host','port','user']) body.set(key,form.elements[key].value);
-     const response=await fetch('/forget-password',{method:'POST',body});
-     status.textContent=await response.text();
-   }catch(e){status.textContent='Could not reach credential store';}
- }
- // Open the video tab DURING the Connect click (a real user gesture, so no
- // popup-block) — but the URL doesn't exist yet, so point it at a local
- // "Connecting…" page that polls for the real URL and redirects itself. Only
- // for the browser frontend; the desktop frontend has no video page.
- function prepVideo(){ try{ var f=document.querySelector('[name=frontend]');
-   if(f&&f.value==='browser') window.open('/video-wait','_blank'); }catch(e){} return true; }
- </script></body></html>"""
+_FORM = (Path(__file__).parent / "static" / "connect.html").read_text(encoding="utf-8")
 
 _VIDEO_WAIT = """<!doctype html><html><head><meta charset="utf-8"><title>Connecting…</title>
 <style>body{background:#16171a;color:#c7c9cf;font:15px -apple-system,system-ui,sans-serif;display:flex;height:100vh;margin:0;align-items:center;justify-content:center;flex-direction:column;gap:16px}.s{width:34px;height:34px;border:3px solid #2c2e33;border-top-color:#4f8cff;border-radius:50%;animation:r .8s linear infinite}@keyframes r{to{transform:rotate(360deg)}}</style></head>
@@ -687,7 +606,7 @@ def _decoder_options_html() -> str:
             if not _spec_offerable(s, probe_ready):
                 continue
             label = _DECODER_LABELS.get(s.name, f"{s.codec.upper()} — {s.name}")
-            opts.append(f'<option value="{_h.escape(s.name, quote=True)}">'
+            opts.append(f'<option value="{_h.escape(s.name, quote=True)}" data-codec="{s.codec}">'
                         f'{_h.escape(label)}</option>')
     except Exception:
         pass  # registry unavailable → just offer Auto
@@ -864,7 +783,13 @@ def main() -> int:
     # dropdown reflects real availability and the session doesn't re-probe at
     # stream start (the "hevc444 probe: unavailable" log noise).
     threading.Thread(target=_warm_decoder_probe, daemon=True).start()
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    # A stable origin lets browser localStorage survive launcher restarts.
+    try:
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 49731), _Handler)
+    except OSError as error:
+        print(f"Cannot open the launcher at http://127.0.0.1:49731/: {error}")
+        print("Close the previous launcher and run iss again.")
+        return 1
     _GUI_PORT = server.server_address[1]
     url = f"http://127.0.0.1:{_GUI_PORT}/"
     print(f"iShareScreen → {url}")

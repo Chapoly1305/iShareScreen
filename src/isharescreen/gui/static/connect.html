@@ -1,0 +1,148 @@
+<!doctype html><html><head><title>iShareScreen — Connect</title>__HEAD__
+<style>
+ body { min-height:100vh; display:grid; place-items:center; padding:32px 0; }
+ .card { width:min(680px, calc(100vw - 32px)); background:#1e1f22; border:1px solid #2c2e33; border-radius:16px; padding:28px 28px 24px; box-shadow:0 12px 40px #0008; }
+ h1 { margin:0 0 2px; font-size:22px; } .sub { margin:0 0 20px; color:#9aa0a6; font-size:13px; }
+ label { display:block; margin:0 0 6px; color:#c7c9cf; font-size:13px; }
+ input[type=text],input[type=password],input[type=number],select { width:100%; margin:0 0 14px; padding:10px 12px; font-size:15px; color:#e8e8ea; background:#2b2d31; border:1px solid #3a3d42; border-radius:9px; outline:none; }
+ input:focus,select:focus { border-color:#4f8cff; }
+ .row { display:flex; gap:10px; align-items:center; margin:2px 0 12px; } .row input { width:auto; margin:0; }
+ button { width:100%; margin-top:8px; padding:12px; font-size:15px; font-weight:600; color:#fff; background:#4f8cff; border:0; border-radius:9px; cursor:pointer; } button:hover { background:#5f97ff; }
+
+ .grid { display:grid; grid-template-columns:1fr 1fr; gap:0 20px; }
+ .wide { grid-column:1 / -1; }
+ details { margin:20px 0; border:1px solid #3a3d42; border-radius:12px; padding:16px; }
+ summary { cursor:pointer; font-weight:600; } details[open] summary { margin-bottom:20px; }
+ .hint { color:#9aa0a6; font-size:13px; line-height:1.5; }
+ .secondary { width:auto; padding:8px 12px; background:#2b2d31; font-size:13px; }
+ input:focus-visible,select:focus-visible,button:focus-visible,summary:focus-visible { outline:2px solid #8cb5ff; outline-offset:3px; }
+ @media(max-width:540px) { .grid { grid-template-columns:1fr; } .card { padding:22px; } }
+</style></head><body>
+ <form class="card" method="post" action="/connect" onsubmit="return prepVideo()">
+  <h1>iShareScreen</h1><p class="sub">Your Mac, wherever you work.</p>
+  <label>Host</label><input type="text" name="host" required placeholder="Mac hostname or IP" value="__HOST__" autofocus>
+  <label>User</label><input type="text" name="user" required placeholder="macOS account" value="__USER__">
+  <label>Password</label><input type="password" name="password" placeholder="Leave blank to use saved password" autocomplete="current-password">
+  <div class="row"><input type="checkbox" name="remember_password" id="remember-password" __REMEMBER__><label for="remember-password" style="margin:0">Remember password in system credential store</label></div>
+  <button type="button" onclick="forgetPassword()" style="background:#2b2d31;font-size:13px;margin-bottom:14px">Forget saved password</button>
+  <p id="credential-status" role="status" style="font-size:13px;color:#9aa0a6"></p>
+  <label>Frontend</label>
+  <select name="frontend"><option value="browser" __BROWSER_SEL__>Browser — open a video tab</option><option value="desktop" __DESKTOP_SEL__>Desktop — open a native window</option></select>
+  <details id="advanced"><summary>Advanced settings</summary>
+  <p class="hint">Choose the video format and decoding path, display size, and connection options.</p>
+  <div class="grid"><div>  <label>Port</label><input type="number" name="port" value="__PORT__" min="1" max="65535" required>
+</div><div>  <label>Authentication</label><select name="auth">
+   <option value="srp" __SRP_SEL__>Password (SRP)</option>
+   <option value="nonsrp" __NONSRP_SEL__>Password (legacy RSA1)</option>
+   <option value="kerberos" __KERBEROS_SEL__>Kerberos</option>
+  </select>
+</div></div>
+  <label for="codec">Video codec</label><select name="codec" id="codec">
+   <option value="auto">Auto — choose for this viewer</option>
+   <option value="hevc">HEVC — full-color 4:4:4 desktop path</option>
+   <option value="avc">H.264 — compatible 4:2:0 path</option>
+  </select>
+  <p class="hint" id="video-hint">Browser viewing uses H.264. Choose Desktop for HEVC and manual decoder selection.</p>
+  <label>Resolution</label>
+  <select name="advertise" title="The encoded pixel resolution = how much bandwidth you use. Higher = sharper + more bandwidth. UI size is set separately by Display scale.">
+   <option value="auto" selected>Auto — track window size</option>
+   <option value="3840x2160">3840 × 2160 (4K UHD)</option>
+   <option value="3440x1440">3440 × 1440 (UWQHD)</option>
+   <option value="2560x1600">2560 × 1600 (WQXGA)</option>
+   <option value="2560x1440">2560 × 1440 (QHD)</option>
+   <option value="1920x1200">1920 × 1200 (WUXGA)</option>
+   <option value="1920x1080">1920 × 1080 (FHD)</option>
+   <option value="1680x1050">1680 × 1050 (WSXGA+)</option>
+   <option value="1600x900">1600 × 900 (HD+)</option>
+   <option value="1366x768">1366 × 768 (WXGA)</option>
+   <option value="1280x720">1280 × 720 (HD)</option>
+   <option value="1024x768">1024 × 768 (XGA)</option>
+   <option value="800x600">800 × 600 (SVGA)</option>
+  </select>
+  <label>Display scale</label>
+  <select name="scale" title="How large the host UI is drawn — like Windows display scaling (100%–400%). Higher = bigger text/UI. This does NOT change bandwidth; Resolution does.">
+   <option value="1.0">100% — smallest UI, most desktop space</option>
+   <option value="1.5">150%</option>
+   <option value="2.0" selected>200% — Retina (normal UI, crisp)</option>
+   <option value="2.5">250%</option>
+   <option value="3.0">300% — large UI</option>
+   <option value="3.5">350%</option>
+   <option value="4.0">400% — largest UI</option>
+  </select>
+  <label>Decoder</label>
+  <select name="decoder" title="Only decoders available on this computer are listed. 'Auto' picks the best one; the rest are for pinning a specific path when debugging.">
+   __DECODER_OPTIONS__
+  </select>
+  <div class="row"><input type="checkbox" name="audio" id="audio" checked><label for="audio" style="margin:0">Audio</label></div>
+  <div class="row"><input type="checkbox" name="curtain" id="curtain" checked><label for="curtain" style="margin:0">Curtain (private virtual display)</label></div>
+  </details>
+  <p class="hint" id="settings-status" role="status">Settings are saved in this browser. Passwords are never saved here.</p>
+  <button type="button" class="secondary" id="reset-settings">Reset settings</button>
+  <button type="submit">Connect to Mac</button>
+ </form>
+ <script>
+
+ const form = document.querySelector('form');
+ const storageKey = 'isharescreen.connection.v1';
+ const fields = ['host','user','port','auth','frontend','codec','decoder','advertise','scale','audio','curtain','remember_password'];
+ const status = document.getElementById('settings-status');
+ function saveSettings(){
+   const settings = {};
+   for(const name of fields){const el=form.elements[name]; settings[name]=el.type==='checkbox'?el.checked:el.value;}
+   settings.advanced=document.getElementById('advanced').open;
+   try {localStorage.setItem(storageKey,JSON.stringify(settings)); status.textContent='Settings saved in this browser. Passwords are never saved here.';}
+   catch(e){status.textContent='Browser storage is unavailable. You can still connect.';}
+ }
+ try {
+   const saved=JSON.parse(localStorage.getItem(storageKey)||'null');
+   if(saved && typeof saved==='object'){
+     for(const name of fields){
+       const el=form.elements[name], value=saved[name];
+       if(el.type==='checkbox'){if(typeof value==='boolean')el.checked=value;}
+       else if(typeof value==='string' && (el.tagName!=='SELECT'||Array.from(el.options).some(o=>o.value===value)))el.value=value;
+     }
+     document.getElementById('advanced').open=saved.advanced===true;
+   }
+ } catch(e){status.textContent='Saved settings could not be read. You can still connect.';}
+ function updateVideo(){
+   const browser=form.elements.frontend.value==='browser';
+   for(const option of form.elements.codec.options) option.disabled=browser&&option.value==='hevc';
+   if(browser && form.elements.codec.value==='hevc')form.elements.codec.value='auto';
+   form.elements.decoder.disabled=browser;
+   for(const option of form.elements.decoder.options){
+     option.disabled=form.elements.codec.value!=='auto' && !!option.dataset.codec && option.dataset.codec!==form.elements.codec.value;
+   }
+   if(form.elements.decoder.selectedOptions[0]?.disabled)form.elements.decoder.value='auto';
+   document.getElementById('video-hint').textContent=browser?'Browser viewing uses H.264; the browser manages decoding.':'Decoder chooses how video is decoded, not which GPU draws the window. Auto tries available hardware; Intel QSV can decode HEVC 4:4:4.';
+ }
+ updateVideo();
+ form.addEventListener('input',saveSettings);
+ form.addEventListener('change',()=>{updateVideo();saveSettings();});
+ document.getElementById('advanced').addEventListener('toggle',saveSettings);
+ document.getElementById('reset-settings').addEventListener('click',()=>{
+   form.reset();form.elements.password.value='';
+   form.elements.codec.value='auto';form.elements.decoder.value='auto';
+   document.getElementById('advanced').open=false;updateVideo();saveSettings();
+ });
+ // Associate every field with its visible label for keyboard and screen-reader use.
+ for(const el of form.querySelectorAll('input,select')){
+   if(!el.id)el.id='field-'+el.name;
+   const label=el.previousElementSibling;if(label&&label.tagName==='LABEL')label.htmlFor=el.id;
+ }
+ async function forgetPassword(){
+   const status=document.getElementById('credential-status');
+   status.textContent='Removing saved password…';
+   try{
+     const form=document.querySelector('form'), body=new URLSearchParams();
+     for(const key of ['host','port','user']) body.set(key,form.elements[key].value);
+     const response=await fetch('/forget-password',{method:'POST',body});
+     status.textContent=await response.text();
+   }catch(e){status.textContent='Could not reach credential store';}
+ }
+ // Open the video tab DURING the Connect click (a real user gesture, so no
+ // popup-block) — but the URL doesn't exist yet, so point it at a local
+ // "Connecting…" page that polls for the real URL and redirects itself. Only
+ // for the browser frontend; the desktop frontend has no video page.
+ function prepVideo(){ saveSettings(); try{ var f=document.querySelector('[name=frontend]');
+   if(f&&f.value==='browser') window.open('/video-wait','_blank'); }catch(e){} return true; }
+ </script></body></html>
