@@ -97,6 +97,7 @@
  function saveSettings(){
    const settings = {};
    for(const name of fields){const el=form.elements[name]; settings[name]=el.type==='checkbox'?el.checked:el.value;}
+   settings.authDefaultsVersion=1;
    settings.advanced=document.getElementById('advanced').open;
    try {localStorage.setItem(storageKey,JSON.stringify(settings)); status.textContent='Settings saved in this browser. Passwords are never saved here.';}
    catch(e){status.textContent='Browser storage is unavailable. You can still connect.';}
@@ -109,8 +110,12 @@
        if(el.type==='checkbox'){if(typeof value==='boolean')el.checked=value;}
        else if(typeof value==='string' && (el.tagName!=='SELECT'||Array.from(el.options).some(o=>o.value===value&&!o.disabled)))el.value=value;
      }
+     // Migrate the previous experimental Kerberos default once. Later
+     // explicit authentication selections continue to be remembered.
+     if(saved.authDefaultsVersion!==1)form.elements.auth.value='srp';
      document.getElementById('advanced').open=saved.advanced===true;
    }
+   if(!saved)form.elements.auth.value='srp';
  } catch(e){status.textContent='Saved settings could not be read. You can still connect.';}
  function updateVideo(){
    const browser=form.elements.frontend.value==='browser';

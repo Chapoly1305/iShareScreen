@@ -98,13 +98,13 @@ def test_form_has_advanced_controls_and_secret_free_storage_allowlist(monkeypatc
     assert "localStorage.setItem" in html
 
 
-def test_new_login_defaults_to_kerberos_without_remembering_password(monkeypatch):
+def test_new_login_defaults_to_srp_without_remembering_password(monkeypatch):
     monkeypatch.setattr(C.sys, "platform", "darwin")
     monkeypatch.setattr(C, "_kerberos_supported", lambda: True)
     monkeypatch.setattr(C, "load_last", lambda: None)
     monkeypatch.setattr(C, "_decoder_options_html", lambda: "")
     html = C._form_page().decode()
-    assert 'value="kerberos" selected' in html
+    assert 'value="srp" selected' in html
     assert 'id="remember-password" checked' not in html
 
 

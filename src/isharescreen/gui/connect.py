@@ -246,7 +246,7 @@ def _kerberos_supported() -> bool:
 
 
 def _default_auth() -> str:
-    return "kerberos" if sys.platform != "win32" and _kerberos_supported() else "srp"
+    return "srp"
 
 
 def _launch(values: dict) -> None:
