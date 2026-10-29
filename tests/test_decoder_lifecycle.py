@@ -70,3 +70,34 @@ def test_restart_claim_has_one_winner_across_threads():
     assert session._claim_restart(103.0, 3.0) is True
     # A new AVC generation must reset even within the HEVC debounce interval.
     assert session._claim_restart(103.1, 0.0) is True
+
+
+def test_close_waits_for_frame_download(monkeypatch):
+    decoder = HevcDecoder(1)
+    entered, release, closing = (threading.Event() for _ in range(3))
+    order = []
+
+    def download(tile):
+        entered.set()
+        assert release.wait(3)
+        order.append("downloaded")
+
+    def close():
+        closing.set()
+        decoder.close()
+
+    monkeypatch.setattr(decoder, "_get_frame_locked", download)
+    monkeypatch.setattr(decoder, "_teardown", lambda: order.append("closed"))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reading = pool.submit(decoder.get_frame, 0)
+        try:
+            assert entered.wait(3)
+            stopping = pool.submit(close)
+            assert closing.wait(3)
+            assert not decoder._lifecycle_lock.acquire(blocking=False)
+            assert order == []
+        finally:
+            release.set()
+        reading.result(timeout=3)
+        stopping.result(timeout=3)
+    assert order == ["downloaded", "closed"]

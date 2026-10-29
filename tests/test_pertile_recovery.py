@@ -73,6 +73,7 @@ def _make_decoder(num_tiles: int = 4, *, with_codec: bool = False) -> HevcDecode
     # State touched by `_decode_one`'s IDR / packet paths.
     d._codec = _StubCodec() if with_codec else None
     d._codec_lock = threading.Lock()
+    d._lifecycle_lock = threading.RLock()
     d._next_pts = 0
     d._pts_to_tile = {}
     d._pts_submit_t = {}

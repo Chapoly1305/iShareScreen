@@ -10,9 +10,10 @@ _SAMPLE = bytes.fromhex(
 )
 
 
-def hardware_accel():
+def hardware_accel(*, defer_download=False):
     from av.codec.hwaccel import HWAccel
-    return HWAccel("d3d11va", options={"vendor_id": "0x1002"}, allow_software_fallback=False)
+    return HWAccel("d3d11va", options={"vendor_id": "0x1002"}, allow_software_fallback=False,
+                   is_hw_owned=defer_download)
 
 
 @lru_cache(maxsize=1)

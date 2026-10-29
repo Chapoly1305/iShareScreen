@@ -509,6 +509,12 @@ class HevcDecoder:
         tile; its healthy siblings keep publishing from their own intact
         DPB history.
         """
+        # A hardware download must finish before restart releases its device.
+        # This also serializes use of the shared presentation reformatter.
+        with self._lifecycle_lock:
+            return self._get_frame_locked(tile_idx)
+
+    def _get_frame_locked(self, tile_idx: int) -> Optional[TileFrame]:
         if not self._dpb_has_idr:
             return None
         if _PERTILE_RECOVERY and tile_idx in self._tiles_await_idr:
@@ -1050,7 +1056,7 @@ class HevcDecoder:
 
             if self._amd_only:
                 from .amd import hardware_accel
-                hw = hardware_accel()
+                hw = hardware_accel(defer_download=True)
             else:
                 hw = HWAccel(device_type=hw_type)
             c = av.CodecContext.create("hevc", "r", hwaccel=hw)

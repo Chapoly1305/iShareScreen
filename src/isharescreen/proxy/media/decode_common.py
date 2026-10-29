@@ -151,13 +151,12 @@ def _av_frame_to_tile(
         if reformatter_holder[0] is None:
             from av.video.reformatter import VideoReformatter
             reformatter_holder[0] = VideoReformatter()
-        # Apple's HEVC stream is RExt 4:4:4 — reformatting to 4:2:0
-        # (nv12) throws away three-quarters of the chroma and produces
-        # visible "pixelated gray" fringing on text and rectangles.
-        # Preserve full chroma. yuv444p is universally supported by
-        # libswscale; the GPU upload path already handles it as planar
-        # full-resolution Y/U/V.
-        frame = reformatter_holder[0].reformat(frame, format="yuv444p")
+        # GPU-owned AMD frames defer the blocking download until presentation.
+        # Preserve their native software format: forcing 4:4:4 would quadruple
+        # chroma storage for a 4:2:0 source and add an unnecessary conversion.
+        software_format = getattr(frame, "sw_format", None)
+        output_format = getattr(software_format, "name", None) or "yuv444p"
+        frame = reformatter_holder[0].reformat(frame, format=output_format)
         fmt = frame.format.name
 
     if fmt in _PACKED_444_FORMATS:
