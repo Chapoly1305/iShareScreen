@@ -234,6 +234,9 @@ def _browser_is_safari(ua: str) -> bool:
 
 
 def _kerberos_supported() -> bool:
+    if sys.platform == "win32":
+        from importlib.util import find_spec
+        return find_spec("spnego") is not None
     if sys.platform == "darwin":
         return True
     if sys.platform.startswith("linux"):
@@ -243,7 +246,7 @@ def _kerberos_supported() -> bool:
 
 
 def _default_auth() -> str:
-    return "kerberos" if _kerberos_supported() else "srp"
+    return "kerberos" if sys.platform != "win32" and _kerberos_supported() else "srp"
 
 
 def _launch(values: dict) -> None:
@@ -656,7 +659,7 @@ def _form_page() -> bytes:
     return (_FORM
             .replace("__DEFAULT_AUTH__", _default_auth())
             .replace("__KERBEROS_DISABLED__", "" if _kerberos_supported() else "disabled")
-            .replace("__AUTH_NOTE__", "" if _kerberos_supported() else "Kerberos is not available in this client on Windows or without a system GSS library. Use Password (SRP).")
+            .replace("__AUTH_NOTE__", "Windows Kerberos via pyspnego is experimental; standalone Macs may need KDC configuration. SRP remains the default." if sys.platform == "win32" and _kerberos_supported() else "" if _kerberos_supported() else "Kerberos is not available in this client on Windows or without a system GSS library. Use Password (SRP).")
             .replace("__HEAD__", _HEAD)
             .replace("__HOST__", _html.escape(host, quote=True))
             .replace("__USER__", _html.escape(user, quote=True))

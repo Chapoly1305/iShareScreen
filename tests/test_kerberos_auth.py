@@ -64,7 +64,7 @@ class GSS:
 @pytest.fixture
 def gss(monkeypatch):
     context = GSS()
-    monkeypatch.setattr(K, "_NativeGSS", lambda: context)
+    monkeypatch.setattr(K, "_gss_backend", lambda: context)
     return context
 
 

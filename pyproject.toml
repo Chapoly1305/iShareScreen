@@ -29,6 +29,7 @@ classifiers = [
 dependencies = [
     # Native OS credential stores; no file-based password persistence.
     "keyring>=25,<26",
+    "pyspnego>=0.12.4,<0.13; sys_platform == 'win32'",
     # Core protocol + media
     "cryptography>=42.0",
     "pycryptodome>=3.20",

@@ -99,6 +99,7 @@ def test_form_has_advanced_controls_and_secret_free_storage_allowlist(monkeypatc
 
 
 def test_new_login_defaults_to_kerberos_without_remembering_password(monkeypatch):
+    monkeypatch.setattr(C.sys, "platform", "darwin")
     monkeypatch.setattr(C, "_kerberos_supported", lambda: True)
     monkeypatch.setattr(C, "load_last", lambda: None)
     monkeypatch.setattr(C, "_decoder_options_html", lambda: "")
