@@ -18,5 +18,5 @@ def test_pc_alt_keys_stay_alt():
 
 
 def test_browser_sends_meta_for_mac_option():
-    html = Path(isharescreen.__file__).parent / "frontend/wt/static/index.html"
+    html = Path(isharescreen.__file__).parent / "frontend/wt/static/viewer.js"
     assert "? 0xffe7 : 0xffe9" in html.read_text()

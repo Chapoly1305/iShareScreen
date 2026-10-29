@@ -179,6 +179,38 @@ def test_avc_never_advertises_unsupported_ltrp():
         config.validate()
 
 
+@pytest.mark.parametrize("codec", ["avc", "hevc", "both"])
+def test_empty_pixel_format_offer_rejected(codec):
+    config = MediaOfferConfig()
+    config.video.codec = codec
+    config.video.pixel_formats = PixelFormat(0)
+    with pytest.raises(ValueError, match="at least one format"):
+        config.validate()
+
+
+@pytest.mark.parametrize("formats", [
+    PixelFormat.YUV444_8_FULL,
+    PixelFormat.YUV444_8_VIDEO | PixelFormat.YUV444_10_FULL,
+    PixelFormat.YUV420_10_VIDEO,
+])
+def test_avc_requires_supported_chroma_and_bit_depth(formats):
+    config = MediaOfferConfig()
+    config.video.codec = "avc"
+    config.video.pixel_formats = formats
+    with pytest.raises(ValueError, match="8-bit YUV420"):
+        config.validate()
+
+
+@pytest.mark.parametrize("formats", [
+    PixelFormat.YUV420_8_FULL, PixelFormat.YUV420_8_VIDEO, PixelFormat.ALL,
+])
+def test_avc_accepts_compatible_pixel_format_sets(formats):
+    config = MediaOfferConfig()
+    config.video.codec = "avc"
+    config.video.pixel_formats = formats
+    config.validate()
+
+
 def test_explicit_audio_capability_override_preserves_legacy_precedence():
     config = MediaOfferConfig()
     config.audio.payload_flags = 12345

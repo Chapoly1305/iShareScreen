@@ -275,6 +275,12 @@ class VideoSettings:
         _uint("hdr_modes", self.hdr_modes)
         if int(self.pixel_formats) & ~int(PixelFormat.ALL):
             raise ValueError("pixel_formats contains unknown capability bits")
+        if not self.pixel_formats:
+            raise ValueError("pixel_formats must advertise at least one format")
+        if self.codec == "avc" and not (self.pixel_formats & (
+            PixelFormat.YUV420_8_FULL | PixelFormat.YUV420_8_VIDEO
+        )):
+            raise ValueError("AVC requires an 8-bit YUV420 pixel format")
         if int(self.hdr_modes) & ~int(HDRMode.ALL):
             raise ValueError("hdr_modes contains unknown capability bits")
         payloads = [p for p in self.payloads if self.codec == "both" or p.payload == (123 if self.codec == "avc" else 100)]

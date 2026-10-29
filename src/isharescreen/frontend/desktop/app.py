@@ -9,6 +9,7 @@ on the render thread.
 from __future__ import annotations
 
 import dataclasses
+from contextlib import ExitStack
 import logging
 import os
 import sys
@@ -211,9 +212,10 @@ def _resolve_hidpi_request(
     return req_w, req_h, scale
 
 
-def run(
+def _run_viewer(
     config: SessionConfig,
     *,
+    resources: ExitStack,
     title: str = "iShareScreen",
     auto_quit_secs: int = 0,
     display: int = -1,
@@ -282,7 +284,10 @@ def run(
         log.info("fixed advertise %dx%d @%gx (rendering the picked resolution)",
                  config.advertise.width, config.advertise.height,
                  config.advertise.hidpi_scale)
+    window_resources = resources.enter_context(ExitStack())
     session = Session(config)
+    # Stop frame producers before closing their native window consumers.
+    resources.callback(session.close)
     session.connect()
 
     # Audio playback. `make_audio_sink()` returns None when the OS
@@ -292,6 +297,7 @@ def run(
     # render thread never touches it.
     audio_sink = make_audio_sink() if config.audio else None
     if audio_sink is not None:
+        resources.callback(audio_sink.stop)
         session.set_audio_callback(audio_sink.feed)
 
     # Clipboard sync (both directions) lives in Session — every frontend
@@ -386,6 +392,7 @@ def run(
     # each window, including the secondary windows below.
     _set_window_identity()
     window = RenderCanvas(title=title, size=(win_w, win_h), max_fps=120)
+    window_resources.callback(window.close)
     glfw_window = window._window  # for raw glfw input callbacks only
     # Lock the window to the content's aspect ratio so the stream always fills
     # it edge-to-edge with no letterbox side-bars (restores pre-merge behavior;
@@ -735,6 +742,7 @@ def run(
             glfw_window,
             key_sender=lambda is_down, ks: session.input.key_event(is_down, ks),
         )
+        resources.callback(kbd_grab.disable)
         # Initial enable if window already focused at startup.
         if glfw.get_window_attrib(glfw_window, glfw.FOCUSED):
             kbd_grab.enable()
@@ -766,6 +774,7 @@ def run(
         win_h2 = max(1, int(base * rh0 / rw0)) if rw0 else base
         _set_window_identity()
         w2 = RenderCanvas(title=title_s, size=(win_w2, win_h2), max_fps=120)
+        window_resources.callback(w2.close)
         gw2 = w2._window
         try:
             glfw.set_window_aspect_ratio(gw2, rw0, rh0)
@@ -1462,30 +1471,22 @@ def run(
             _cursor_dirty["v"] = False
 
     log.info("desktop frontend closing")
-    for sv in secondaries:
-        try:
-            sv.window.close()
-        except Exception:
-            pass
-    if kbd_grab is not None:
-        kbd_grab.disable()
-    if audio_sink is not None:
-        audio_sink.stop()
-    session.close()
-    # Explicit window close — triggers orderly wgpu cleanup. Without
-    # this we'd rely on __del__ when locals fall out of scope, and the
-    # interpreter's GC ordering can deadlock the wgpu native poller
-    # (observed: main thread stuck in wgpu _release proxy_func at exit).
-    try:
-        window.close()
-    except Exception as e:
-        log.debug("window.close() failed: %s", e)
-    # Fail-safe: bypass Python's interpreter-shutdown phase. We've
-    # already released the network sockets, audio device, and X11
-    # grab; anything left to clean up belongs to the kernel and gets
-    # reclaimed by the process exit. Avoids the rare wgpu-__del__
-    # deadlock at scope unwind that leaves the process hung.
-    os._exit(0)
+    return 0
+
+
+def run(config: SessionConfig, *, exit_process: bool = False, **options) -> int:
+    """Run a viewer with deterministic resource ownership.
+
+    Only the CLI requests the native process-exit workaround. Embedders and
+    tests receive a normal return after resources have been released.
+    """
+    with ExitStack() as resources:
+        result = _run_viewer(config, resources=resources, **options)
+    if exit_process:
+        # Retain the existing workaround for native destructor crashes at exit.
+        os._exit(result)
+    return result
+
 
 
 __all__ = ["run"]

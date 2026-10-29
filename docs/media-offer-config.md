@@ -1,5 +1,27 @@
 # 配置启动媒体协商
 
+## CLI precedence and hardware preset example
+
+Explicit `--codec` / `--decoder` flags override inherited environment settings.
+Omitting a flag preserves the inherited value; explicitly passing `auto` clears
+that override and uses the frontend's normal automatic selection.
+
+For an RX 6800 XT using the existing H.264 path:
+
+```sh
+iss --host mac.local -u me --frontend desktop --codec avc --decoder libav-avc420
+```
+
+`libav-avc420` is the decoder registry ID. `d3d11va` is a hardware backend
+chosen internally on Windows, not a valid `--decoder` name. Hardware may still
+fall back to software if initialization fails. A JSON preset loader is not yet
+implemented; a future preset for this path should use `codec: avc`,
+`chroma: "420"`, and `decoder: libav-avc420`.
+
+Pixel format offers must be nonempty. AVC offers must include an 8-bit 4:2:0
+format; HEVC 4:2:0 remains available through the low-level offer configuration
+but advertising it does not prove the host or selected decoder supports it.
+
 `src/isharescreen/proxy/protocol/media_config.py` 将启动 offer 的已复原字段保存为可编辑的 Python dataclass。配置经 `create_offers()` 序列化为 plist/zlib/protobuf，也可以直接交给 `SessionConfig.media_offer`。每次 offer 的 SSRC、时间戳和 UUID 仍由构造器生成。
 
 ## 常用配置

@@ -219,7 +219,7 @@ def select(codec: str, *, override: Optional[str] = None) -> Optional[DecoderSpe
     return None
 
 
-def build_best(codec: str, *, override: Optional[str], num_tiles: int, **opts):
+def build_best(codec: str, *, override: Optional[str], num_tiles: int, initialize=None, **opts):
     """Select + construct a decoder for `codec`, falling through to the next
     available candidate if construction fails (preserves the old HW→libav
     fallback). Returns (spec, decoder) or (None, None)."""
@@ -227,11 +227,19 @@ def build_best(codec: str, *, override: Optional[str], num_tiles: int, **opts):
     ordered = ([chosen] if chosen else [])
     ordered += [s for s in candidates(codec) if s is not chosen and s.available()]
     for spec in ordered:
+        dec = None
         try:
             dec = spec.build(num_tiles, **opts)
+            if initialize is not None:
+                initialize(dec)
             log.info("decoder: %s — %s", spec.name, spec.note)
             return spec, dec
         except Exception as e:
+            if dec is not None:
+                try:
+                    dec.close()
+                except Exception:
+                    log.exception("failed decoder cleanup: %s", spec.name)
             log.warning("decoder %s failed to start (%s) — trying next candidate",
                         spec.name, e)
     return None, None
@@ -239,7 +247,7 @@ def build_best(codec: str, *, override: Optional[str], num_tiles: int, **opts):
 
 # ── codec negotiation (moved here from hwcaps to break the import cycle) ──
 
-def resolve_codec(choice: str) -> str:
+def resolve_codec(choice: str, *, decoder_override: Optional[str] = None) -> str:
     """Resolve a `--codec` value to a concrete 'hevc' / 'avc'. 'auto' offers
     HEVC when any 4:4:4 hardware decoder is available, else H.264 4:2:0.
 
@@ -250,7 +258,7 @@ def resolve_codec(choice: str) -> str:
     codec still wins, and select() rejects incompatible decoder overrides."""
     if choice != "auto":
         return choice
-    raw = os.environ.get("ISS_DECODER", "").strip().lower()
+    raw = (decoder_override if decoder_override is not None else os.environ.get("ISS_DECODER", "")).strip().lower()
     name = _ALIASES.get(raw, raw)
     for spec in _REGISTRY:
         if spec.name == name and spec.supported_here():

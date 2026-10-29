@@ -39,6 +39,9 @@ from typing import Callable, Literal, Optional
 import numpy as np
 
 from .media.tiles import TileFrame
+from .config import SessionConfig
+from .media.decoder import Decoder
+from .media.options import DecoderOptions
 from .input import InputController
 from .media.aac_eld import AacEldDecoder, make_aac_eld_decoder
 from .media.hevc import HevcDecoder
@@ -206,117 +209,6 @@ class _CursorImage:
     rgba: bytes
 
 
-@dataclass
-class SessionConfig:
-    """Connection parameters. Defaults are conservative; the CLI
-    overrides whatever the user customised."""
-
-    host: str
-    username: str
-    password: str
-    port: int = 5900
-    auth_mode: Literal["srp", "nonsrp", "kerberos"] = "srp"
-    advertise: Optional[AdvertiseDims] = None
-    hdr: bool = False
-    audio: bool = True
-    # HiDPI mode for the host's virtual display, resolved to a backing:point
-    # ratio by the frontend (which knows the window size):
-    #   "on"   → always 2× (Retina): crisp, but ~4× the pixels = more
-    #            bandwidth, and UI renders half-size on a non-Retina client.
-    #   "off"  → always 1× (flat, backing == logical): far less bandwidth,
-    #            correctly-sized UI on non-Retina (Linux/Windows) clients.
-    #   "auto" → match the LOCAL display: 2× on a Retina client, 1× on a
-    #            non-Retina one (so the stream maps 1:1 to the client's pixels);
-    #            2× is downgraded to 1× when it wouldn't fit the host's
-    #            3840×2160 cap (window logical > 1920×1080).
-    # The frontend passes the resolved scale into send_dynamic_resolution and
-    # the initial AdvertiseDims; the proxy itself only carries the mode.
-    hidpi: str = "auto"
-
-    # When auth user differs from the console user, ask the console user
-    # to share their existing session (Apple's "Ask to share" choice in
-    # the Screen Sharing.app prompt). On accept, the viewer joins the
-    # console session in observe-only mode rather than starting an
-    # alt-user virtual display. False (default) = no SessionSelect exchange.
-    share_console: bool = False
-
-    # When auth user differs from the console user, log them in to a
-    # fresh virtual display via Apple's cmd=2 SessionSelect path
-    # (encrypted creds at body+0x48 / +0x88; daemon spawns user2's
-    # vdisplay; iss replays Apple Screen Sharing's canned 308-byte SDC so the
-    # encoder targets the new vdisplay rather than the console user's
-    # screen). Mutually exclusive with `share_console`.
-    alt_session: bool = False
-
-    # Optional callback () -> "share_console" | "alt_session". Invoked during
-    # negotiation when a different user is at the console and neither flag was
-    # forced — lets a launcher (the GUI) prompt the user at connect time.
-    on_session_choice: "Optional[Callable[[str], str]]" = None
-
-    # Curtain mode: send the SetDisplayConfiguration message during
-    # negotiation so the daemon spins up a SkyLight virtual display
-    # and blanks the host's physical screen while we view. When False,
-    # we skip that message entirely — the daemon then encodes whatever
-    # is on the physical display, no curtain. Default on for privacy
-    # (the host's screen isn't broadcast to anyone walking past). The
-    # cmd=2 alt-session path ignores this flag and always sends Apple's
-    # canned SDC instead.
-    curtain: bool = True
-
-    # Which 4-SSRC quality tier to subscribe to (0 = highest, ascending = lower).
-    quality_tier: int = 0
-
-    # AAC-ELD backend override (None → platform default).
-    aac_backend: Optional[str] = None
-
-    # Whether to perform Apple's two-TCP warmup before the real session.
-    # Required for surviving lock-screen → login → desktop transitions
-    # without the daemon closing our TCP. Defaults to True.
-    warmup_tcp: bool = True
-
-    # UDP port overrides — None ⇒ port + 0/1 (Apple's layout: audio
-    # rtcp-muxes onto ctrl_port; video rtcp-muxes onto video_port).
-    # Custom values let a NAT relay route the streams.
-    udp_ctrl_port: Optional[int] = None
-    udp_video_port: Optional[int] = None
-    udp_bind_host: str = ""  # "" = INADDR_ANY
-
-    # Local control socket: when set, the Session opens a ControlServer at
-    # this path (UDS on POSIX, sidecar `.port` file on Windows) so an
-    # external TUI / monitor can subscribe to snapshots and (later) issue
-    # commands. None = no control server.
-    control_socket: Optional[str] = None
-
-    # Packet capture: when set, every byte that crosses the TCP control
-    # socket and the two UDP media sockets is written — exactly as it goes
-    # on the wire (still enc1103/SRTP encrypted) — to a classic `.pcap` at
-    # this path, with synthetic Ethernet/IPv4/TCP|UDP framing. The result is
-    # byte-identical to a packet-capture dump and feeds straight into the
-    # bundled Python dissector (which derives the keys from the cleartext
-    # handshake it sees) or Wireshark. None ⇒ no capture; zero overhead.
-    record_pcap: Optional[str] = None
-
-    # Dynamic resolution: the frontend issues a mid-session resize (via
-    # Session.send_dynamic_resolution) whenever the viewer window changes
-    # size, so the host's virtual display re-renders sharp at the new size
-    # instead of stretching a fixed canvas. This is an IN-BAND change on
-    # the existing connection — 0x1d → server 0x451 → 0x1c re-offer →
-    # encoder restart — no reconnect. Purely a frontend concern; the
-    # protocol layer doesn't read this flag, it rides along with the rest
-    # of the config to the desktop viewer. Off ⇒ classic fixed canvas
-    # (the window just stretches the stream on resize).
-    dynamic_resolution: bool = False
-    # Editable startup offer. None uses the existing ISS_* environment choices.
-    # Session snapshots it at construction; this is not a live control API.
-    media_offer: Optional[MediaOfferConfig] = field(default=None, kw_only=True)
-
-    # Credential persistence is supplied by the launcher, after successful
-    # negotiation. These remain last to preserve existing positional callers.
-    on_authenticated: Optional[Callable[[], None]] = None
-    krb_realm: str = ""
-    krb_principal: str = ""
-    krb_service: str = ""
-
 # ── internal RTP packet group ────────────────────────────────────────
 
 # A single RTP packet's metadata after SRTP decrypt. Kept as a tuple to
@@ -331,7 +223,8 @@ class Session:
     """Connection + decode pipeline for one Apple HP screen-share session."""
 
     def __init__(self, config: SessionConfig) -> None:
-        self._config = config
+        self._config = deepcopy(config)
+        self._decoder_options = config.decoder_options or DecoderOptions.from_environment()
         self._media_offer_config = (
             deepcopy(config.media_offer) if config.media_offer is not None
             else MediaOfferConfig.from_environment()
@@ -374,7 +267,7 @@ class Session:
         # the SPS we last configured, so we only restart on an actual change.
         self._avc_needs_reconfig: bool = False
         self._avc_cfg_sps: bytes = b""
-        self._decoder: Optional[object] = None
+        self._decoder: Optional[Decoder] = None
         self._aac: Optional[AacEldDecoder] = None
         self._input: Optional[InputController] = None
         # Reassembler for multi-cipher-frame msg 0x1f (clipboard) sends.
@@ -1179,7 +1072,7 @@ class Session:
         import os as _os
         import sys as _sys
         from .media import registry
-        prefer_hwaccel = _os.environ.get("ISS_FORCE_SW_HEVC", "0") == "0"
+        prefer_hwaccel = self._decoder_options.prefer_hardware
         # Decoder selection. On macOS the native VideoToolbox path
         # (VTDecompressionSession, vtdecode.py) decodes Apple's stream the way
         # its own viewer does — VideoToolbox manages the DPB and conceals the
@@ -1188,7 +1081,7 @@ class Session:
         # freeze). It's the default on macOS; `ISS_DECODER=libav` forces the
         # cross-platform libav path, and `ISS_FORCE_SW_HEVC=1` forces libav
         # software (and therefore libav).
-        _decoder_choice = _os.environ.get("ISS_DECODER", "auto").lower()
+        _decoder_choice = self._decoder_options.override.lower()
         # Per-codec hardware-accel preference, then registry-driven selection
         # (media/registry.py owns the capability matrix + override handling).
         if self._video_codec == "avc":
@@ -1212,7 +1105,7 @@ class Session:
                          "(every ~%d frames since IDR, d3d11va POC-wrap "
                          "workaround)", self._AVC_REANCHOR_FRAMES)
             elif (_sys.platform == "win32"
-                    and _os.environ.get("ISS_AVC_HWACCEL", "1") == "0"):
+                    and not self._decoder_options.avc_hardware):
                 avc_prefer_hwaccel = False
                 log.info("AVC: forcing software decode "
                          "(ISS_AVC_HWACCEL=0; d3d11va POC-wrap workaround)")
@@ -1226,10 +1119,15 @@ class Session:
             _override = ("libav-hevc444" if not prefer_hwaccel
                          else registry.normalize_override(_decoder_choice, "hevc"))
 
+        def initialize_decoder(decoder):
+            decoder.set_params(burst.vps, burst.sps, burst.all_pps)
+            decoder.start()
+            decoder.feed_burst(burst.tile_nalus)
+
         _spec, self._decoder = registry.build_best(
             self._video_codec, override=_override, num_tiles=num_tiles,
             enable_quality_gate=True, on_frame_published=self._on_frame_published,
-            prefer_hwaccel=_pf,
+            prefer_hwaccel=_pf, initialize=initialize_decoder,
         )
         if self._decoder is None:
             raise RuntimeError(
@@ -1237,15 +1135,12 @@ class Session:
                 f"(override={_override!r})")
         if not prefer_hwaccel:
             log.info("ISS_FORCE_SW_HEVC=1: HW decoders disabled")
-        self._decoder.set_params(burst.vps, burst.sps, burst.all_pps)
         self._avc_cfg_sps = burst.sps or b""
-        self._decoder.start()
         # Mark the start of the burst-feed window so the DPB-break
         # fast-path stays graced through it; libav fires "Could not
         # find ref" transiently as the cold context catches up.
         self._last_decoder_restart_t = time.monotonic()
         self._dpb_error_window.clear()
-        self._decoder.feed_burst(burst.tile_nalus)
         # Install a libavcodec log callback that turns concealment
         # log messages into FIR requests. Idempotent — subsequent
         # connects keep the same callback hooked.
@@ -1641,6 +1536,9 @@ class Session:
                     socket.SOL_SOCKET, socket.SO_LINGER,
                     struct.pack("ii", 1, 0),
                 )
+            except OSError:
+                pass
+            try:
                 self._negotiation.sock.close()
             except OSError:
                 pass

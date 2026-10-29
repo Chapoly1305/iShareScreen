@@ -48,6 +48,8 @@ from ...proxy.session import Session, SessionConfig
 from ...proxy.media.avc_nalu import au_is_keyframe, au_has_sps
 from ...proxy.media.avc import _patch_avc_sps_dpb
 from .audio import OpusEncoder
+from .access import ViewerAccess
+from ...proxy.protocol.auth import AuthError
 from .capsule import CapsuleType, H3Capsule, H3CapsuleDecoder
 from .cert import write_cert, trust_cert_in_keychain, is_cert_trusted
 
@@ -407,7 +409,7 @@ class _BridgeProtocol(QuicConnectionProtocol):
             protocol = headers.get(b":protocol", b"").decode()
             log.info(
                 "H3 HEADERS stream=%d method=%s path=%s protocol=%s",
-                event.stream_id, method, path, protocol,
+                event.stream_id, method, path.partition("?")[0], protocol,
             )
             base_path, _, query = path.partition("?")
             if (method == "CONNECT"
@@ -418,6 +420,9 @@ class _BridgeProtocol(QuicConnectionProtocol):
                 # long-lived-stream transport via ?transport=single (Safari does,
                 # to stay under its WebTransport uni-stream credit); the global
                 # env flag forces it for everyone.
+                if not self._bridge._access.allows_connect(headers):
+                    self._send_status(event.stream_id, 403, b"forbidden")
+                    return
                 single = _VIDEO_SINGLE_STREAM or "transport=single" in query
                 self._accept_webtransport(event.stream_id, single)
             elif method == "GET":
@@ -532,6 +537,9 @@ class _BridgeProtocol(QuicConnectionProtocol):
         if path == "/" or path == "":
             html = (_STATIC_DIR / "index.html").read_bytes()
             self._send_response(stream_id, 200, b"text/html; charset=utf-8", html)
+        elif path in ("/viewer.js", "/audio-worklet.js"):
+            body = (_STATIC_DIR / path.lstrip("/")).read_bytes()
+            self._send_response(stream_id, 200, b"text/javascript", body)
         elif path == "/cert-hash":
             payload = self._bridge.cert_sha256.encode()
             self._send_response(stream_id, 200, b"text/plain", payload)
@@ -578,6 +586,12 @@ class WebTransportBridge:
     ) -> None:
         self._config = config
         self._port = port
+        self._access = ViewerAccess(port)
+        self._session_generation = 0
+        self._session_operation_lock = threading.Lock()
+        self._retired_sessions = []
+        self._retry_timer = None
+        self._closed = False
         # Opt-in: install our self-signed cert into the macOS login
         # keychain so Safari (which ignores serverCertificateHashes) can
         # do WebTransport. Set True once trusted — the page then connects
@@ -662,7 +676,7 @@ class WebTransportBridge:
                     log.info("evicting stale viewer %d (last_seen=%.1fs ago)",
                              v.session_id, now - v.last_seen_t)
                     self.remove_viewer(v)
-        asyncio.create_task(_viewer_watchdog())
+        watchdog = asyncio.create_task(_viewer_watchdog())
 
         # Two listeners:
         #   port (UDP)  — WebTransport / HTTP/3 over QUIC. Browsers use
@@ -676,41 +690,32 @@ class WebTransportBridge:
         # to both ::1 and 127.0.0.1 and prefers ::1 — without an IPv6
         # listener it sees ICMP port-unreachable and reports the WT
         # connect as ERR_CONNECTION_REFUSED without trying IPv4.
-        await quic_serve(
-            host="::",
-            port=self._port,
-            configuration=config,
-            create_protocol=lambda *a, **kw: _BridgeProtocol(
-                *a, bridge=self, **kw,
-            ),
-        )
-        # Also bind a separate IPv4 listener — `::` dual-stack is the
-        # default on Linux/macOS but aioquic creates a single socket;
-        # if dual-stack is disabled (Windows, hardened Linux) we still
-        # need an explicit v4 socket.
+        listeners = []
         try:
-            await quic_serve(
-                host="0.0.0.0",
-                port=self._port,
-                configuration=config,
-                create_protocol=lambda *a, **kw: _BridgeProtocol(
-                    *a, bridge=self, **kw,
-                ),
-            )
-        except OSError as e:
-            log.debug("v4 bind skipped (dual-stack already covers it): %s", e)
-        await self._start_http_bootstrap()
-        # Use localhost, not the LAN IP: Chrome/Edge only expose WebTransport in
-        # a secure context, and http://localhost qualifies while http://<LAN-IP>
-        # does not. localhost also matches the self-signed cert (cert.py issues
-        # it for localhost / 127.0.0.1, not the LAN address), and the dual-stack
-        # listeners above exist precisely so localhost (::1 / 127.0.0.1) works.
-        url = f"http://localhost:{self._port}/"
-        log.info("WebTransport bridge ready:")
-        log.info("  open this URL in Chrome/Edge/Firefox: %s", url)
-        log.info("  (HTML on tcp/%d, WebTransport on udp/%d)",
-                 self._port, self._port)
-        await asyncio.Event().wait()
+            for host in ("127.0.0.1", "::1"):
+                try:
+                    listeners.append(await quic_serve(
+                        host=host, port=self._port, configuration=config,
+                        create_protocol=lambda *a, **kw: _BridgeProtocol(
+                            *a, bridge=self, **kw),
+                    ))
+                except OSError:
+                    if host == "127.0.0.1":
+                        raise
+                    log.debug("IPv6 loopback unavailable", exc_info=True)
+            await self._start_http_bootstrap()
+            url = f"http://localhost:{self._port}/#token={self._access.token}"
+            log.info("WebTransport bridge ready:")
+            log.info("  open this URL in Chrome/Edge/Firefox: %s", url)
+            await asyncio.Event().wait()
+        finally:
+            watchdog.cancel()
+            await asyncio.gather(watchdog, return_exceptions=True)
+            for listener in listeners:
+                listener.close()
+            runner = getattr(self, "_http_runner", None)
+            if runner is not None:
+                await runner.cleanup()
 
     async def _start_http_bootstrap(self) -> None:
         """Tiny aiohttp server that delivers the viewer page + cert
@@ -798,7 +803,25 @@ class WebTransportBridge:
             }
             return web.json_response(payload, headers=nocache)
 
-        app = web.Application()
+        @web.middleware
+        async def authorize(req, handler):
+            # Static assets contain no session data. All state and control routes
+            # require the per-launch credential, supplied in a header by the page.
+            if req.host not in self._access.authorities:
+                raise web.HTTPForbidden()
+            if req.path not in ("/", "/viewer.js", "/audio-worklet.js"):
+                if not self._access.allows(req.host, req.headers.get("Origin"),
+                                          req.headers.get("X-ISS-Token", "")):
+                    raise web.HTTPForbidden()
+            response = await handler(req)
+            response.headers["Referrer-Policy"] = "no-referrer"
+            return response
+
+        app = web.Application(middlewares=[authorize])
+        async def viewer_script(req):
+            return web.FileResponse(_STATIC_DIR / "viewer.js")
+
+        app.router.add_get("/viewer.js", viewer_script)
         app.router.add_get("/", index)
         app.router.add_get("/cert-hash", cert_hash)
         app.router.add_get("/wt-config", wt_config)
@@ -807,7 +830,7 @@ class WebTransportBridge:
         app.router.add_get("/stats", stats_endpoint)
         runner = web.AppRunner(app, access_log=None)  # don't log every /stats poll
         await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", self._port)
+        site = web.TCPSite(runner, "127.0.0.1", self._port)
         await site.start()
         self._http_runner = runner
         log.info("server cert sha256 = %s", self.cert_sha256)
@@ -818,54 +841,50 @@ class WebTransportBridge:
         except KeyboardInterrupt:
             pass
         finally:
+            self._closed = True
             self._teardown_session()
         return 0
 
     # -- viewer management --------------------------------------------
 
+    def _begin_start_locked(self):
+        if self._closed or not self.viewers or self._session is not None or self._session_starting:
+            return
+        self._session_starting = True
+        self._session_generation += 1
+        generation = self._session_generation
+        threading.Thread(target=self._start_session_thread, args=(generation,),
+                         name="wt-session-start", daemon=True).start()
+
     def add_viewer(self, viewer: _ViewerSession) -> None:
         with self._viewers_lock:
+            if self._closed:
+                return
             self.viewers.append(viewer)
-            if self._session is None and not self._session_starting:
-                self._session_starting = True
-                # Run session.connect() in a thread — it does sync
-                # SRP+RFB+burst gather (5-10s). On the asyncio loop
-                # this would freeze QUIC event processing and Chrome
-                # times out the WT keepalive.
-                threading.Thread(
-                    target=self._start_session_thread,
-                    name="wt-session-start", daemon=True,
-                ).start()
-            elif self._session is not None:
-                # Late joiner: resend the geometry/codec config, and FIR all
-                # tiles so a fresh keyframe (with SPS/PPS prepended in
-                # _on_video_au) follows for this viewer to start decoding.
+            session = self._session
+            cached = []
+            if session is not None:
                 if self._last_config_env is not None:
-                    self._broadcast_frame(self._last_config_env)
-                # Replay the most-recent cached keyframe so the joiner can paint
-                # right away. On an idle host (where the FIR below goes
-                # unanswered) this is the ONLY way it gets a decodable frame;
-                # on an active host the fresh IDR re-syncs immediately after.
-                # Existing viewers drop it (older seq than what they've seen),
-                # so a broadcast only reaches the fresh joiner.
-                for kf_env in list(getattr(self, "_last_keyframe_env", {}).values()):
-                    self._broadcast_frame(kf_env)
-                if _FORCE_KEYFRAME_ON_JOIN:
-                    try:
-                        self._session.request_fir(None)
-                    except Exception:
-                        pass
+                    cached.append(self._last_config_env)
+                cached.extend(getattr(self, "_last_keyframe_env", {}).values())
+            self._begin_start_locked()
+        # Never broadcast or invoke session callbacks while holding this lock.
+        for envelope in cached:
+            if self._loop is not None:
+                self._loop.call_soon_threadsafe(viewer.send_frame, envelope)
+        if session is not None and _FORCE_KEYFRAME_ON_JOIN:
+            session.request_fir(None)
 
     def remove_viewer(self, viewer: _ViewerSession) -> None:
         with self._viewers_lock:
-            try:
-                self.viewers.remove(viewer)
-            except ValueError:
+            if viewer not in self.viewers:
                 return
-            log.info("WT viewer %d disconnected (remaining=%d)",
-                     viewer.session_id, len(self.viewers))
-            if not self.viewers:
-                self._teardown_session()
+            self.viewers.remove(viewer)
+            if self.viewers:
+                return
+            self._detach_session_locked()
+        threading.Thread(target=self._close_retired_sessions,
+                         name="wt-session-close", daemon=True).start()
 
     def request_keyframe(self) -> None:
         """Rate-limited FIR request, shared by recovery paths (decoder reset,
@@ -885,84 +904,65 @@ class WebTransportBridge:
 
     # -- session + encoder lifecycle ----------------------------------
 
-    def _start_session_thread(self) -> None:
-        """Off-loop: do the slow SRP+RFB+burst dance, then install
-        encoder + start the pump thread. Runs once per bridge
-        lifecycle (cleared in _teardown_session)."""
-        try:
-            log.info("starting iss session (%s)", self._config.host)
-            session = Session(self._config)
-            session.connect()
-            # Pass-through: forward Apple's H.264 access units straight to
-            # viewers — NO compose, NO re-encode. The native decoder still runs
-            # inside Session (it drives FIR/keyframe recovery, which the browser
-            # rides via the same forwarded keyframes); we just tap the
-            # reassembled per-tile AUs in _on_video_au.
-            self._config_sent = False
-            self._last_config_env = None
-            # Most-recent keyframe envelope per tile — replayed to a late-joining
-            # viewer so it can paint immediately even when the host is idle and
-            # won't answer a FIR with a fresh IDR (see add_viewer).
-            self._last_keyframe_env = {}
-            self._au_seq = 0
-            # Reset dynamic-resolution dedup state so a reconnect at the SAME
-            # window size still re-advertises (the new session starts at the
-            # host's default canvas, not the previous re-advertised size).
-            self._last_resize_wh = None
-            self._last_config_wh = None
-            session.set_video_au_callback(self._on_video_au)
-            # Cursor (RFB enc 1104): forward pixmaps so the browser paints the
-            # host cursor shape as the canvas CSS cursor — and, crucially, the
-            # cursor is NOT baked into the framebuffer, so moving the mouse
-            # doesn't dirty the frame / wake the encoder.
-            session.set_cursor_callback(self._on_cursor)
-            # Audio: opus encoder + callback hook. Audio runs on its
-            # own thread (the session's audio RX thread). Each Opus
-            # packet is sent as a WebTransport DATAGRAM (RFC 9297) —
-            # one UDP datagram per packet, no stream-credit cost.
-            # Datagrams are unreliable but Opus tolerates single-
-            # packet loss gracefully (PLC fills ~5 ms gaps).
-            audio_enc = None
-            try:
-                audio_enc = OpusEncoder()
-                session.set_audio_callback(self._on_audio)
-            except Exception as e:
-                log.warning("audio disabled: opus init failed (%s)", e)
+    def _start_session_thread(self, generation: int) -> None:
+        # Connect and close use the same operation lock: two attempts must not
+        # compete for the host's UDP ports, even when a viewer leaves mid-auth.
+        with self._session_operation_lock:
+            self._drain_retired_sessions()
             with self._viewers_lock:
-                self._session = session
-                self._audio_enc = audio_enc
-                # Gate pump: the browser path forwards AUs via _on_video_au and
-                # never calls get_frame(), but get_frame() is where the quality
-                # gate marks clean/concealed and drives FIR/keyframe recovery —
-                # without it the stream wedges after ~15s (decode loses refs, no
-                # FIR, Apple stops sending). Pump get_frame() on a thread and
-                # discard the frames purely to keep recovery alive.
-                self._pump_stop = threading.Event()
-                self._gate_thread = threading.Thread(
-                    target=self._gate_pump_loop, name="wt-gate-pump", daemon=True)
-                self._gate_thread.start()
-        except Exception as e:
-            log.error("session start failed: %s — retrying in 1.5 s", e)
-            self._session_starting = False
-            # Auto-retry: schedule another start attempt while we still
-            # have at least one viewer connected. Apple's burst is
-            # transient — VPS/SPS/PPS sometimes don't survive the first
-            # window, and a fresh session gather usually succeeds.
-            def _retry():
+                if generation != self._session_generation or not self.viewers or self._closed:
+                    return
+            session = None
+            audio_enc = None
+            published = False
+            try:
+                session = Session(self._config)
+                session.connect()
+                try:
+                    if self._config.audio:
+                        audio_enc = OpusEncoder()
+                except Exception as error:
+                    log.warning("audio disabled: opus init failed (%s)", error)
                 with self._viewers_lock:
-                    needs_retry = (
-                        self._session is None
-                        and not self._session_starting
-                        and bool(self.viewers)
-                    )
-                    if not needs_retry:
+                    if generation != self._session_generation or not self.viewers or self._closed:
                         return
-                    self._session_starting = True
-                threading.Thread(
-                    target=self._start_session_thread,
-                    name="wt-session-retry", daemon=True,
-                ).start()
-            threading.Timer(1.5, _retry).start()
+                    self._config_sent = False
+                    self._last_config_env = None
+                    self._last_keyframe_env = {}
+                    self._au_seq = 0
+                    self._last_resize_wh = self._last_config_wh = None
+                    self._session, self._audio_enc = session, audio_enc
+                    self._session_starting = False
+                    self._pump_stop = threading.Event()
+                    self._gate_thread = threading.Thread(
+                        target=self._gate_pump_loop, args=(session, self._pump_stop),
+                        name="wt-gate-pump", daemon=True)
+                    self._gate_thread.start()
+                    published = True
+                session.set_video_au_callback(self._on_video_au)
+                session.set_cursor_callback(self._on_cursor)
+                if audio_enc is not None:
+                    session.set_audio_callback(self._on_audio)
+            except Exception as error:
+                log.error("session start failed: %s", error)
+                with self._viewers_lock:
+                    if generation == self._session_generation:
+                        if published:
+                            self._detach_session_locked()
+                        self._session_starting = False
+                        if not isinstance(error, AuthError) and self.viewers and not self._closed:
+                            retry_generation = self._session_generation
+                            def retry():
+                                with self._viewers_lock:
+                                    if retry_generation == self._session_generation:
+                                        self._begin_start_locked()
+                            self._retry_timer = threading.Timer(1.5, retry)
+                            self._retry_timer.daemon = True
+                            self._retry_timer.start()
+            finally:
+                if not published:
+                    self._close_resources(session, audio_enc, None, None)
+                self._drain_retired_sessions()
 
     def _on_cursor(self, img) -> None:
         """Cursor RX thread → fan-out one enc-1104 pixmap (RGBA8888 + hotspot)
@@ -1115,15 +1115,11 @@ class WebTransportBridge:
             self._last_keyframe_env[tile_idx] = env
         self._broadcast_frame(env)
 
-    def _gate_pump_loop(self) -> None:
+    def _gate_pump_loop(self, session, stop) -> None:
         """Drain get_frame() for every tile so the quality gate + FIR recovery
         run (the browser path consumes AUs directly, never get_frame). Frames
         are discarded — this exists only to keep the native recovery alive."""
-        session = self._session
-        if session is None:
-            return
         nt = session.num_tiles
-        stop = self._pump_stop
         while not stop.is_set():
             try:
                 for ti in range(nt):
@@ -1141,34 +1137,54 @@ class WebTransportBridge:
         for viewer in viewers:
             loop.call_soon_threadsafe(viewer.send_frame, envelope)
 
-    def _teardown_session(self) -> None:
-        pump_stop = getattr(self, "_pump_stop", None)
-        if pump_stop is not None:
-            pump_stop.set()
-        gt = getattr(self, "_gate_thread", None)
-        if gt is not None:
-            gt.join(timeout=1.0)
-            self._gate_thread = None
-        if self._session is not None:
-            try:
-                self._session.set_video_au_callback(None)
-            except Exception:
-                pass
-            try:
-                self._session.set_cursor_callback(None)
-            except Exception:
-                pass
-        if self._audio_enc is not None:
-            self._audio_enc.close()
-            self._audio_enc = None
-        if self._session is not None:
-            self._session.set_audio_callback(None)
-            self._session.close()
-            self._session = None
+    def _detach_session_locked(self) -> None:
+        self._session_generation += 1
+        if self._retry_timer is not None:
+            self._retry_timer.cancel()
+            self._retry_timer = None
+        stop = getattr(self, "_pump_stop", None)
+        if stop is not None:
+            stop.set()
+        self._retired_sessions.append((self._session, self._audio_enc, stop,
+                                       getattr(self, "_gate_thread", None)))
+        self._session = self._audio_enc = self._gate_thread = None
         self._session_starting = False
-        log.info("iss session torn down (no viewers)")
 
-    # -- input handling -----------------------------------------------
+    @staticmethod
+    def _close_resources(session, audio_enc, stop, thread):
+        if stop is not None:
+            stop.set()
+        if thread is not None:
+            thread.join(timeout=1.0)
+        # Stop callbacks and their producer before freeing the audio encoder.
+        if session is not None:
+            try:
+                session.set_video_au_callback(None)
+                session.set_cursor_callback(None)
+                session.set_audio_callback(None)
+            except Exception:
+                log.exception("session callback cleanup failed")
+            try:
+                session.close()
+            except Exception:
+                log.exception("session cleanup failed")
+        if audio_enc is not None:
+            audio_enc.close()
+
+    def _drain_retired_sessions(self):
+        with self._viewers_lock:
+            retired, self._retired_sessions = self._retired_sessions, []
+        for resources in retired:
+            self._close_resources(*resources)
+
+    def _close_retired_sessions(self):
+        with self._session_operation_lock:
+            self._drain_retired_sessions()
+
+    def _teardown_session(self) -> None:
+        with self._viewers_lock:
+            self._detach_session_locked()
+        self._close_retired_sessions()
 
     def handle_input_datagram(self, viewer, data: bytes) -> None:
         """Mouse-move datagrams from the browser. Fixed 13-byte format:
@@ -1375,15 +1391,7 @@ class WebTransportBridge:
                     # Wait briefly for teardown to settle before fresh start.
                     time.sleep(0.5)
                     with self._viewers_lock:
-                        should_start = (
-                            self._session is None
-                            and not self._session_starting
-                            and bool(self.viewers)
-                        )
-                        if should_start:
-                            self._session_starting = True
-                    if should_start:
-                        self._start_session_thread()
+                        self._begin_start_locked()
                 finally:
                     self._reconnect_pending = False
             threading.Thread(
