@@ -97,6 +97,7 @@
  const storageKey = 'isharescreen.connection.v1';
  const fields = ['host','user','port','auth','frontend','codec','chroma','decoder','advertise','scale','bandwidth_mbps','sr_evaluation','audio','curtain','remember_password'];
  const status = document.getElementById('settings-status');
+ let evaluationValues = null;
  function updateBandwidth(){
    const slider=form.elements.bandwidth_mbps;
    const label=Number(slider.value)===0?'Auto':slider.value+' Mbps';
@@ -105,7 +106,10 @@
  }
  function saveSettings(){
    const settings = {};
-   for(const name of fields){const el=form.elements[name]; settings[name]=el.type==='checkbox'?el.checked:el.value;}
+   for(const name of fields){
+     const el=form.elements[name];
+     settings[name]=evaluationValues && name in evaluationValues ? evaluationValues[name] : (el.type==='checkbox'?el.checked:el.value);
+   }
    settings.authDefaultsVersion=1;
    settings.advanced=document.getElementById('advanced').open;
    try {localStorage.setItem(storageKey,JSON.stringify(settings)); status.textContent='Settings saved in this browser. Passwords are never saved here.';}
@@ -131,20 +135,25 @@
    const decoder=document.querySelector('[name=decoder]');
    const hevc=Array.from(decoder.options).find(option=>option.value.includes('hevc'));
    const fixed={frontend:'desktop',advertise:'960x540',scale:'1.0',codec:'hevc',chroma:'auto',decoder:hevc?hevc.value:'auto',audio:false,curtain:true};
-   for(const [name,value] of Object.entries(fixed)){
-     const field=document.querySelector(`[name=${name}]`), checkbox=field.type==='checkbox';
-     if(enabled&&!field.disabled) field.dataset.beforeEvaluation=checkbox?String(field.checked):field.value;
-     if(enabled){ if(checkbox) field.checked=value; else field.value=value; }
-     else if(field.dataset.beforeEvaluation!==undefined){
-       if(checkbox) field.checked=field.dataset.beforeEvaluation==='true'; else field.value=field.dataset.beforeEvaluation;
-       delete field.dataset.beforeEvaluation;
-     }
-     field.disabled=enabled;
+   if(enabled && evaluationValues===null){
+     evaluationValues=Object.fromEntries(Object.keys(fixed).map(name=>{
+       const field=form.elements[name];
+       return [name,field.type==='checkbox'?field.checked:field.value];
+     }));
    }
+   const values=enabled?fixed:evaluationValues;
+   if(values){
+     for(const [name,value] of Object.entries(values)){
+       const field=form.elements[name];
+       if(field.type==='checkbox')field.checked=value;else field.value=value;
+     }
+   }
+   if(!enabled)evaluationValues=null;
    document.getElementById('evaluation-settings').hidden=!enabled;
  }
  function updateVideo(){
    evaluationMode();
+   for(const name of ['frontend','advertise','scale','codec','chroma','decoder','audio','curtain'])form.elements[name].disabled=false;
    updateBandwidth();
    const browser=form.elements.frontend.value==='browser';
    for(const option of form.elements.codec.options) option.disabled=browser&&option.value==='hevc';
@@ -157,13 +166,14 @@
      option.disabled=(form.elements.codec.value!=='auto' && !!option.dataset.codec && option.dataset.codec!==form.elements.codec.value)||(option.value==='amd-hevc420'&&form.elements.chroma.value==='444');
    }
    if(form.elements.decoder.selectedOptions[0]?.disabled)form.elements.decoder.value='auto';
-   if(form.elements.sr_evaluation.checked)evaluationMode();
+   for(const name of Object.keys(evaluationValues||{}))form.elements[name].disabled=true;
  }
  updateVideo();
  form.addEventListener('input',()=>{updateBandwidth();saveSettings();});
  form.addEventListener('change',()=>{updateVideo();saveSettings();});
  document.getElementById('advanced').addEventListener('toggle',saveSettings);
  document.getElementById('reset-settings').addEventListener('click',()=>{
+   evaluationValues=null;
    form.reset();form.elements.password.value='';
    form.elements.codec.value='auto';form.elements.chroma.value='auto';form.elements.decoder.value='auto';
    form.elements.auth.value='__DEFAULT_AUTH__';form.elements.remember_password.checked=false;
@@ -188,6 +198,6 @@
  // popup-block) — but the URL doesn't exist yet, so point it at a local
  // "Connecting…" page that polls for the real URL and redirects itself. Only
  // for the browser frontend; the desktop frontend has no video page.
- function prepVideo(){ evaluationMode(); saveSettings(); try{ var f=document.querySelector('[name=frontend]');
+ function prepVideo(){ updateVideo(); saveSettings(); try{ var f=document.querySelector('[name=frontend]');
    if(f&&f.value==='browser') window.open('/video-wait','_blank'); }catch(e){} return true; }
  </script></body></html>

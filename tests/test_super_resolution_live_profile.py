@@ -79,7 +79,6 @@ def test_launch_pins_actual_child_flags_and_precision_and_reconnect_values(monke
 
 def test_form_and_dashboard_expose_locks_and_canvas_mismatch_warning():
     assert 'name="sr_evaluation"' in connect._FORM
-    assert "field.disabled=enabled" in connect._FORM
     assert "dynamic resolution off" in connect._FORM
     assert "blanks the host screen" in connect._FORM
     dashboard = connect._dash_page().decode()

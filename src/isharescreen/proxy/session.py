@@ -33,8 +33,8 @@ import threading
 import time
 from collections import defaultdict, deque
 from copy import deepcopy
-from dataclasses import dataclass, field
-from typing import Callable, Literal, Optional
+from dataclasses import dataclass
+from typing import Callable, Optional
 
 import numpy as np
 

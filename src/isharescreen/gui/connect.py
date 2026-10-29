@@ -344,7 +344,6 @@ def _launch(values: dict) -> None:
     # touch a bridge on another port or any non-iss process.
     _free_bridge_port(_BRIDGE_PORT)
     _LAST = dict(values)
-    frontend = values.get("frontend", "browser")
     with _LOCK:
         _LATEST.clear()
         _HELLO.clear()
@@ -383,8 +382,6 @@ def _launch(values: dict) -> None:
             cmd += ["--advertise", advertise]
     else:
         cmd += ["--hidpi", scale]
-    decoder = values.get("decoder", "auto").strip() or "auto"
-    codec = values.get("codec", "auto").strip() or "auto"
     cmd += ["--decoder", decoder, "--codec", codec, "--chroma", chroma]
     if values.get("curtain") != "on":
         cmd.append("--no-curtain")
