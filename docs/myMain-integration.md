@@ -74,5 +74,39 @@ and shortcuts in desktop/browser; Linux NVIDIA decoding; Wayland/X11 identity
 with multiple windows; background-window memory behavior; Windows QSV and
 keyboard focus changes during a real session.
 
-No enhancement/training branches or changes from external forks linked in PR
-discussions were incorporated in this integration.
+No video-enhancement/training features or changes from external forks linked
+in PR discussions were incorporated in this integration.
+
+## Selected configuration and authentication ports
+
+The subsequent feature selection ports only these changes from
+`origin/cs682-video-enhancement`:
+
+- `b8d9e2c` (source `ea7e40a`): validated startup protocol objects, bandwidth
+  ceilings, pixel-format/HDR capabilities, payload banks and format rules;
+  per-session snapshots; matching tile-group and LTRP handling. Usage is in
+  [media-offer-config.md](media-offer-config.md).
+- `a576a43` (source `a9c5a45`): optional passwords in the native OS credential
+  store, remember/forget controls in the connect form and CLI, and explicit
+  Kerberos authentication with cached tickets and automatic LKDC discovery.
+
+The pre-port branch is preserved as
+`backup/myMain-before-config-auth-20261028` at `4c792e5`. The authentication
+commit conflicted in the README and connect form because its parent contained
+video-enhancement features. Those unrelated controls, JavaScript and
+documentation were excluded from the resolution. No enhancement modules,
+models, training tools or optional ML dependencies were added.
+
+Post-port validation: **219 passed, 2 skipped** on Windows, with dependency
+consistency checks passing. The skipped tests require native macOS
+CoreFoundation. Forty deterministic legacy offer fixtures still match, and the
+previous lifecycle, hardware-probe, keyboard ABI and recovery tests remain in
+the suite. This run did not access real saved passwords or authenticate to a
+remote Mac. The source branch's native/live observations are historical
+evidence, not checks repeated during this port.
+
+Protocol configuration applies at session construction, not as a live bitrate
+control; the host still negotiates supported capabilities. Kerberos currently
+uses macOS GSS or Linux libgssapi-krb5 and is unavailable on Windows. Full live
+Screen Sharing Kerberos authentication remains to be verified. Existing
+password authentication is retained.
