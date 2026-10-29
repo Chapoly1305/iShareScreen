@@ -60,7 +60,7 @@ from .protocol.negotiation import (
     NegotiationResult,
     connect_and_negotiate,
 )
-from .protocol.offers import MediaOfferConfig, extract_offer_ssrc, create_offers
+from .protocol.offers import MediaOfferConfig, extract_offer_ssrc, create_offers, tiles_per_frame
 from .protocol.rfb import warmup_tcp, parse_apple_display_layout, DisplayRect
 from .protocol.rtcp import (
     build_empty_sr,
@@ -837,7 +837,6 @@ class Session:
         if observed:
             return observed
         n = self._negotiation
-        from .protocol.offers import tiles_per_frame
         return n.canvas_tiles if n and n.canvas_tiles else tiles_per_frame(
             getattr(self, "_media_offer_config", None))
 
@@ -1052,7 +1051,6 @@ class Session:
             )
 
         # 7) Decoder init.
-        from .protocol.offers import tiles_per_frame
         num_tiles = self._negotiation.canvas_tiles or tiles_per_frame(
             self._media_offer_config)
         # Size per-tile loss counters now that num_tiles is known.
@@ -2780,7 +2778,6 @@ class Session:
             and s not in self._ssrc_blacklist
             and counts[s] >= _DYNAMIC_SSRC_PACKET_THRESHOLD
         )
-        from .protocol.offers import tiles_per_frame
         want = tiles_per_frame(getattr(self, "_media_offer_config", None))
         if len(candidates) < want:
             return

@@ -245,6 +245,40 @@ def test_session_sends_snapshot_and_aligns_decoder_and_ltrp(monkeypatch):
         session._negotiate_and_burst(session._config)
 
 
+@pytest.mark.parametrize("codec,offered,negotiated,expected", [
+    ("hevc", None, 0, 4),
+    ("avc", None, 0, 1),
+    ("hevc", 2, 0, 2),
+    ("hevc", 4, 2, 2),
+])
+def test_initial_burst_tile_count_fallback(monkeypatch, codec, offered, negotiated, expected):
+    config = MediaOfferConfig()
+    config.video.codec = codec
+    config.video.tiles_per_frame = offered
+    session = Session(SessionConfig(
+        host="example.invalid", username="user", password="unused", media_offer=config,
+    ))
+    negotiation = SimpleNamespace(
+        canvas_tiles=negotiated, video_decryptor=object(),
+        keys=SimpleNamespace(audio_key_s=b"", video_key_s=b"", video_key_v=b""),
+    )
+    monkeypatch.setattr(session_module, "connect_and_negotiate", lambda *a, **kw: negotiation)
+    monkeypatch.setattr(session_module, "extract_offer_ssrc", lambda *a, **kw: None)
+    for cls in (session_module.SRTPDecryptor, session_module.SRTCPDecryptor,
+                session_module.SRTCPEncryptor):
+        monkeypatch.setattr(cls, "from_blob", lambda *a: object())
+    monkeypatch.setattr(session, "_drain_socket_into", lambda *a, **kw: None)
+    burst = object()
+
+    def gather(packets, decryptor, **kwargs):
+        assert kwargs["tile_group_size"] == expected
+        assert kwargs["codec"] == codec
+        return burst
+
+    monkeypatch.setattr(session_module, "gather_initial_burst", gather)
+    assert session._negotiate_and_burst(session._config) is burst
+
+
 def test_resize_fallback_keeps_configured_offer(monkeypatch):
     config = MediaOfferConfig().set_video_bitrate(30_000_000)
     session = Session(SessionConfig(

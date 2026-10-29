@@ -516,8 +516,8 @@ class HevcDecoder:
         tile; its healthy siblings keep publishing from their own intact
         DPB history.
         """
-        # Other hardware paths may still convert here. AMD returns prepared
-        # CPU tiles; its producer owns conversion and is joined at teardown.
+        # All backends return CPU tiles prepared by the decode producer.
+        # Serialize consumption with lifecycle resets, never with GPU work.
         with self._lifecycle_lock:
             return self._get_frame_locked(tile_idx)
 
@@ -536,12 +536,7 @@ class HevcDecoder:
         if frame is None or already_evaluated:
             return None
 
-        if isinstance(frame, TileFrame):
-            tile_frame, had_decode_error = frame, prepared_error
-        else:
-            tile_frame, had_decode_error = _av_frame_to_tile(
-                frame, self._reformatter, self._seen_fmts,
-            )
+        tile_frame, had_decode_error = frame, prepared_error
         with slot.lock:
             slot.last_evaluated_count = count
 
@@ -817,7 +812,7 @@ class HevcDecoder:
             if len(self._pending_downloads) >= min(self.num_tiles, _AMD_DOWNLOAD_BATCH_MAX):
                 self._flush_downloads()
             return
-        self._store_frame(ti, frame, had_error)
+        self._prepare_frame(ti, frame, had_error)
 
     def _flush_downloads(self) -> None:
         # Submit several decode operations before waiting on their readbacks.
@@ -826,18 +821,24 @@ class HevcDecoder:
         # this producer during shutdown.
         pending, self._pending_downloads = self._pending_downloads, []
         for ti, frame, had_error in pending:
-            try:
-                tile, conversion_error = _av_frame_to_tile(
-                    frame, self._reformatter, self._seen_fmts,
-                )
-            except Exception:
-                log.exception("AMD frame preparation failed for tile %d", ti)
-                continue
-            if tile is not None:
-                self._store_frame(ti, tile, had_error or conversion_error)
+            self._prepare_frame(ti, frame, had_error)
+
+    def _prepare_frame(self, ti: int, frame: av.VideoFrame, had_error: bool) -> None:
+        # Run on the decode producer, before notifying the display thread.
+        # Non-AMD backends publish immediately; they do not inherit AMD's
+        # hardware-specific batching delay.
+        try:
+            tile, conversion_error = _av_frame_to_tile(
+                frame, self._reformatter, self._seen_fmts,
+            )
+        except Exception:
+            log.exception("HEVC frame preparation failed for tile %d", ti)
+            return
+        if tile is not None:
+            self._store_frame(ti, tile, had_error or conversion_error)
 
     def _store_frame(
-        self, ti: int, frame: av.VideoFrame | TileFrame, had_error: bool,
+        self, ti: int, frame: TileFrame, had_error: bool,
     ) -> None:
         slot = self._tiles[ti]
         with slot.lock:

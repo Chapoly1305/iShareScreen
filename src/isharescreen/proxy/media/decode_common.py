@@ -85,7 +85,7 @@ class _TileSlot:
     """The latest decoded frame for one tile + its bookkeeping. Locked so
     the decode worker (writer) and the consumer's `get_frame()` (reader)
     don't tear."""
-    raw_frame: Optional[av.VideoFrame | TileFrame] = None
+    raw_frame: Optional[TileFrame] = None
     prepared_error: bool = False
     good_count: int = 0
     # Frames published WITHOUT a libav decode-error flag — i.e. actually
@@ -127,6 +127,7 @@ def _av_frame_to_tile(
     frame: av.VideoFrame,
     reformatter_holder: list[Optional[av.video.reformatter.VideoReformatter]],
     seen_fmts: set[str],
+    preserve_nv12: bool = False,
 ) -> tuple[Optional[TileFrame], bool]:
     """Convert an `av.VideoFrame` to our `TileFrame`.
 
@@ -170,6 +171,15 @@ def _av_frame_to_tile(
             reformatter_holder[0] = VideoReformatter()
         frame = reformatter_holder[0].reformat(frame, format="yuv444p")
         fmt = frame.format.name
+
+    if fmt == "nv12" and preserve_nv12:
+        yp, uvp = frame.planes
+        return TileFrame(
+            y=bytes(yp), u=bytes(uvp), v=None,
+            width=width, height=height,
+            y_stride=yp.line_size, uv_stride=uvp.line_size,
+            chroma_width=width // 2, chroma_height=height // 2,
+        ), had_error
 
     if fmt in ("nv12", "nv21"):
         # Biplanar 4:2:0 (VideoToolbox's AVC output). Deinterleaving the UV

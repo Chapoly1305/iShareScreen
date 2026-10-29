@@ -52,8 +52,20 @@ _CHOICE_EVENT = threading.Event()   # set when the user answers the session moda
 _CHOICE_RESULT = "share"            # "alt" | "share" — the user's last answer
 
 
+def _is_profiling_log(line: str) -> bool:
+    return " | pipeline_timing:" in line or " | presentation: draw_calls=" in line
+
+
+def _clear_logs() -> None:
+    with _LOCK:
+        _LOG.clear()
+    _emit("log_reset", {})
+
+
 def _emit(kind: str, payload) -> None:
     if kind == "log":
+        if _is_profiling_log(payload):
+            return
         with _LOCK:
             _LOG.append(payload)
     elif kind == "snapshot":
@@ -459,7 +471,7 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
  .tile .t { color:#9aa0a6; font-size:11px; } .bar { height:5px; border-radius:3px; background:#2b2d31; margin-top:6px; overflow:hidden; }
  .bar > i { display:block; height:100%; background:#4ec97a; } .bar.loss > i { background:#e06c75; }
  .logwrap { flex:1; display:flex; flex-direction:column; min-height:120px; padding:8px 16px 14px; }
- .loghdr { font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:#9aa0a6; margin:6px 0; }
+ .loghdr { display:flex; align-items:center; justify-content:space-between; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:#9aa0a6; margin:6px 0; }
  #log { flex:1; margin:0; padding:10px 12px; overflow:auto; white-space:pre-wrap; word-break:break-word; background:#0f1012; border:1px solid #2c2e33; border-radius:10px; font:12px ui-monospace,SFMono-Regular,Menlo,monospace; }
  .lvl-ERROR{color:#ff7b72;} .lvl-WARN{color:#e0b341;} .lvl-DEBUG{color:#7f848e;}
  #modal { position:fixed; inset:0; background:#000a; display:none; align-items:center; justify-content:center; z-index:20; }
@@ -517,7 +529,7 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
      <span>Decode lat</span><b id="q_lat">—</b></div></div>
  </div>
  <div class="tiles"><div class="tilegrid" id="tiles"></div></div>
- <div class="logwrap"><div class="loghdr">Log <span class="meta">— drag to select &amp; copy</span></div><pre id="log"></pre></div>
+ <div class="logwrap"><div class="loghdr"><div>Log <span class="meta">— drag to select &amp; copy</span></div><button class="btn" onclick="act('clear_logs')">Clear</button></div><pre id="log"></pre></div>
  <div id="modal"><div class="modalbox">
    <h2>Another user is at the console</h2>
    <p><span id="modaluser">Someone is signed in at this Mac.</span> Share their existing session, or sign in as your own user on a separate display (alt-session)?</p>
@@ -563,6 +575,7 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
    set('q_lat', d.decode_latency_ms!=null?d.decode_latency_ms+' ms':'—');
    tiles(d.tiles); });
  const logEl=$('log');
+ es.addEventListener('log_reset', () => { logEl.textContent=''; });
  es.addEventListener('log', e => { const line=JSON.parse(e.data);
    const atBottom = logEl.scrollHeight-logEl.scrollTop-logEl.clientHeight < 40;
    const lvl = line.includes(' ERROR ')?'lvl-ERROR':line.includes(' WARNING ')?'lvl-WARN':line.includes(' DEBUG ')?'lvl-DEBUG':'';
@@ -757,6 +770,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 _send_command({"action": "fir"})
             elif action == "reconnect":
                 threading.Thread(target=_reconnect, daemon=True).start()
+            elif action == "clear_logs":
+                _clear_logs()
             elif action == "session_choice":
                 _set_session_choice(values.get("choice", "share"))
             self._html(b"ok")
@@ -802,7 +817,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             if _VIDEO_URL:
                 self._event("video_url", {"url": _VIDEO_URL})
             for line in backlog:
-                self._event("log", line)
+                if not _is_profiling_log(line):
+                    self._event("log", line)
             while True:
                 kind, payload = q.get()
                 self._event(kind, payload)

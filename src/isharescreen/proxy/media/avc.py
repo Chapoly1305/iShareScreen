@@ -15,14 +15,16 @@ codec bank. Reverse-engineered from live captures:
     So "have we got a keyframe" can't be detected from the NAL type — instead
     the first frame the decoder actually EMITS is the keyframe signal.
 
-H.264 4:2:0 is hardware-decodable everywhere (the point of this path vs HEVC
-4:4:4), though this decoder is software-only for now. Frame extraction + the
-quality gate are reused verbatim from the HEVC path.
+Hardware decoding is preferred with a software fallback. A bounded worker
+queue keeps decoding off the packet-processing thread. D3D11 submissions
+overlap GPU downloads; frame extraction and the quality gate are shared with
+the HEVC path.
 """
 from __future__ import annotations
 
 import logging
 import os
+import queue
 import sys
 import threading
 import time
@@ -33,7 +35,7 @@ import av
 from .avc_nalu import h264_nal_type
 from .decode_common import (
     _CODEC_FLAG_LOW_DELAY, _CODEC_FLAG2_FAST,
-    _NAL_START_CODE, _TileSlot, _av_frame_to_tile, chroma_trace,
+    _NAL_START_CODE, _TileSlot, _av_frame_to_tile, chroma_trace, _HW_FRAME_FORMATS,
 )
 from .tiles import TileFrame
 from .quality_gate import FrameQualityGate
@@ -187,6 +189,8 @@ def _vt_accepts_h264(sps: bytes, pps: bytes) -> bool:
 # decoder from unbounded growth; prune keeps the most-recent window.
 _PTS_MAP_SOFT_MAX = 256
 _PTS_MAP_PRUNE_KEEP = 64
+_DECODE_QUEUE_MAX = 8
+_DOWNLOAD_WAIT_S = 0.020  # One 60 Hz frame, with a bounded quiet-stream flush.
 
 
 def _nal_is_keyframe(nalu: bytes) -> bool:
@@ -304,6 +308,14 @@ class AvcDecoder:
         self._reference_reset_count: int = 0
         self._reference_break_t: float = 0.0
         self._reference_break_trigger: str = ""
+        self._queue = queue.Queue(maxsize=_DECODE_QUEUE_MAX)
+        self._worker = None
+        self._stop = threading.Event()
+        self._submit_lock = threading.Lock()
+        self._generation = 0
+        self._overflow = threading.Event()
+        self._pending_frames = []
+        self._pending_since = 0.0
 
     # -- setup ---------------------------------------------------------
 
@@ -350,9 +362,15 @@ class AvcDecoder:
     ) -> Optional[av.codec.context.CodecContext]:
         try:
             from av.codec.hwaccel import HWAccel
-            hw = HWAccel(device_type=hw_type)
+            # Keep D3D11 surfaces on the GPU until the next submission, so
+            # PyAV does not synchronously download inside every decode call.
+            deferred = hw_type == "d3d11va"
+            hw = HWAccel(device_type=hw_type, **({"is_hw_owned": True} if deferred else {}))
             c = av.CodecContext.create("h264", "r", hwaccel=hw)
             c.extradata = extradata
+            if deferred:
+                c.thread_count = 1
+                c.options = {"extra_hw_frames": "8"}
             c.flags = _CODEC_FLAG_LOW_DELAY
             c.flags2 = _CODEC_FLAG2_FAST
             c.open()
@@ -379,15 +397,65 @@ class AvcDecoder:
             raise RuntimeError("set_params() must be called before start()")
         with self._codec_lock:
             self._ensure_codec_locked()
+        if self._worker is None:
+            self._stop.clear()
+            self._worker = threading.Thread(target=self._worker_loop, name="avc-decode", daemon=True)
+            self._worker.start()
 
     # -- feed ----------------------------------------------------------
 
     def feed_burst(self, tile_nalu_cache: dict) -> None:
         for ti, nalus in tile_nalu_cache.items():
             for nalu in nalus:
-                self.feed_nalu(nalu, ti)
+                self._decode_nalu(nalu, ti)
+        self._flush_pending()
 
     def feed_nalu(self, nalu: bytes, tile_idx: int, donl: Optional[int] = None) -> None:
+        if not nalu or not (0 <= tile_idx < self.num_tiles) or self._stop.is_set():
+            return
+        if self._worker is None:
+            self._decode_nalu(nalu, tile_idx)
+            return
+        with self._submit_lock:
+            if self._stop.is_set():
+                return
+            try:
+                self._queue.put_nowait((bytes(nalu), tile_idx, self._generation))
+            except queue.Full:
+                # Dropping an encoded delta invalidates later references.
+                # Clear stale work, then recover on a fresh intra picture.
+                self._queue_full_drops += self._clear_queue()
+                self._overflow.set()
+                self._queue.put_nowait((bytes(nalu), tile_idx, self._generation))
+
+    def _clear_queue(self):
+        count = 0
+        while True:
+            try:
+                self._queue.get_nowait()
+                count += 1
+            except queue.Empty:
+                return count
+
+    def _worker_loop(self):
+        while not self._stop.is_set():
+            try:
+                timeout = .05
+                if self._pending_frames:
+                    timeout = max(0.0, _DOWNLOAD_WAIT_S - (time.perf_counter() - self._pending_since))
+                item = self._queue.get(timeout=timeout)
+            except queue.Empty:
+                self._flush_pending()
+                continue
+            try:
+                self._decode_nalu(*item)
+                if self._pending_frames and time.perf_counter() - self._pending_since >= _DOWNLOAD_WAIT_S:
+                    self._flush_pending()
+            except Exception:
+                log.exception("AVC decode worker failed")
+                self._overflow.set()
+
+    def _decode_nalu(self, nalu: bytes, tile_idx: int, generation=None) -> None:
         if not nalu or not (0 <= tile_idx < self.num_tiles):
             return
         t = h264_nal_type(nalu[0])
@@ -433,6 +501,16 @@ class AvcDecoder:
         import time as _time
         published: list[int] = []
         with self._codec_lock:
+            if self._stop.is_set() or (generation is not None and generation != self._generation):
+                return
+            if self._overflow.is_set():
+                self._overflow.clear()
+                self._pending_frames.clear()
+                self.mark_reference_chain_broken("decode queue overflow")
+                for ti in range(self.num_tiles):
+                    self._gate.mark_decode_error(ti)
+                if not is_key:
+                    return
             reset_for_this_key = False
             if is_key and self._reference_reset_pending:
                 waited = (
@@ -501,31 +579,72 @@ class AvcDecoder:
                 return
             for frame in frames:
                 ti = self._pts_to_tile.pop(frame.pts, tile_idx)
-                submit_t = self._pts_submit_t.pop(frame.pts, None)
                 # The libav callback can arm recovery synchronously from inside
                 # ctx.decode(pkt). Never publish that same concealed frame:
                 # hold the last known-good picture while deltas are gated and
                 # the requested intra recovery frame is in flight.
                 if self._reference_reset_pending:
                     continue
-                if submit_t is not None:
-                    latency_ms = (_time.monotonic() - submit_t) * 1000
-                    self._decode_latency_ms = (
-                        0.1 * latency_ms + 0.9 * self._decode_latency_ms
-                    )
-                if not self._dpb_ready:
-                    self._dpb_ready = True
-                    for _t in range(self.num_tiles):
-                        self._gate.mark_idr_observed(_t)
-                slot = self._tiles[ti]
-                with slot.lock:
-                    slot.raw_frame = frame
-                    slot.good_count += 1
-                published.append(ti)
+                if frame.format.name in _HW_FRAME_FORMATS:
+                    if not self._pending_frames:
+                        self._pending_since = time.perf_counter()
+                    self._pending_frames.append((frame, ti))
+                    if len(self._pending_frames) >= 2:
+                        # Publish one picture per submission, rather than
+                        # overwriting two pictures in the same display slot.
+                        previous, previous_ti = self._pending_frames.pop(0)
+                        self._pending_since = time.perf_counter()
+                        if self._prepare_frame_locked(previous, previous_ti):
+                            published.append(previous_ti)
+                elif self._prepare_frame_locked(frame, ti):
+                    published.append(ti)
         # Notify outside the codec lock to avoid holding it across the callback.
         if self._on_frame_published is not None:
             for ti in published:
                 self._on_frame_published(ti)
+
+    def _flush_pending(self):
+        with self._codec_lock:
+            published = self._flush_pending_locked()
+        if self._on_frame_published is not None:
+            for ti in published:
+                self._on_frame_published(ti)
+
+    def _flush_pending_locked(self):
+        pending, self._pending_frames = self._pending_frames, []
+        published = []
+        for frame, ti in pending:
+            if self._prepare_frame_locked(frame, ti):
+                published.append(ti)
+        return published
+
+    def _prepare_frame_locked(self, frame, ti):
+        # Prepare while holding the codec lock: restart/close cannot
+        # release hardware surfaces during conversion. The display
+        # consumer receives immutable CPU bytes and takes no GPU lock.
+        submit_t = self._pts_submit_t.pop(frame.pts, None)
+        try:
+            tile_frame, had_error = _av_frame_to_tile(
+                frame, self._reformatter, self._seen_fmts, True,
+            )
+        except Exception:
+            log.exception("AVC frame preparation failed for tile %d", ti)
+            return False
+        if tile_frame is None:
+            return False
+        if submit_t is not None:
+            latency_ms = (time.monotonic() - submit_t) * 1000
+            self._decode_latency_ms = .1 * latency_ms + .9 * self._decode_latency_ms
+        if not self._dpb_ready:
+            self._dpb_ready = True
+            for _t in range(self.num_tiles):
+                self._gate.mark_idr_observed(_t)
+        slot = self._tiles[ti]
+        with slot.lock:
+            slot.raw_frame = tile_frame
+            slot.prepared_error = had_error
+            slot.good_count += 1
+        return True
 
     def mark_hwaccel_failed(self, trigger: str = "") -> None:
         """Record FFmpeg's explicit late hardware-initialization failure.
@@ -573,13 +692,12 @@ class AvcDecoder:
         slot = self._tiles[tile_idx]
         with slot.lock:
             frame = slot.raw_frame
+            had_error = slot.prepared_error
             count = slot.good_count
             already = count <= slot.last_evaluated_count
         if frame is None or already:
             return None
-        tile_frame, had_error = _av_frame_to_tile(
-            frame, self._reformatter, self._seen_fmts,
-        )
+        tile_frame = frame
         with slot.lock:
             slot.last_evaluated_count = count
         if tile_frame is None:
@@ -615,11 +733,11 @@ class AvcDecoder:
 
     @property
     def decode_queue_depth(self) -> int:
-        return len(self._pts_to_tile)
+        return self._queue.qsize() + len(self._pts_to_tile) + len(self._pending_frames)
 
     @property
     def decode_queue_cap(self) -> int:
-        return 512
+        return self._queue.maxsize + 2  # queued + active decode + pending download
 
     @property
     def decode_queue_drops(self) -> int:
@@ -676,6 +794,7 @@ class AvcDecoder:
         FIR request cannot clear until the newly seeded decoder publishes a
         clean frame.
         """
+        self._pending_frames.clear()
         if self._codec is not None:
             try:
                 self._codec.close()
@@ -695,6 +814,10 @@ class AvcDecoder:
         context while feed_nalu is mid-decode. Resets the gate too (HEVC does
         this in _teardown) so post-restart publish/FIR decisions start clean."""
         with self._codec_lock:
+            with self._submit_lock:
+                self._generation += 1
+                self._clear_queue()
+                self._overflow.clear()
             self._restart_count += 1
             self._close_codec_context_locked()
             self._reference_reset_pending = False
@@ -705,10 +828,12 @@ class AvcDecoder:
                 self._ensure_codec_locked()
 
     def close(self) -> None:
+        with self._submit_lock:
+            self._stop.set()
+            self._clear_queue()
+        if self._worker is not None:
+            if threading.current_thread() is not self._worker:
+                self._worker.join()
+            self._worker = None
         with self._codec_lock:
-            if self._codec is not None:
-                try:
-                    self._codec.close()
-                except Exception:
-                    pass
-                self._codec = None
+            self._close_codec_context_locked()
