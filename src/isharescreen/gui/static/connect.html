@@ -126,7 +126,7 @@
    form.elements.chroma.setCustomValidity(only420&&form.elements.chroma.value==='444'?'Choose Auto or 4:2:0 for H.264/browser, or choose Desktop with HEVC.':'');
    form.elements.decoder.disabled=browser;
    for(const option of form.elements.decoder.options){
-     option.disabled=form.elements.codec.value!=='auto' && !!option.dataset.codec && option.dataset.codec!==form.elements.codec.value;
+     option.disabled=(form.elements.codec.value!=='auto' && !!option.dataset.codec && option.dataset.codec!==form.elements.codec.value)||(option.value==='amd-hevc420'&&form.elements.chroma.value==='444');
    }
    if(form.elements.decoder.selectedOptions[0]?.disabled)form.elements.decoder.value='auto';
    document.getElementById('video-hint').textContent=browser?'Browser viewing uses H.264; the browser manages decoding.':'Decoder chooses how video is decoded, not which GPU draws the window. Auto tries available hardware; Intel QSV can decode HEVC 4:4:4.';

@@ -563,6 +563,12 @@ def _apply_video_overrides(args: argparse.Namespace) -> None:
     decoder_id = registry.normalize_override(effective_decoder, "hevc")
     if effective_chroma == "444" and any(spec.name == decoder_id and spec.codec == "avc" for spec in registry.all_specs()):
         raise ValueError("4:4:4 requires an HEVC decoder; choose Auto or an HEVC decoder")
+    if decoder_id == "amd-hevc420":
+        if args.frontend == "browser" or effective_codec == "avc" or effective_chroma == "444":
+            raise ValueError("AMD HEVC requires Desktop, HEVC/Auto codec and 4:2:0/Auto chroma")
+        chroma = "420"
+        effective_codec = "hevc"
+        args.codec = "hevc"
     codec = "hevc" if effective_chroma == "444" and effective_codec in ("auto", "both") else args.codec
     for name, value in (("ISS_DECODER", decoder), ("ISS_VIDEO_CODEC", codec), ("ISS_VIDEO_CHROMA", chroma)):
         if value == "auto":

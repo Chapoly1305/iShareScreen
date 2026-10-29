@@ -289,6 +289,9 @@ def _launch(values: dict) -> None:
             or (frontend == "browser" and codec == "hevc")):
         _emit("log", "[gui] invalid video settings; browser viewing requires H.264 or Auto")
         return
+    if decoder == "amd-hevc420" and (chroma == "444" or frontend == "browser"):
+        _emit("log", "[gui] AMD HEVC requires Desktop and 4:2:0/Auto chroma")
+        return
     effective_codec = "hevc" if chroma == "444" and codec == "auto" else codec
     if effective_codec != "auto" and normalized is not None:
         spec = next(spec for spec in all_specs() if spec.name == normalized)
@@ -565,6 +568,7 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
 # decoders SUPPORTED ON THIS CLIENT PLATFORM (via the registry), so e.g.
 # VideoToolbox never shows on Windows/Linux and Intel QSV never shows on macOS.
 _DECODER_LABELS = {
+    "amd-hevc420":      "HEVC — AMD Radeon (4:2:0)",
     "vt-hevc444":       "HEVC — VideoToolbox (Mac GPU)",
     "libav-hevc444":    "HEVC — Generic GPU (d3d11va / vaapi / cuda)",
     "qsv-hevc444":      "HEVC — Intel Quick Sync",

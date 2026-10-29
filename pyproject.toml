@@ -33,7 +33,8 @@ dependencies = [
     # Core protocol + media
     "cryptography>=42.0",
     "pycryptodome>=3.20",
-    "av>=12.0",
+    "av>=12.0; sys_platform != 'win32'",
+    "av>=19.0.2; sys_platform == 'win32'",
     "numpy>=1.26",
     # WebTransport browser frontend (--frontend browser, the default): the
     # QUIC/HTTP3 bridge + an HTTP server that serves the viewer page and

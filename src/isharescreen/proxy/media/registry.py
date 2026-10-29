@@ -101,6 +101,17 @@ def _build_libav_hevc_sw(num_tiles, *, enable_quality_gate=True, on_frame_publis
                        on_frame_published=on_frame_published, prefer_hwaccel=False)
 
 
+def _amd_available():
+    from .amd import available
+    return available()
+
+
+def _build_amd(num_tiles, *, enable_quality_gate=True, on_frame_published=None, **_):
+    from .hevc import HevcDecoder
+    return HevcDecoder(num_tiles, amd_only=True, enable_quality_gate=enable_quality_gate,
+                       on_frame_published=on_frame_published)
+
+
 def _build_avc(num_tiles, *, enable_quality_gate=True, on_frame_published=None,
                prefer_hwaccel=True, **_):
     from .avc import AvcDecoder
@@ -131,6 +142,9 @@ def _build_avc(num_tiles, *, enable_quality_gate=True, on_frame_published=None,
 #    20  libav-hevc444-sw  SOFTWARE HEVC 4:4:4 — manual override only (slow for
 #                          live 4-tile streams); not on the auto ladder.
 _REGISTRY: list[DecoderSpec] = [
+    DecoderSpec("amd-hevc420", "hevc", "420", ("win32",), "hardware", 70,
+                available=_amd_available, build=_build_amd,
+                note="AMD Radeon D3D11 HEVC 4:2:0; explicitly selected adapter, no fallback"),
     DecoderSpec("vt-hevc444", "hevc", "444", ("darwin",), "hardware", 100,
                 available=lambda: _vt_available(), build=_build_vt,
                 note="direct VideoToolbox (VTDecompressionSession, no libav RPS layer)"),
@@ -182,7 +196,8 @@ def candidates(codec: str, chroma: Optional[str] = None) -> list[DecoderSpec]:
     best-first (hardware before software, then priority)."""
     out = [s for s in _REGISTRY
            if s.codec == codec and s.supported_here()
-           and (chroma is None or s.chroma == chroma)]
+           and (chroma is None or s.chroma == chroma)
+           and (s.name != "amd-hevc420" or chroma == "420")]
     out.sort(key=lambda s: (s.kind == "hardware", s.priority), reverse=True)
     return out
 
@@ -226,6 +241,8 @@ def build_best(codec: str, *, override: Optional[str], num_tiles: int, initializ
     chosen = select(codec, override=override)
     ordered = ([chosen] if chosen else [])
     ordered += [s for s in candidates(codec) if s is not chosen and s.available()]
+    if chosen is not None and chosen.name == "amd-hevc420":
+        ordered = [chosen]  # An explicit AMD choice must not silently run on Intel/CPU.
     for spec in ordered:
         dec = None
         try:

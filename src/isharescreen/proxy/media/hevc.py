@@ -173,6 +173,7 @@ class HevcDecoder:
         num_tiles: int,
         *,
         prefer_hwaccel: bool = True,
+        amd_only: bool = False,
         enable_quality_gate: bool = True,
         on_frame_published: Optional[Callable[[int], None]] = None,
     ) -> None:
@@ -180,6 +181,7 @@ class HevcDecoder:
             raise ValueError("num_tiles must be positive")
         self.num_tiles = num_tiles
         self._prefer_hwaccel = prefer_hwaccel
+        self._amd_only = amd_only
         self._on_frame_published = on_frame_published
 
         self._codec: Optional[av.codec.context.CodecContext] = None
@@ -1032,10 +1034,10 @@ class HevcDecoder:
         extradata = self._build_extradata()
 
         if not force_software and self._prefer_hwaccel and not self._hw_failed:
-            for hw_type in _platform_hwaccels():
+            for hw_type in (("d3d11va",) if self._amd_only else _platform_hwaccels()):
                 ctx = self._try_hwaccel(hw_type, extradata)
                 if ctx is not None:
-                    self._install_codec(ctx, hw_name=hw_type)
+                    self._install_codec(ctx, hw_name="AMD d3d11va" if self._amd_only else hw_type)
                     return
 
         self._install_codec(self._make_sw_context(extradata), hw_name=None)
@@ -1046,7 +1048,11 @@ class HevcDecoder:
         try:
             from av.codec.hwaccel import HWAccel
 
-            hw = HWAccel(device_type=hw_type)
+            if self._amd_only:
+                from .amd import hardware_accel
+                hw = hardware_accel()
+            else:
+                hw = HWAccel(device_type=hw_type)
             c = av.CodecContext.create("hevc", "r", hwaccel=hw)
             c.extradata = extradata
             # SLICE threading (parallelise within a frame), all cores.
@@ -1070,6 +1076,8 @@ class HevcDecoder:
             return None
 
     def _make_sw_context(self, extradata: bytes) -> av.codec.context.CodecContext:
+        if self._amd_only:
+            raise RuntimeError("AMD hardware could not decode this stream; choose another decoder or chroma setting")
         # Single shared context, SLICE threading across all cores. SLICE
         # parallelises within a single frame's CTU rows (no frame reordering,
         # no added latency), so the cross-tile/cross-frame DPB refs Apple's
