@@ -73,6 +73,25 @@ _MAX_ADVERTISE_W = 1920  # server backing 3840 / mode-table ratio 2
 _MAX_ADVERTISE_H = 1080
 
 
+def _scroll_ticks(
+    accum: list[float], dx: float, dy: float, dt_ms: float,
+) -> tuple[int, int]:
+    """Accumulate GLFW scroll on each axis; return left/up-negative ticks."""
+    accel = (10.0 if dt_ms < 25 else 6.0 if dt_ms < 50 else 3.5 if dt_ms < 100
+             else 2.0 if dt_ms < 200 else 1.4 if dt_ms < 350 else 1.0)
+    ticks = [0, 0]
+    for axis, delta in enumerate((dx, dy)):
+        if delta == 0:
+            continue  # Don't drain another axis's backlog during a new gesture.
+        # GLFW is left/up-positive; preserve fractional trackpad motion.
+        accum[axis] -= delta * _WHEEL_MULT * accel
+        # Bound large flicks while carrying fractions and un-emitted ticks.
+        accum[axis] = max(-200.0, min(200.0, accum[axis]))
+        ticks[axis] = max(-50, min(50, int(accum[axis])))
+        accum[axis] -= ticks[axis]
+    return ticks[0], ticks[1]
+
+
 def _set_window_identity() -> None:
     """Set Linux compositor hints when the loaded GLFW library supports them."""
     if sys.platform != "linux" or not glfw.init():
@@ -636,39 +655,18 @@ def _run_viewer(
     # across the wire, so we recreate the curve here. Without it,
     # RFB scroll feels glacial vs the OS-native scroll the user is
     # used to.
-    _wheel_accum = [0.0]
+    _wheel_accum = [0.0, 0.0]
     _wheel_last_t = [0.0]
 
-    def on_scroll(_w, _x, dy):
-        if cursor is None or dy == 0:
+    def on_scroll(_w, dx, dy):
+        if cursor is None or (dx == 0 and dy == 0):
             return
         now = time.monotonic() * 1000.0  # ms
         dt = now - _wheel_last_t[0]
         _wheel_last_t[0] = now
-        if dt < 25:    accel = 10.0
-        elif dt < 50:  accel = 6.0
-        elif dt < 100: accel = 3.5
-        elif dt < 200: accel = 2.0
-        elif dt < 350: accel = 1.4
-        else:          accel = 1.0
-        # glfw's dy is in wheel ticks (1.0 per notch on a discrete wheel;
-        # fractional on trackpads / high-res wheels). Apply a base multiplier
-        # (so even a slow, deliberate scroll advances several ticks) times the
-        # speed curve, and ACCUMULATE the fraction across events — never reset
-        # it, or sub-tick motion from a high-res wheel is thrown away and the
-        # scroll can never build past 1 tick. `scroll_event` reads dy<0 as up.
-        _wheel_accum[0] += -dy * _WHEEL_MULT * accel
-        # Cap the pending magnitude so a single violent flick doesn't leave a
-        # long tail of catch-up events, then emit at most 50 ticks this event
-        # and CARRY the rest (including any clamp overflow) — subtracting only
-        # what we emit, so fast scrolls aren't silently truncated.
-        _wheel_accum[0] = max(-200.0, min(200.0, _wheel_accum[0]))
-        ticks = int(_wheel_accum[0])      # whole ticks pending (toward zero)
-        if ticks == 0:
-            return                        # sub-tick: keep the fraction, let it build
-        emit = max(-50, min(50, ticks))
-        _wheel_accum[0] -= emit           # carry remainder + clamp overflow
-        session.input.scroll_event(cursor[0], cursor[1], 0, emit)
+        tx, ty = _scroll_ticks(_wheel_accum, dx, dy, dt)
+        if tx or ty:
+            session.input.scroll_event(cursor[0], cursor[1], tx, ty)
 
     # Ctrl→Cmd remap: rewrite local Ctrl into the Mac's Cmd modifier
     # so Ctrl+C / Ctrl+V "feel right". Off by default now — the OS
@@ -800,7 +798,7 @@ def _run_viewer(
         ctx2.configure(device=device, format=surface_format, alpha_mode="opaque")
         st = _types.SimpleNamespace(
             window=w2, glfw_window=gw2, crop=crop, cursor=None, last_drawn=None,
-            button_mask=0, in_win={"v": True}, wheel_accum=[0.0], wheel_last=[0.0],
+            button_mask=0, in_win={"v": True}, wheel_accum=[0.0, 0.0], wheel_last=[0.0],
             device_lost=False,
         )
 
@@ -841,22 +839,15 @@ def _run_viewer(
             if st.cursor is not None:
                 session.input.pointer_event(st.button_mask, st.cursor[0], st.cursor[1])
 
-        def on_scroll2(_w, _x, dy):
-            if st.cursor is None or dy == 0:
+        def on_scroll2(_w, dx, dy):
+            if st.cursor is None or (dx == 0 and dy == 0):
                 return
             now = time.monotonic() * 1000.0
             dt = now - st.wheel_last[0]
             st.wheel_last[0] = now
-            accel = (10.0 if dt < 25 else 6.0 if dt < 50 else 3.5 if dt < 100
-                     else 2.0 if dt < 200 else 1.4 if dt < 350 else 1.0)
-            st.wheel_accum[0] += -dy * _WHEEL_MULT * accel
-            st.wheel_accum[0] = max(-200.0, min(200.0, st.wheel_accum[0]))
-            ticks = int(st.wheel_accum[0])
-            if ticks == 0:
-                return
-            emit = max(-50, min(50, ticks))
-            st.wheel_accum[0] -= emit
-            session.input.scroll_event(st.cursor[0], st.cursor[1], 0, emit)
+            tx, ty = _scroll_ticks(st.wheel_accum, dx, dy, dt)
+            if tx or ty:
+                session.input.scroll_event(st.cursor[0], st.cursor[1], tx, ty)
 
         def on_enter2(_w, entered):
             st.in_win["v"] = bool(entered)

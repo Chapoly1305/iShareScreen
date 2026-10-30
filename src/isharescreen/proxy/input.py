@@ -33,6 +33,8 @@ from .protocol.clipboard import (
 from .protocol.enc1103 import StreamCipher
 from .protocol.rfb import (
     BTN_SCROLL_DOWN,
+    BTN_SCROLL_LEFT,
+    BTN_SCROLL_RIGHT,
     BTN_SCROLL_UP,
     build_key_event,
     build_pointer_event,
@@ -142,20 +144,21 @@ class InputController:
         self._send(msg)
 
     def scroll_event(self, x: int, y: int, dx: int, dy: int) -> None:
-        """Apple emulates a wheel via pointer events with bits 3/4 of buttons.
+        """Send wheel ticks: negative dx/dy scroll left/up, positive right/down.
 
-        Each `(press, release)` pair = one wheel tick. `abs(dy)` is the number
-        of ticks; the sign picks up vs down. The host's HID handler edge-
-        triggers, so back-to-back press/release pairs at line rate are fine —
-        Mac UI elements (Safari, Finder) eat them at >100 Hz.
-
-        Horizontal scroll isn't natively supported in RFB; we ignore dx."""
-        if dy == 0:
-            return
-        bit = BTN_SCROLL_UP if dy < 0 else BTN_SCROLL_DOWN
-        for _ in range(abs(int(dy))):
-            self.pointer_event(bit, x, y)
-            self.pointer_event(0, x, y)
+        Apple handles vertical scroll with button bits 3/4 and horizontal
+        scroll with bits 5/6 (see docs/apple_vnc_rfc.md, section 8.1.1).
+        Each tick uses a press/release pair. Emit the axes separately: the
+        host checks scroll bits in order and handles only one per event.
+        """
+        for delta, negative, positive in (
+            (dy, BTN_SCROLL_UP, BTN_SCROLL_DOWN),
+            (dx, BTN_SCROLL_LEFT, BTN_SCROLL_RIGHT),
+        ):
+            bit = negative if delta < 0 else positive
+            for _ in range(abs(int(delta))):
+                self.pointer_event(bit, x, y)
+                self.pointer_event(0, x, y)
 
     def key_event(self, down: bool, keysym: int) -> None:
         if not keysym:

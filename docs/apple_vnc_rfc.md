@@ -453,6 +453,36 @@ The server MAY emit `AppleDisplayLayout` (§8.4) updates that change effective g
 
 The session uses standard RFB messages (SetPixelFormat `0x00`, SetEncodings `0x02`, FramebufferUpdateRequest `0x03`, key/pointer events, etc.) unchanged, carried in record-layer bodies after activation.
 
+#### 8.1.1 Pointer Scroll Mask
+
+Apple's encrypted pointer event (`0x10`, §8.2) supports both wheel axes in
+its one-byte button mask:
+
+| Mask | Direction | Agent scroll delta (vertical, horizontal) |
+|---|---|---|
+| `0x08` | Up | `(+1, 0)` |
+| `0x10` | Down | `(-1, 0)` |
+| `0x20` | Left | `(0, +1)` |
+| `0x40` | Right | `(0, -1)` |
+
+Send each tick as a pointer press followed by release. For a diagonal
+gesture, send the two axes separately: the daemon tests bits 3, 4, 5, 6 in
+order and handles only the first matching direction in each event.
+
+Verified by static analysis of the arm64e binaries on macOS 15.7.3
+(24G419): `screensharingd`'s `HandleEncryptedEventMessage` tests the mask
+at `0x10003c348`–`0x10003c354`. Horizontal branches `0x10003dad0` and
+`0x10003e0a0` pass `(0, +1)` and `(0, -1)` to the scroll RPC at
+`0x10006c8bc`. `ScreensharingAgent` receives those two deltas at
+`0x100040e54` and forwards them via `0x100013060` to
+`CGEventCreateScrollWheelEvent(NULL, kCGScrollEventUnitPixel, 2, vertical,
+horizontal)`. This confirms the encoding; a live Excel gesture still
+requires end-to-end validation on a connected host.
+
+The legacy unencrypted `0x05` path in this daemon only special-cases
+`0x08`/`0x10` as scroll events. Horizontal scrolling uses the encrypted
+`0x10` path used by High Performance sessions.
+
 ### 8.2 Client-to-Server Message Registry
 
 | Opcode | Name | Phase | Status |

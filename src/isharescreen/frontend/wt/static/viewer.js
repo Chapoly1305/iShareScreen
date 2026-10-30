@@ -779,18 +779,18 @@ async function main() {
     send({type: "mouse", buttons: buttonMask, x: xy[0], y: xy[1], seq: mouseSeq++ >>> 0});
   });
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
-  // Wheel: convert pixel-mode `deltaY` to integer ticks for the host's
+  // Wheel: convert both axes to integer ticks for the host's
   // RFB scroll-button protocol. macOS's native scroll has velocity
   // acceleration (consecutive fast scrolls amplify exponentially),
   // which RFB doesn't carry across the wire — we replicate it here:
   // measure time since previous wheel event and multiply ticks when
   // events arrive in quick succession.
-  let wheelAccum = 0;
+  const wheelAccum = [0, 0];
   let lastWheelT = 0;
   canvas.addEventListener("wheel", (e) => {
     e.preventDefault();
     const xy = inWindowToCanvas(e);
-    if (!xy || e.deltaY === 0) return;
+    if (!xy || (e.deltaX === 0 && e.deltaY === 0)) return;
     const now = performance.now();
     const dt = now - lastWheelT;
     lastWheelT = now;
@@ -807,23 +807,21 @@ async function main() {
     // to a pixel-equivalent, then divide to land ~12 ticks (px) per wheel notch
     // (~1 line) — enough to be clearly perceptible. The old /25 gave ~4 px/notch,
     // so a slow scroll moved too few pixels to notice ("tick didn't register").
-    let pxDelta = e.deltaY;
-    if (e.deltaMode === 1) pxDelta *= 16;        // DOM_DELTA_LINE → ~px
-    else if (e.deltaMode === 2) pxDelta *= 400;  // DOM_DELTA_PAGE → ~px
-    wheelAccum += (pxDelta * mult) / 8;
-    let ticks = Math.trunc(wheelAccum);
-    // Minimum 1 tick per event so slow / tiny-delta inputs always
-    // register. Without this, sub-1-tick accumulator values from a
-    // gentle trackpad swipe could fail to fire for several events.
-    if (ticks === 0) {
-      ticks = e.deltaY > 0 ? 1 : -1;
-      wheelAccum = 0;
-    } else {
-      wheelAccum -= ticks;
-    }
-    if (ticks > 50) ticks = 50;
-    if (ticks < -50) ticks = -50;
-    send({type: "scroll", x: xy[0], y: xy[1], dx: 0, dy: ticks});
+    const scale = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1;
+    const ticks = [e.deltaX, e.deltaY].map((delta, axis) => {
+      if (delta === 0) return 0;
+      wheelAccum[axis] += (delta * scale * mult) / 8;
+      let value = Math.trunc(wheelAccum[axis]);
+      // Minimum 1 tick on a moving axis so gentle swipes still register.
+      if (value === 0) {
+        value = Math.sign(delta);
+        wheelAccum[axis] = 0;
+      } else {
+        wheelAccum[axis] -= value;
+      }
+      return Math.max(-50, Math.min(50, value));
+    });
+    send({type: "scroll", x: xy[0], y: xy[1], dx: ticks[0], dy: ticks[1]});
   }, { passive: false });
 
   document.addEventListener("keydown", (e) => {

@@ -109,6 +109,8 @@ BTN_RIGHT = 1 << 1
 BTN_MIDDLE = 1 << 2
 BTN_SCROLL_UP = 1 << 3
 BTN_SCROLL_DOWN = 1 << 4
+BTN_SCROLL_LEFT = 1 << 5
+BTN_SCROLL_RIGHT = 1 << 6
 
 
 # ── socket helper ────────────────────────────────────────────────────
@@ -356,6 +358,7 @@ def build_virtual_display(
 
 __all__ = [
     "BTN_LEFT", "BTN_MIDDLE", "BTN_RIGHT", "BTN_SCROLL_DOWN", "BTN_SCROLL_UP",
+    "BTN_SCROLL_LEFT", "BTN_SCROLL_RIGHT",
     "CLI_KEY_EVENT", "CLI_MEDIA_NEGOTIATION",
     "CLI_POINTER_EVENT", "CLI_POST_ENCRYPTION_TOGGLE", "CLI_SET_ENCODINGS",
     "CLI_VIEWER_INFO", "CLI_VIRTUAL_DISPLAY",
