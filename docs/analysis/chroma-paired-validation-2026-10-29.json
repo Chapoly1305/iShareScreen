@@ -1,0 +1,75 @@
+{
+  "videos": 24,
+  "methods": 8,
+  "frames_per_video": 3,
+  "resolutions": [
+    540,
+    576,
+    720,
+    1080
+  ],
+  "rates": [
+    {
+      "kbps": 600,
+      "means": {
+        "420": {
+          "psnr": 28.129936235475466,
+          "ssim": 0.9283324439415497,
+          "lpips": 0.09640356689366551
+        },
+        "444": {
+          "psnr": 28.351009866051925,
+          "ssim": 0.9294349344280136,
+          "lpips": 0.09761304372295854
+        }
+      },
+      "cells_favoring_444": {
+        "psnr": 31,
+        "ssim": 30,
+        "lpips": 5
+      },
+      "cells": 32,
+      "pairs": 2304,
+      "delta_444_minus_420": {
+        "psnr": 0.22107363057645912,
+        "ssim": 0.0011024904864639362,
+        "lpips": 0.0012094768292930241
+      }
+    },
+    {
+      "kbps": 1000,
+      "means": {
+        "420": {
+          "psnr": 29.280216291289896,
+          "ssim": 0.9435185302750989,
+          "lpips": 0.07345721258136312
+        },
+        "444": {
+          "psnr": 29.744764051619914,
+          "ssim": 0.9451892999509073,
+          "lpips": 0.07370494684482765
+        }
+      },
+      "cells_favoring_444": {
+        "psnr": 32,
+        "ssim": 31,
+        "lpips": 18
+      },
+      "cells": 32,
+      "pairs": 2304,
+      "delta_444_minus_420": {
+        "psnr": 0.4645477603300172,
+        "ssim": 0.00167076967580837,
+        "lpips": 0.0002477342634645274
+      }
+    }
+  ],
+  "total_rows": 9216,
+  "scope": "All requested configurations retained, including rate/VBV exceptions; image-quality metrics, not source-truth OCR accuracy",
+  "coverage_audit_sha256": "4c24b872fa4923af92e564807761e1941b450df6caf28e802f45f65a478efd88",
+  "default_for_future_evaluations": "420",
+  "encoder_builds": {
+    "H100": "x265 3.5+1-f0c1022b6 / FFmpeg 9.0.2",
+    "lab": "x265 4.1+1-1d117be / FFmpeg 8.0.1-3ubuntu2"
+  }
+}

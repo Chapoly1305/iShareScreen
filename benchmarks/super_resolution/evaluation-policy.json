@@ -1,0 +1,9 @@
+{
+  "updated": "2026-10-29",
+  "chroma": "420",
+  "pixel_format": "yuv420p",
+  "scope": "Future video evaluation defaults; primary report for the current baseline campaign",
+  "reason": "Explicit user preference for broader applicability",
+  "include_444_only_when_user_requests_comparison": true,
+  "preserve_frozen_historical_protocols": true
+}

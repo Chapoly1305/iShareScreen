@@ -25,6 +25,13 @@ tools/*
 # Reproducible benchmark inputs, weights and generated outputs
 benchmarks/super_resolution/vendor/
 benchmarks/super_resolution/checkpoints/
-benchmarks/super_resolution/artifacts/
+benchmarks/super_resolution/artifacts
+benchmarks/super_resolution/experiments/
+archives/
 benchmarks/super_resolution/.venv*/
 debug-captures/
+
+# Generated datasets are local; retain the layout builder and documentation.
+datasets/**
+!datasets/README.md
+!datasets/prepare_splits.py

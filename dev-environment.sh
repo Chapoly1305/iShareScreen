@@ -1,0 +1,13 @@
+# Source this file on the current host; Python environments stay host-local.
+export ISS_WORKSPACE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$ISS_WORKSPACE/.venv/bin/activate"
+export ISS_SR_HOME="$ISS_WORKSPACE/.cache/super_resolution"
+export ISS_TESSDATA="$ISS_WORKSPACE/tools-runtime/tessdata"
+export TESSDATA_PREFIX="$ISS_TESSDATA"
+export TORCH_HOME="$ISS_WORKSPACE/.cache/torch"
+export PLAYWRIGHT_BROWSERS_PATH="$ISS_WORKSPACE/.cache/ms-playwright"
+export HF_HOME="$ISS_WORKSPACE/.cache/huggingface"
+export TMPDIR="$ISS_WORKSPACE/.tmp"
+export PATH="$ISS_WORKSPACE/.venv/bin:$ISS_WORKSPACE/tools-runtime/env/bin:$PATH"
+export PYTHONPATH="$ISS_WORKSPACE:$ISS_WORKSPACE/src${PYTHONPATH:+:$PYTHONPATH}"
+cd "$ISS_WORKSPACE"
