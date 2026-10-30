@@ -164,6 +164,72 @@ _PROFILE = os.environ.get("ISS_WT_PROFILE", "0") == "1"
 _FORCE_KEYFRAME_ON_JOIN = True
 
 
+class _FrameMailbox:
+    """One bounded handoff per viewer, independent of asyncio ready-queue size."""
+    def __init__(self, loop, send, recover):
+        self.loop, self.send, self.recover = loop, send, recover
+        self.lock = threading.Lock()
+        self.pending = deque()
+        self.scheduled = False
+        self.needs_key = False
+        self.closed = False
+
+    def offer(self, payload):
+        if not payload:
+            return
+        recover = False
+        now = time.perf_counter()
+        tag = payload[0]
+        with self.lock:
+            if self.closed:
+                return
+            if tag in (1, 3):  # New key/config supersedes old video history.
+                self.pending = deque((t, p) for t, p in self.pending
+                                     if p[0] not in ((0, 1, 3) if tag == 3 else (0, 1)))
+                self.needs_key = tag == 3
+            elif tag == 0:
+                if self.needs_key:
+                    return
+                old_video = next((t for t, p in self.pending if p[0] in (0, 1)), now)
+                if len(self.pending) >= 8 or now - old_video > 0.05:
+                    self.pending = deque((t, p) for t, p in self.pending if p[0] not in (0, 1))
+                    self.needs_key = recover = True
+            else:
+                # Keep only the latest cursor/config of each type.
+                self.pending = deque((t, p) for t, p in self.pending if p[0] != tag)
+            if not recover:
+                self.pending.append((now, payload))
+            schedule = not self.scheduled
+            self.scheduled = True
+        if recover and self.recover is not None:
+            self.loop.call_soon_threadsafe(self.recover)
+        if schedule:
+            self.loop.call_soon_threadsafe(self._drain)
+
+    def _drain(self):
+        for _ in range(4):
+            with self.lock:
+                if self.closed or not self.pending:
+                    self.scheduled = False
+                    return
+                queued, payload = self.pending.popleft()
+                stale = payload[0] in (0, 1) and time.perf_counter() - queued > 0.05
+                if stale:
+                    self.pending = deque((t, p) for t, p in self.pending if p[0] not in (0, 1))
+                    self.needs_key = True
+            if stale:
+                if self.recover is not None:
+                    self.recover()
+            else:
+                self.send(payload)
+        self.loop.call_soon(self._drain)
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+            self.pending.clear()
+
+
 class _ViewerSession:
     """Per-browser-tab state — the WT session, the bidi input stream,
     and bookkeeping the bridge needs to fan-out encoded bytes."""
@@ -174,6 +240,7 @@ class _ViewerSession:
         "input_callback", "dgrams_sent", "last_seen_t",
         "video_stream_id", "frames_dropped", "video_discontinuity",
         "capsule_decoder", "use_single_stream", "request_keyframe",
+        "last_mouse_seq", "mouse_buttons", "_ack_rate", "_ack_sample", "_mailbox",
     )
 
     def __init__(
@@ -226,6 +293,14 @@ class _ViewerSession:
         # single-stream reset-on-backlog path to resync after discarding a
         # stale backlog. None in contexts without a bridge (e.g. tests).
         self.request_keyframe = request_keyframe
+        self.last_mouse_seq = None
+        self.mouse_buttons = 0
+        self._ack_rate = 2_500_000.0
+        self._ack_sample = None
+        self._mailbox = _FrameMailbox(loop, self.send_frame, request_keyframe)
+
+    def queue_frame(self, payload):
+        self._mailbox.offer(payload)
 
     def send_frame(self, payload: bytes) -> None:
         """Deliver one encoded-frame envelope to the browser.
@@ -247,6 +322,11 @@ class _ViewerSession:
         if _VIDEO_SINGLE_STREAM or self.use_single_stream:
             self._send_frame_single(payload)
             return
+        tag = payload[0] if payload else -1
+        if self.video_discontinuity and tag == 0:
+            return
+        if tag == 1:
+            self.video_discontinuity = False
         try:
             quic = self.h3._quic
             new_id = self.h3.create_webtransport_stream(
@@ -264,6 +344,11 @@ class _ViewerSession:
             self.transmit()
         except Exception as e:
             log.debug("frame send failed (viewer %d): %s", self.session_id, e)
+            if tag in (0, 1):
+                self.frames_dropped += 1
+                self.video_discontinuity = True
+                if self.request_keyframe is not None:
+                    self.request_keyframe()
 
     def _send_frame_single(self, payload: bytes) -> None:
         """Single-stream path: length-prefix each envelope onto ONE long-lived
@@ -308,7 +393,17 @@ class _ViewerSession:
                 backlog = 0
                 if stream is not None:
                     backlog = stream.sender._buffer_stop - stream.sender._buffer_start
-                if backlog > _SINGLE_STREAM_HIGH_WATER:
+                now = time.perf_counter()
+                acknowledged = stream.sender._buffer_start if stream is not None else 0
+                sample = self._ack_sample
+                if sample is not None and now - sample[0] >= 0.1:
+                    rate = max(0, acknowledged - sample[1]) / (now - sample[0])
+                    self._ack_rate = 0.75 * self._ack_rate + 0.25 * rate
+                    self._ack_sample = (now, acknowledged)
+                elif sample is None:
+                    self._ack_sample = (now, acknowledged)
+                budget = min(_SINGLE_STREAM_HIGH_WATER, max(4096, int(self._ack_rate * 0.1)))
+                if backlog > budget:
                     # Stop feeding the stream (bounds the backlog) and resync
                     # from a keyframe rather than resetting the stream.
                     self.video_discontinuity = True
@@ -357,6 +452,21 @@ class _ViewerSession:
         except Exception as e:
             log.warning("datagram send failed (viewer %d): %s", self.session_id, e)
 
+    def accept_mouse(self, msg):
+        seq = msg.get("seq")
+        motion = msg.get("motion", False)
+        if motion and int(msg.get("buttons", 0)) != self.mouse_buttons:
+            return False  # A delayed datagram cannot re-press a released button.
+        previous = self.last_mouse_seq
+        newer = seq is not None and (previous is None or 0 < ((int(seq)-previous) & 0xffffffff) < 0x80000000)
+        if motion and seq is not None and not newer:
+            return False
+        if not motion:
+            self.mouse_buttons = int(msg.get("buttons", 0))
+        if newer:
+            self.last_mouse_seq = int(seq) & 0xffffffff
+        return True
+
     def feed_input_bytes(self, data: bytes) -> None:
         """Append client input bytes; dispatch newline-delimited JSON
         records as they arrive."""
@@ -376,7 +486,8 @@ class _ViewerSession:
                 log.warning("bad input json: %s — %s", e, line[:80])
                 continue
             try:
-                self.input_callback(msg)
+                if msg.get("type") != "mouse" or self.accept_mouse(msg):
+                    self.input_callback(msg)
             except Exception as e:
                 log.warning("input callback raised: %s on %s", e, msg.get("type"))
 
@@ -876,6 +987,9 @@ class WebTransportBridge:
             session.request_fir(None)
 
     def remove_viewer(self, viewer: _ViewerSession) -> None:
+        mailbox = getattr(viewer, "_mailbox", None)
+        if mailbox is not None:
+            mailbox.close()
         with self._viewers_lock:
             if viewer not in self.viewers:
                 return
@@ -1135,7 +1249,11 @@ class WebTransportBridge:
         with self._viewers_lock:
             viewers = list(self.viewers)
         for viewer in viewers:
-            loop.call_soon_threadsafe(viewer.send_frame, envelope)
+            queued = getattr(viewer, "queue_frame", None)
+            if queued is not None:
+                queued(envelope)
+            else:
+                loop.call_soon_threadsafe(viewer.send_frame, envelope)
 
     def _detach_session_locked(self) -> None:
         self._session_generation += 1
@@ -1192,12 +1310,16 @@ class WebTransportBridge:
         viewer.last_seen_t = time.monotonic()
         if self._session is None:
             return
-        if len(data) != 13 or data[0] != 0x10:
+        if len(data) not in (13, 17) or data[0] != 0x10:
             log.debug("input datagram: bad len=%d type=%d", len(data), data[0] if data else -1)
             return
         buttons = int.from_bytes(data[1:5], "big")
         x = int.from_bytes(data[5:9], "big", signed=True)
         y = int.from_bytes(data[9:13], "big", signed=True)
+        accept = getattr(viewer, "accept_mouse", None)
+        if accept is not None and not accept({"buttons": buttons, "motion": True,
+                "seq": int.from_bytes(data[13:17], "big") if len(data) == 17 else None}):
+            return
         self._input_dgrams_rx = getattr(self, "_input_dgrams_rx", 0) + 1
         if self._input_dgrams_rx in (1, 50, 200, 1000):
             log.info(

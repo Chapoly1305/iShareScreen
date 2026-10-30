@@ -42,7 +42,7 @@ from .media.tiles import TileFrame
 from .config import SessionConfig
 from .media.decoder import Decoder
 from .media.options import DecoderOptions
-from .input import InputController
+from .input import AsyncInputController, InputController
 from .media.aac_eld import AacEldDecoder, make_aac_eld_decoder
 from .media.hevc import HevcDecoder
 from .media.avc import AvcDecoder
@@ -176,6 +176,7 @@ _PENDING_GROUP_TTL_S = 0.2
 # milliseconds; 75 ms gives generous headroom without adding latency to
 # healthy frames, which still flush immediately.
 _AVC_RTP_REPAIR_WAIT_S = 0.075
+_HEVC_RTP_REPAIR_WAIT_S = 0.012
 
 # How long a completed (marker-flushed) (SSRC, ts) key stays in the dedup
 # set so we drop late retransmits of already-processed packets without
@@ -215,6 +216,20 @@ class _CursorImage:
 # keep `pending_groups` cheap — these accumulate by the thousands per
 # second on busy streams.
 _PktTuple = tuple[int, bool, bytes]  # (seq, marker, payload)
+
+
+class _PacketGroup(list):
+    """Packet order plus constant-time duplicate/marker bookkeeping."""
+    def __init__(self, packets=()):
+        super().__init__(packets)
+        self.sequences = {p[0] for p in self}
+        self.has_marker = any(p[1] for p in self)
+
+    def add_packet(self, seq, marker, payload):
+        if seq not in self.sequences:
+            self.sequences.add(seq)
+            self.has_marker |= marker
+            self.append((seq, marker, payload))
 
 
 # ── Session ──────────────────────────────────────────────────────────
@@ -322,7 +337,7 @@ class Session:
         # Drain queues — see _video_drain_loop / _ctrl_drain_loop. The
         # drain threads do nothing but recvfrom + put_nowait; the
         # process threads do all decrypt + dispatch work.
-        self._video_q: queue.Queue[bytes] = queue.Queue(maxsize=_UDP_DRAIN_QUEUE_MAX)
+        self._video_q: queue.Queue[tuple[float, bytes]] = queue.Queue(maxsize=_UDP_DRAIN_QUEUE_MAX)
         self._ctrl_q: queue.Queue[bytes] = queue.Queue(maxsize=_UDP_DRAIN_QUEUE_MAX)
         self._video_q_dropped = 0
         self._ctrl_q_dropped = 0
@@ -406,6 +421,7 @@ class Session:
         self._tx_wakeup = threading.Event()
         self._threads: list[threading.Thread] = []
         self._fresh_evt = threading.Event()
+        self._frame_wakeup = None
         self._connected = False
         self._closing = False
 
@@ -508,6 +524,7 @@ class Session:
         # `local_clipboard.push_text`) so headless and frontend-less
         # callers still get clipboard sync.
         self._clipboard_text_callback: Optional[Callable[[str], None]] = None
+        self._clipboard_in = queue.Queue(maxsize=1)
         # Most-recent text we pushed to the local clipboard. Used as an
         # echo guard by the frontend's outbound poll thread so a value
         # that came FROM the host doesn't get sent BACK as a fresh
@@ -579,11 +596,18 @@ class Session:
         since the last call (or the gate blocked the latest)."""
         if self._decoder is None:
             return None
+        if (getattr(self, "_needs_param_harvest", False)
+                or getattr(self, "_avc_needs_reconfig", False)):
+            return None
         if not 0 <= tile_idx < self.num_tiles:
             raise ValueError(
                 f"tile_idx {tile_idx} out of range [0, {self.num_tiles})"
             )
         return self._decoder.get_frame(tile_idx)
+
+    def set_frame_wakeup(self, callback) -> None:
+        """Wake a native event loop when decoding publishes, without UI work here."""
+        self._frame_wakeup = callback
 
     def wait_for_fresh_tile(self, timeout: float = 0.033) -> bool:
         """Block until any tile publishes a new frame, or `timeout` elapses.
@@ -711,12 +735,12 @@ class Session:
         msg = build_virtual_display(
             width=width, height=height, hidpi_scale=hidpi_scale, hdr=False,
         )
-        neg.cipher.encrypt_and_send(neg.sock, msg)
+        sender = self._input.send_record if isinstance(self._input, AsyncInputController) else (
+            lambda payload: neg.cipher.encrypt_and_send(neg.sock, payload))
+        sender(msg)
         # Re-arm TCP and nudge encoder with FIRs for fresh IDRs.
         try:
-            neg.cipher.encrypt_and_send(
-                neg.sock, build_fbu_request(incremental=False)
-            )
+            sender(build_fbu_request(incremental=False))
         except OSError:
             pass
         self.request_fir()
@@ -1131,6 +1155,9 @@ class Session:
             raise RuntimeError(
                 f"no usable decoder for codec {self._video_codec!r} "
                 f"(override={_override!r})")
+        feedback = getattr(self._decoder, "set_feedback_wakeup", None)
+        if feedback is not None:
+            feedback(self._tx_wakeup.set)
         if not prefer_hwaccel:
             log.info("ISS_FORCE_SW_HEVC=1: HW decoders disabled")
         self._avc_cfg_sps = burst.sps or b""
@@ -1163,7 +1190,7 @@ class Session:
         # events in msg 0x10 (HandleEncryptedEventMessage) so the
         # daemon's uid-gated msg 0x05 PointerEvent path doesn't
         # silently drop them — see input.py for the gate analysis.
-        self._input = InputController(
+        self._input = AsyncInputController(
             self._negotiation.sock,
             self._negotiation.cipher,
             server_width=self._negotiation.canvas_width,
@@ -1353,14 +1380,19 @@ class Session:
         # are independent slice chains and the burst must gather enough to seed
         # the shared decoder context before the streaming loop starts.
         _is_avc = self._video_codec == "avc"
+        from .protocol.burst import BurstReadiness
+        ready = BurstReadiness(SRTPDecryptor.from_blob(keys.video_key_s),
+                               self._video_codec, cfg.quality_tier,
+                               self._negotiation.canvas_tiles or tiles_per_frame(self._media_offer_config))
         self._drain_socket_into(
-            self._sock_video, burst_buf, max_seconds=4.0 if _is_avc else 2.0)
+            self._sock_video, burst_buf, max_seconds=4.0 if _is_avc else 2.0,
+            ready=ready)
         return gather_initial_burst(
             burst_buf, self._video_decryptor, quality_tier=cfg.quality_tier,
             codec=self._video_codec,
             tile_group_size=self._negotiation.canvas_tiles or tiles_per_frame(
                 self._media_offer_config),
-            min_packets=400 if _is_avc else 100,
+            min_packets=0, deadline_seconds=0, settle_seconds=0,
         )
 
     def _teardown_negotiation_tcp(self) -> None:
@@ -1603,6 +1635,8 @@ class Session:
         # Note: there's no separate iss-audio-rx thread because Apple
         # rtcp-muxes audio onto _sock_ctrl (UDP 5900); the ctrl process
         # loop routes audio RTP to _handle_audio_rtp.
+        if os.environ.get("ISS_CLIP", "1") != "0":
+            targets.append(("iss-clipboard-in", self._clipboard_in_loop))
         for name, target in targets:
             t = threading.Thread(target=target, name=name, daemon=True)
             t.start()
@@ -1615,6 +1649,12 @@ class Session:
         published. Wakes anyone in `wait_for_fresh_tile`."""
         self._last_publish_t = time.monotonic()
         self._fresh_evt.set()
+        wakeup = getattr(self, "_frame_wakeup", None)
+        if wakeup is not None:
+            try:
+                wakeup()
+            except Exception:
+                log.debug("frame event wakeup failed", exc_info=True)
         self._send_ltr_ack(tile_idx)
 
     def _send_ltr_ack(self, tile_idx: int) -> None:
@@ -2229,7 +2269,7 @@ class Session:
                         loss_count += 1
                         continue
             try:
-                q.put_nowait(pkt)
+                q.put_nowait((time.perf_counter(), pkt))
             except queue.Full:
                 self._video_q_dropped += 1
 
@@ -2240,11 +2280,15 @@ class Session:
         q = self._video_q
         while not self._stop_evt.is_set():
             try:
-                pkt = q.get(timeout=_UDP_RECV_TIMEOUT_S)
+                timeout = 0.005 if self._group_repair_deadline else _UDP_RECV_TIMEOUT_S
+                pkt = q.get(timeout=timeout)
             except queue.Empty:
                 self._evict_stale_groups()
                 continue
 
+            if isinstance(pkt, tuple):
+                queued, pkt = pkt
+                self._video_queue_age_ms = (time.perf_counter() - queued) * 1000
             res = decryptor.decrypt(pkt)
             if res is None:
                 continue
@@ -2262,7 +2306,7 @@ class Session:
             # Previously eviction ran only on queue.Empty, which may never
             # happen during an active 60 fps stream.
             now = time.monotonic()
-            if now - self._last_group_evict_t >= 0.020:
+            if now - self._last_group_evict_t >= 0.005:
                 self._last_group_evict_t = now
                 self._evict_stale_groups()
 
@@ -2287,7 +2331,7 @@ class Session:
 
     def _group_complete(self, key: tuple[int, int], grp: list[_PktTuple]) -> bool:
         """True when marker boundaries and the AU's sequence range are intact."""
-        if not grp or not any(p[1] for p in grp):
+        if not grp or not (grp.has_marker if isinstance(grp, _PacketGroup) else any(p[1] for p in grp)):
             return False
         packets = self._sorted_group_packets(grp)
         # The marker must terminate the circularly ordered access unit.
@@ -2356,18 +2400,32 @@ class Session:
             return
         grp = self._pending_groups.get(key)
         if grp is None:
-            grp = []
+            grp = _PacketGroup()
             self._pending_groups[key] = grp
             self._group_arrival[key] = time.monotonic()
-        # Retransmits can duplicate a packet already received. Keep one copy so
-        # duplicate sequence numbers cannot confuse gap detection/reassembly.
-        if not any(p[0] == seq for p in grp):
-            grp.append((seq, marker, payload))
-
-        if not any(p[1] for p in grp):
+        elif not isinstance(grp, _PacketGroup):
+            # Initial-burst groups also enter this path.
+            grp = self._pending_groups[key] = _PacketGroup(grp)
+        grp.add_packet(seq, marker, payload)
+        if not grp.has_marker:
             return
         if self._video_codec != "avc":
-            self._flush_group(key)
+            now = time.monotonic()
+            deadlines = self._group_repair_deadline
+            for older in list(self._pending_groups):
+                if older == key:
+                    break
+                if older[0] == ssrc and not any(p[1] for p in self._pending_groups[older]):
+                    deadlines.setdefault(older, now + _HEVC_RTP_REPAIR_WAIT_S)
+            if not self._group_complete(key, grp):
+                deadlines.setdefault(key, now + _HEVC_RTP_REPAIR_WAIT_S)
+            else:
+                deadlines.pop(key, None)
+            if deadlines:
+                self._flush_hevc_ready_groups()
+            else:
+                self._flush_group(key)
+                self._flush_hevc_ready_groups()
             return
 
         now = time.monotonic()
@@ -2396,6 +2454,33 @@ class Session:
         self._group_repair_deadline.pop(key, None)
         self._flush_group(key)
         self._flush_ready_groups(ssrc)
+
+    def _flush_hevc_ready_groups(self) -> None:
+        # All HEVC tiles share references. Hold later groups across SSRCs,
+        # while allowing an older missing AU's NACK retransmission to precede
+        # the group whose marker originally exposed that loss.
+        blocked = self._group_repair_deadline
+        while True:
+            cutoff = min((self._group_arrival.get(k, float("inf")) for k in blocked),
+                         default=float("inf"))
+            for key in list(self._pending_groups):
+                if self._group_arrival.get(key, 0) > cutoff:
+                    ordered = self._ordered_group_keys(key[0])
+                    position = ordered.index(key)
+                    repairs_predecessor = any(
+                        other[0] == key[0] and other in ordered
+                        and position < ordered.index(other) for other in blocked)
+                    if not repairs_predecessor:
+                        continue
+                grp = self._pending_groups[key]
+                if self._group_complete(key, grp):
+                    blocked.pop(key, None)
+                    self._flush_group(key)
+                    if key in self._pending_groups:
+                        return  # Decoder teardown can race the receive loop.
+                    break  # Marker advancement can unblock an earlier dict key.
+            else:
+                return
 
     def _flush_ready_groups(self, ssrc: int) -> None:
         """Drain complete buffered groups for one SSRC in decode order."""
@@ -2652,7 +2737,7 @@ class Session:
             # internally complete AU establish a new transport anchor.
             self._last_group_marker_seq.pop(ssrc, None)
         ti = self._ssrc_to_tile.get(ssrc)
-        if self._video_codec == "avc" and ti is not None and self._decoder is not None:
+        if ti is not None and self._decoder is not None:
             trigger = (
                 f"RTP access unit incomplete after repair window ({reason}; "
                 f"packets={len(grp)} age={(now - started) * 1000:.1f}ms)"
@@ -2691,8 +2776,11 @@ class Session:
                 )
                 if ssrc is not None:
                     unblocked_ssrcs.add(ssrc)
-        for ssrc in unblocked_ssrcs:
-            self._flush_ready_groups(ssrc)
+        if self._video_codec != "avc":
+            self._flush_hevc_ready_groups()
+        else:
+            for ssrc in unblocked_ssrcs:
+                self._flush_ready_groups(ssrc)
         if self._recently_flushed:
             for k in [
                 k for k, t in self._recently_flushed.items()
@@ -3508,6 +3596,7 @@ class Session:
         return 8 + comp_size
 
     def _notify_cursor(self, img: Optional[_CursorImage]) -> None:
+        self._maybe_poll_cursor()
         self._cursor_msgs_processed += 1
         self._cursor_last_t = time.monotonic()
         if img is not None:
@@ -3525,6 +3614,18 @@ class Session:
             cb(img)
         except Exception as e:
             log.warning("cursor callback raised: %s", e)
+
+    def _clipboard_in_loop(self):
+        from . import local_clipboard
+        while not self._stop_evt.is_set():
+            try:
+                text = self._clipboard_in.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            try:
+                local_clipboard.push_text(text)
+            except Exception:
+                log.debug("clipboard write failed", exc_info=True)
 
     def _handle_clipboard_send(self, full_msg: bytes) -> None:
         """A complete 0x1f payload arrived — decompress, parse, push the
@@ -3565,7 +3666,18 @@ class Session:
             len(items), len(text),
         )
         self._last_received_clipboard_text = text
-        local_clipboard.push_text(text)
+        incoming = getattr(self, "_clipboard_in", None)
+        if incoming is not None:
+            try:
+                incoming.put_nowait(text)
+            except queue.Full:
+                try:
+                    incoming.get_nowait()
+                except queue.Empty:
+                    pass
+                incoming.put_nowait(text)
+        else:
+            local_clipboard.push_text(text)
         cb = self._clipboard_text_callback
         if cb is not None:
             try:
@@ -3586,6 +3698,10 @@ class Session:
         InputController.request_framebuffer_update)."""
         if self._input is None:
             return
+        now = time.monotonic()
+        if now - getattr(self, "_last_cursor_poll_t", 0.0) < 0.016:
+            return
+        self._last_cursor_poll_t = now
         try:
             self._input.request_framebuffer_update()
         except Exception:
@@ -3676,7 +3792,8 @@ class Session:
             "udp_q": {
                 "video": {"depth": self._video_q.qsize(),
                           "cap": _UDP_DRAIN_QUEUE_MAX,
-                          "drop": self._video_q_dropped},
+                          "drop": self._video_q_dropped,
+                              "age_ms": round(getattr(self, "_video_queue_age_ms", 0.0), 2)},
                 "ctrl":  {"depth": self._ctrl_q.qsize(),
                           "cap": _UDP_DRAIN_QUEUE_MAX,
                           "drop": self._ctrl_q_dropped},
@@ -3866,7 +3983,8 @@ class Session:
                 "udp_q": {
                     "video": {"depth": self._video_q.qsize(),
                               "cap": _UDP_DRAIN_QUEUE_MAX,
-                              "drop": self._video_q_dropped},
+                              "drop": self._video_q_dropped,
+                              "age_ms": round(getattr(self, "_video_queue_age_ms", 0.0), 2)},
                     "ctrl":  {"depth": self._ctrl_q.qsize(),
                               "cap": _UDP_DRAIN_QUEUE_MAX,
                               "drop": self._ctrl_q_dropped},
@@ -3892,6 +4010,7 @@ class Session:
                 "decode_q": {
                     "depth": getattr(self._decoder, "decode_queue_depth", 0),
                     "cap": getattr(self._decoder, "decode_queue_cap", 512),
+                    "wait_ms": round(getattr(self._decoder, "_queue_wait_ms", 0.0), 2),
                     "drop": getattr(self._decoder, "decode_queue_drops", 0),
                 } if self._decoder is not None else None,
             })
@@ -4466,7 +4585,7 @@ class Session:
 
     @staticmethod
     def _drain_socket_into(
-        sock: socket.socket, into: list[bytes], *, max_seconds: float,
+        sock: socket.socket, into: list[bytes], *, max_seconds: float, ready=None,
     ) -> None:
         """Pull packets off `sock` for up to `max_seconds`. Used to drain
         the burst before the rx thread starts."""
@@ -4479,12 +4598,15 @@ class Session:
                 # Burst typically lands within 200-400 ms; once we see
                 # no packets for 50 ms after some have arrived, we have
                 # enough.
-                if into:
+                if into and ready is None:
                     return
                 continue
             except OSError:
                 return
             into.append(pkt)
+            if ready is not None and ready(pkt):
+                sock.settimeout(_UDP_RECV_TIMEOUT_S)
+                return
         sock.settimeout(_UDP_RECV_TIMEOUT_S)
 
 

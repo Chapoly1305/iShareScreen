@@ -391,9 +391,22 @@ def _run_viewer(
     # match iss by its title, which changes per session. Apply these before
     # each window, including the secondary windows below.
     _set_window_identity()
-    window = RenderCanvas(title=title, size=(win_w, win_h), max_fps=120)
+    # On macOS, FIFO presentation blocks Metal drawable acquisition on this
+    # same thread that polls input. Tiles uploaded before that wait are already
+    # ~19 ms old at draw submission in a live 60 Hz session. Immediate
+    # presentation removes that extra wait; keep the other platforms' defaults.
+    # ISS_VSYNC=1 opts back into display synchronization (e.g. for tearing).
+    vsync = os.environ.get(
+        "ISS_VSYNC", "0" if sys.platform == "darwin" else "1",
+    ) != "0"
+    log.info("desktop presentation: vsync=%s", vsync)
+    window = RenderCanvas(
+        title=title, size=(win_w, win_h), max_fps=120, vsync=vsync,
+    )
     window_resources.callback(window.close)
     glfw_window = window._window  # for raw glfw input callbacks only
+    session.set_frame_wakeup(glfw.post_empty_event)
+    window_resources.callback(session.set_frame_wakeup, None)
     # Lock the window to the content's aspect ratio so the stream always fills
     # it edge-to-edge with no letterbox side-bars (restores pre-merge behavior;
     # the render rework dropped the lock, so on a monitor whose work-area aspect
@@ -463,6 +476,7 @@ def _run_viewer(
     )
 
     renderer = Renderer(device, surface_format, canvas_w, canvas_h)
+    renderer.expect_tiles(num_tiles)
 
     def _cursor_user_mult() -> float:
         """Manual ISS_CURSOR_SCALE multiplier (default 1.0)."""
@@ -773,7 +787,9 @@ def _run_viewer(
         win_w2 = max(1, base)
         win_h2 = max(1, int(base * rh0 / rw0)) if rw0 else base
         _set_window_identity()
-        w2 = RenderCanvas(title=title_s, size=(win_w2, win_h2), max_fps=120)
+        w2 = RenderCanvas(
+            title=title_s, size=(win_w2, win_h2), max_fps=120, vsync=vsync,
+        )
         window_resources.callback(w2.close)
         gw2 = w2._window
         try:
@@ -893,6 +909,7 @@ def _run_viewer(
                     except Exception:
                         pass
                 renderer.draw(target.create_view(), target.width, target.height)
+                _submitted[0] = True
             except Exception as e:
                 m = str(e)
                 if "device is lost" in m.lower() or "Validation Error" in m:
@@ -927,6 +944,8 @@ def _run_viewer(
     _locked_aspect: list = [0.0]  # last content aspect the window was locked to
     _geom_last: list = [()]  # last logged render-geom tuple (re-log only on change)
     _crop_applied: list = [display < 0]  # --display crop latched once layout lands
+
+    _submitted = [False]
 
     def draw_callback():
         try:
@@ -1031,6 +1050,7 @@ def _run_viewer(
                     num_tiles, slot_h, renderer._dbg_uv, dict(renderer._dbg_tiles),
                 )
             renderer.draw(target.create_view(), target.width, target.height)
+            _submitted[0] = True
         except Exception as e:
             msg = str(e)
             if "device is lost" in msg.lower() or "Validation Error" in msg:
@@ -1242,7 +1262,8 @@ def _run_viewer(
         slot_h = canvas_h // num_tiles if num_tiles else canvas_h
         slot_h_resolved = False
         first_seen = [False] * num_tiles
-        renderer = Renderer(device, surface_format, canvas_w, canvas_h)
+        renderer.resize(canvas_w, canvas_h, force=True)
+        renderer.expect_tiles(num_tiles)
         # In the default single-monitor/auto mode, a layout gap may first
         # appear on a later dynamic resize rather than in the initial layout.
         # Arm the corrective crop then too. `_mw_views` is non-empty once a
@@ -1327,6 +1348,17 @@ def _run_viewer(
                 log.error("send_dynamic_resolution failed: %s", e)
                 return
 
+    # force_draw bypasses rendercanvas's max_fps scheduler. Limit redundant
+    # per-tile presentations, while native events and decoding remain unpaced.
+    try:
+        present_fps = max(30.0, min(1000.0, float(os.environ.get("ISS_PRESENT_FPS", "120"))))
+    except ValueError:
+        present_fps = 120.0
+    present_interval = 1.0 / present_fps
+    next_present_t = 0.0
+    pending_present = False
+    pending_uploads = False
+
     while time.monotonic() < deadline:
         glfw.poll_events()
         _apply_pending_cursor()
@@ -1357,7 +1389,7 @@ def _run_viewer(
 
         # Detect canvas changes from 0x451 handler.
         new_cw, new_ch = session.canvas_dims
-        if (new_cw, new_ch) != (canvas_w, canvas_h) and new_cw and new_ch:
+        if ((new_cw, new_ch) != (canvas_w, canvas_h) or session.num_tiles != num_tiles) and new_cw and new_ch:
             _apply_new_canvas()
 
         # Multi-window: once the host's per-monitor layout (0x451) lands, open
@@ -1424,7 +1456,13 @@ def _run_viewer(
                     _alive.append(sv)
             secondaries[:] = _alive
 
-        session.wait_for_fresh_tile(timeout=_FRESH_TILE_WAIT_S)
+        if not session.wait_for_fresh_tile(timeout=0):
+            # Cocoa input wakes this wait immediately; decoded tiles post an
+            # empty native event. Never park the UI on a Python Event.
+            wait = _FRESH_TILE_WAIT_S
+            if pending_present:
+                wait = min(wait, max(0.0001, next_present_t - time.monotonic()))
+            glfw.wait_events_timeout(wait)
 
         # Drain fresh decoded frames + upload.
         any_fresh = False
@@ -1432,20 +1470,23 @@ def _run_viewer(
             tf = session.get_frame(ti)
             if tf is None:
                 continue
-            first_seen[ti] = True
             # Refine slot_h on the first tile — encoder's CTU-padded
             # picture height (typically 4 rows taller than canvas_h//
             # num_tiles). See comment at session-ready above.
-            if not slot_h_resolved:
+            if not slot_h_resolved or tf.height != slot_h:
+                if slot_h_resolved:
+                    renderer.resize(canvas_w, canvas_h, force=True)
+                    first_seen = [False] * num_tiles
                 slot_h = tf.height
                 slot_h_resolved = True
+            first_seen[ti] = True
             renderer.upload_tile(ti, tf, slot_h)
             any_fresh = True
 
-        # Flush staged uploads every frame; without a draw (e.g. window hidden)
-        # they pile up and flood the GPU driver on the next submit.
-        if any_fresh:
-            device.queue.submit([])
+        pending_present |= any_fresh
+        pending_uploads |= any_fresh
+        _submitted[0] = False
+        attempted_draw = False
 
         # Present after a fresh upload, OR when the overlay cursor moved or
         # changed shape — otherwise a pointer that moves/reshapes over a
@@ -1454,8 +1495,11 @@ def _run_viewer(
         cursor_moved = _canvas_cursor and cursor != _last_drawn_cursor
         _sec_moved = _canvas_cursor and any(
             sv.cursor != sv.last_drawn for sv in secondaries)
-        if ((any_fresh or cursor_moved or _sec_moved or _cursor_dirty["v"])
-                and any(first_seen)):
+        pending_present |= cursor_moved or _sec_moved or _cursor_dirty["v"]
+        if pending_present and any(first_seen) and time.monotonic() >= next_present_t:
+            attempted_draw = True
+            pending_present = False
+            next_present_t = time.monotonic() + present_interval
             if display_all:
                 # Draw each window with its own crop. Every draw callback
                 # (primary draw_callback and each secondary draw2) self-asserts
@@ -1469,6 +1513,12 @@ def _run_viewer(
                 window.force_draw()
             _last_drawn_cursor = cursor
             _cursor_dirty["v"] = False
+        # A normal draw already submits staged texture writes. Flush explicitly
+        # only when the surface was hidden and no draw callback ran.
+        if attempted_draw and pending_uploads and not _submitted[0]:
+            device.queue.submit([])
+        if _submitted[0] or attempted_draw:
+            pending_uploads = False
 
     log.info("desktop frontend closing")
     return 0

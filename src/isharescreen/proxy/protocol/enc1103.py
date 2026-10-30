@@ -100,6 +100,13 @@ class StreamCipher:
             enc = self._encrypt_locked(plaintext)
             sock.sendall(enc)
 
+    def encrypt_and_send_many(self, sock, records) -> None:
+        """Batch ordered records into one TCP write without interleaving counters."""
+        with self._lock:
+            payload = b"".join(self._encrypt_locked(record) for record in records)
+            if payload:
+                sock.sendall(payload)
+
     def decrypt_message(self, ciphertext: bytes) -> Optional[bytes]:
         """Decrypt one ciphertext block. Returns the inner RFB body, or None
         if the MAC doesn't verify under any candidate counter.

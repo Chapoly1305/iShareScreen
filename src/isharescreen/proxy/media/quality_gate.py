@@ -26,6 +26,8 @@ fires.
 from __future__ import annotations
 
 import logging
+import threading
+from functools import wraps
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -56,6 +58,14 @@ class _TileState:
     vis: TileVisState = field(default_factory=lambda: TileVisState(STATE_INIT))
 
 
+def _locked(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self._state_lock:
+            return method(self, *args, **kwargs)
+    return call
+
+
 class FrameQualityGate:
     """Tracks per-tile keyframe-required state with libwebrtc-style
     sticky semantics. `mark_decode_error(i)` flags a tile as needing
@@ -68,10 +78,8 @@ class FrameQualityGate:
     tile every `_RE_ARM_INTERVAL_S` regardless of whether libav has
     logged any new errors, until the decoder confirms recovery.
 
-    Methods are not thread-safe — call from the decoder's frame-publish
-    thread (or hold the decoder's lock around them). The FIR set is
-    safe to read from another thread *as long as* no `mark_decode_error`
-    call is in progress.
+    Public operations are serialized across decode, receive and feedback
+    threads. A reentrant lock keeps force-all/reset operations atomic.
     """
 
     # Time between successive FIR re-emits for a tile that's still in
@@ -132,6 +140,7 @@ class FrameQualityGate:
     ) -> None:
         if num_tiles <= 0:
             raise ValueError("num_tiles must be positive")
+        self._state_lock = threading.RLock()
         self._num_tiles = num_tiles
         self._states: list[_TileState] = [_TileState() for _ in range(num_tiles)]
         # Sticky set: a tile stays here until both clear-conditions
@@ -210,12 +219,14 @@ class FrameQualityGate:
     # -- main "publish" hook --------------------------------------------
     # Always publishes. Kept as a callable for API compatibility with
     # the old gate; no pixel inspection is done.
+    @_locked
     def should_publish(self, tile_idx: int, tile: TileFrame) -> bool:
         state = self._states[tile_idx]
         state.vis = TileVisState(STATE_OK)
         return True
 
     # -- decoder-error path (the only escalation source) ----------------
+    @_locked
     def mark_decode_error(self, tile_idx: int, *, reliable: bool = True) -> None:
         """Trusted signal that libavcodec concealed / failed for this
         tile. Adds the tile to `keyframe_required` (sticky) — the
@@ -285,6 +296,7 @@ class FrameQualityGate:
                           tile_idx, self._cycle_count[tile_idx])
 
     # -- IDR observation hook -------------------------------------------
+    @_locked
     def mark_idr_observed(self, tile_idx: int, *, suspicious: bool = False) -> None:
         """Decoder calls this when an IDR NAL (unit type 16-21) is
         fed for this tile. Half of the two-condition clear; the other
@@ -337,6 +349,7 @@ class FrameQualityGate:
     # decode_error_flag set. Resets the streak; if an IDR was already
     # observed for this tile since the last error, also clears the
     # keyframe-required flag (libwebrtc two-condition).
+    @_locked
     def mark_clean(self, tile_idx: int) -> None:
         if tile_idx < 0 or tile_idx >= self._num_tiles:
             return
@@ -391,6 +404,7 @@ class FrameQualityGate:
                     self._cycle_count[tile_idx] = 0
 
     # -- FIR consumption -------------------------------------------------
+    @_locked
     def consume_fir_request(self) -> set[int]:
         """Returns the set of tile indices to send FIR for on this tick.
 
@@ -431,6 +445,7 @@ class FrameQualityGate:
 
     # -- introspection ---------------------------------------------------
     @property
+    @_locked
     def bad_tiles(self) -> set[int]:
         """Tiles the gate currently considers broken (concealing/gray and
         awaiting recovery). Driven by mark_decode_error, which fires on both
@@ -439,13 +454,16 @@ class FrameQualityGate:
         per-frame flag. The honest 'which tiles are gray' signal."""
         return set(self._keyframe_required)
 
+    @_locked
     def tile_state(self, tile_idx: int) -> TileVisState:
         return self._states[tile_idx].vis
 
+    @_locked
     def needs_real_frame(self, tile_idx: int) -> bool:
         return self._states[tile_idx].needs_real_frame
 
     # -- lifecycle -------------------------------------------------------
+    @_locked
     def reset(self, tile_idx: Optional[int] = None) -> None:
         if tile_idx is None:
             for i in range(self._num_tiles):
@@ -470,6 +488,7 @@ class FrameQualityGate:
             self._idr_observed_at[tile_idx] = 0.0
 
     # -- force-IDR manual fallback funnel -------------------------------
+    @_locked
     def force_keyframe_all(self) -> None:
         """Sets keyframe_required for every tile (single funnel for the
         TUI's force-IDR ('f') action + any other 'just refresh

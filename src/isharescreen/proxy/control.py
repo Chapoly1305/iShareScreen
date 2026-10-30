@@ -32,6 +32,7 @@ the streamed screen, so we add no auth on top.
 from __future__ import annotations
 
 import json
+from collections import deque
 import logging
 import os
 import socket
@@ -68,11 +69,10 @@ class ControlServer:
     """Publishes session snapshots and accepts client commands on a local
     socket. One server per Session; any number of clients can subscribe.
 
-    Thread model: a daemon thread accepts new clients; broadcasts go out
-    on whatever thread calls `publish_snapshot` / `publish_event` (the
-    session's tx tick, by design). A per-server lock guards the client
-    list during broadcast and accept. Dead sockets are pruned lazily on
-    the next broadcast."""
+    Thread model: accept and command-reader threads handle clients; a bounded
+    sender queue replaces obsolete snapshots. Protocol/feedback publishers
+    enqueue without waiting for any dashboard socket. Socket writes run outside
+    the client-list lock."""
 
     def __init__(self, addr: str, on_command: Optional[CommandHandler] = None):
         self._addr = addr
@@ -90,6 +90,9 @@ class ControlServer:
         # Per-client command dispatcher; None disables the inbound path
         # (server is publish-only).
         self._on_command = on_command
+        self._outgoing = deque()
+        self._outgoing_ready = threading.Condition()
+        self._sender_thr = None
 
     @property
     def address(self) -> str:
@@ -138,6 +141,9 @@ class ControlServer:
             target=self._accept_loop, name="iss-ctrl-accept", daemon=True,
         )
         self._accept_thr.start()
+        self._sender_thr = threading.Thread(target=self._send_loop,
+                                            name="iss-stats-tx", daemon=True)
+        self._sender_thr.start()
         log.info("control socket listening at %s", self.address)
 
     def set_hello(self, **fields: Any) -> None:
@@ -161,6 +167,8 @@ class ControlServer:
         """Stop the accept loop, close every client, unbind, and clean up
         the on-disk artifacts (UDS file or port sidecar)."""
         self._stop.set()
+        with self._outgoing_ready:
+            self._outgoing_ready.notify_all()
         sock, self._listen = self._listen, None
         if sock is not None:
             try:
@@ -188,6 +196,8 @@ class ControlServer:
             pass
         if self._accept_thr is not None:
             self._accept_thr.join(timeout=1.0)
+        if self._sender_thr is not None and self._sender_thr is not threading.current_thread():
+            self._sender_thr.join(timeout=1.0)
         # Reap any per-client reader threads. They notice the closed
         # socket on their next recv (or `_stop` on the 0.5 s timeout) and
         # exit; joining ensures we don't return until they've removed
@@ -199,20 +209,36 @@ class ControlServer:
     # ── internals ──────────────────────────────────────────────────
 
     def _broadcast(self, msg: dict[str, Any]) -> None:
-        line = (json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8")
-        with self._clients_lock:
-            dead: list[socket.socket] = []
-            for c in self._clients:
-                try:
-                    c.sendall(line)
-                except OSError:
-                    dead.append(c)
-            for c in dead:
-                self._clients.remove(c)
-                try:
-                    c.close()
-                except OSError:
-                    pass
+        # Protocol feedback must never wait for a paused dashboard reader.
+        with self._outgoing_ready:
+            if self._stop.is_set():
+                return
+            if msg.get("type") == "snapshot":
+                self._outgoing = deque(m for m in self._outgoing
+                                       if m.get("type") != "snapshot")
+            if len(self._outgoing) >= 128:
+                self._outgoing.popleft()
+            self._outgoing.append(msg)
+            self._outgoing_ready.notify()
+
+    def _send_loop(self) -> None:
+        while not self._stop.is_set():
+            with self._outgoing_ready:
+                self._outgoing_ready.wait_for(lambda: self._outgoing or self._stop.is_set())
+                if self._stop.is_set():
+                    return
+                msg = self._outgoing.popleft()
+            with self._clients_lock:
+                clients = list(self._clients)
+            dead = [c for c in clients if not self._send_to(c, msg)]
+            with self._clients_lock:
+                for c in dead:
+                    if c in self._clients:
+                        self._clients.remove(c)
+                    try:
+                        c.close()
+                    except OSError:
+                        pass
 
     def _send_to(self, c: socket.socket, msg: dict[str, Any]) -> bool:
         line = (json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8")
@@ -234,6 +260,7 @@ class ControlServer:
             except OSError:
                 break
             log.debug("control client connected")
+            client.settimeout(0.1)
             # Greet immediately with the cached hello so the TUI can
             # render static panels before the first periodic snapshot.
             hello = {"type": "hello", "version": 1, "session": self._hello}

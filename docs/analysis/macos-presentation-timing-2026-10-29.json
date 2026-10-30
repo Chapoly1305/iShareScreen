@@ -1,0 +1,1851 @@
+{
+  "date": "2026-10-29",
+  "platform": "macOS 15.7.3 arm64",
+  "gpu": "Apple M1",
+  "wgpu": "0.32.0",
+  "rendercanvas": "2.7.2",
+  "decoder": "vt-hevc444",
+  "canvas": [
+    2736,
+    1740
+  ],
+  "tiles": 4,
+  "local_cursor": true,
+  "baseline_revision": "71bed6463f7259ef201ed30254a5d175036eaca6",
+  "method": "Sequential manual remote-window drags with temporary in-process perf_counter wrappers; five-second windows. Same decoder, scale, canvas, and native cursor. FIFO compared with immediate presentation; supported surface modes were fifo and immediate.",
+  "units": "milliseconds per operation, unless count n or total",
+  "limitations": [
+    "Manual input was not an identical recorded replay.",
+    "Frame age is measured from CPU TileFrame construction to Renderer.draw entry, before command submission and physical presentation; it excludes host capture, encoding, transit, and display scanout.",
+    "decoded_to_draw_recent_ms includes only newly uploaded tiles with ages under 100 ms; old unchanged tiles are excluded. It is not an end-to-end latency measurement.",
+    "First five seconds excluded from comparison. Baseline windows 2-5 and immediate windows 1-5 contain active interaction before later resize.",
+    "Immediate presentation can tear and does more draws/GPU work. CPU usage was approximately 96% of one core during a later active window, versus an earlier approximately 40%; these are unmatched activity samples, not a controlled resource-cost comparison."
+  ],
+  "baseline_fifo": {
+    "windows": {
+      "2": {
+        "copy_pixels_ms": {
+          "n": 981,
+          "p50": 0.298,
+          "p95": 0.46,
+          "p99": 0.65,
+          "max": 1.107,
+          "total": 306.617
+        },
+        "decode_ms": {
+          "n": 981,
+          "p50": 2.543,
+          "p95": 2.952,
+          "p99": 3.589,
+          "max": 5.002,
+          "total": 2549.324
+        },
+        "acquire_ms": {
+          "n": 300,
+          "p50": 12.741,
+          "p95": 15.099,
+          "p99": 15.717,
+          "max": 15.946,
+          "total": 3882.066
+        },
+        "decoded_to_draw_recent_ms": {
+          "n": 890,
+          "p50": 18.67,
+          "p95": 28.107,
+          "p99": 29.177,
+          "max": 30.104,
+          "total": 17039.685
+        },
+        "draw_ms": {
+          "n": 300,
+          "p50": 0.444,
+          "p95": 1.047,
+          "p99": 1.273,
+          "max": 1.34,
+          "total": 157.747
+        },
+        "force_draw_ms": {
+          "n": 300,
+          "p50": 13.411,
+          "p95": 15.719,
+          "p99": 16.155,
+          "max": 16.883,
+          "total": 4079.308
+        },
+        "poll_interval_ms": {
+          "n": 301,
+          "p50": 16.651,
+          "p95": 17.472,
+          "p99": 17.737,
+          "max": 18.23,
+          "total": 4999.864
+        },
+        "poll_ms": {
+          "n": 301,
+          "p50": 0.291,
+          "p95": 1.003,
+          "p99": 1.36,
+          "max": 2.083,
+          "total": 104.816
+        },
+        "wait_tile_ms": {
+          "n": 301,
+          "p50": 0.003,
+          "p95": 0.004,
+          "p99": 0.01,
+          "max": 5.643,
+          "total": 13.31
+        },
+        "decoded_to_upload_ms": {
+          "n": 890,
+          "p50": 3.799,
+          "p95": 14.725,
+          "p99": 16.044,
+          "max": 16.983,
+          "total": 4136.599
+        },
+        "upload_ms": {
+          "n": 890,
+          "p50": 0.786,
+          "p95": 1.315,
+          "p99": 1.617,
+          "max": 2.102,
+          "total": 752.031
+        },
+        "force_draw_interval_ms": {
+          "n": 300,
+          "p50": 16.621,
+          "p95": 18.425,
+          "p99": 19.612,
+          "max": 24.298,
+          "total": 4999.766
+        },
+        "pointer_interval_ms": {
+          "n": 257,
+          "p50": 16.681,
+          "p95": 17.585,
+          "p99": 166.234,
+          "max": 266.089,
+          "total": 5182.839
+        },
+        "input_send_ms": {
+          "n": 269,
+          "p50": 0.086,
+          "p95": 0.417,
+          "p99": 0.694,
+          "max": 0.892,
+          "total": 33.107
+        },
+        "pointer_ms": {
+          "n": 257,
+          "p50": 0.128,
+          "p95": 0.472,
+          "p99": 0.744,
+          "max": 0.941,
+          "total": 42.829
+        }
+      },
+      "3": {
+        "copy_pixels_ms": {
+          "n": 1174,
+          "p50": 0.29,
+          "p95": 0.428,
+          "p99": 0.491,
+          "max": 0.609,
+          "total": 351.794
+        },
+        "decode_ms": {
+          "n": 1174,
+          "p50": 2.504,
+          "p95": 2.835,
+          "p99": 3.024,
+          "max": 3.286,
+          "total": 2973.468
+        },
+        "acquire_ms": {
+          "n": 300,
+          "p50": 12.475,
+          "p95": 13.843,
+          "p99": 15.105,
+          "max": 15.73,
+          "total": 3769.833
+        },
+        "decoded_to_draw_recent_ms": {
+          "n": 1056,
+          "p50": 18.948,
+          "p95": 28.887,
+          "p99": 29.681,
+          "max": 31.13,
+          "total": 21096.026
+        },
+        "draw_ms": {
+          "n": 300,
+          "p50": 0.45,
+          "p95": 1.035,
+          "p99": 1.287,
+          "max": 1.492,
+          "total": 159.924
+        },
+        "force_draw_ms": {
+          "n": 300,
+          "p50": 13.118,
+          "p95": 14.442,
+          "p99": 15.751,
+          "max": 16.171,
+          "total": 3966.921
+        },
+        "poll_interval_ms": {
+          "n": 300,
+          "p50": 16.68,
+          "p95": 17.334,
+          "p99": 17.596,
+          "max": 17.704,
+          "total": 5000.365
+        },
+        "pointer_interval_ms": {
+          "n": 289,
+          "p50": 16.651,
+          "p95": 17.42,
+          "p99": 17.667,
+          "max": 199.443,
+          "total": 5000.385
+        },
+        "input_send_ms": {
+          "n": 299,
+          "p50": 0.084,
+          "p95": 0.543,
+          "p99": 0.776,
+          "max": 0.906,
+          "total": 39.205
+        },
+        "pointer_ms": {
+          "n": 289,
+          "p50": 0.123,
+          "p95": 0.581,
+          "p99": 0.865,
+          "max": 0.953,
+          "total": 49.851
+        },
+        "poll_ms": {
+          "n": 300,
+          "p50": 0.274,
+          "p95": 0.966,
+          "p99": 1.263,
+          "max": 1.883,
+          "total": 106.85
+        },
+        "wait_tile_ms": {
+          "n": 300,
+          "p50": 0.003,
+          "p95": 0.004,
+          "p99": 0.004,
+          "max": 0.004,
+          "total": 0.938
+        },
+        "decoded_to_upload_ms": {
+          "n": 1055,
+          "p50": 3.946,
+          "p95": 15.6,
+          "p99": 16.392,
+          "max": 17.309,
+          "total": 5916.365
+        },
+        "upload_ms": {
+          "n": 1055,
+          "p50": 0.756,
+          "p95": 1.289,
+          "p99": 1.481,
+          "max": 1.87,
+          "total": 859.646
+        },
+        "force_draw_interval_ms": {
+          "n": 300,
+          "p50": 16.731,
+          "p95": 17.951,
+          "p99": 18.569,
+          "max": 18.662,
+          "total": 4999.929
+        }
+      },
+      "4": {
+        "copy_pixels_ms": {
+          "n": 1062,
+          "p50": 0.293,
+          "p95": 0.43,
+          "p99": 0.53,
+          "max": 0.86,
+          "total": 322.802
+        },
+        "decode_ms": {
+          "n": 1062,
+          "p50": 2.513,
+          "p95": 2.904,
+          "p99": 3.215,
+          "max": 4.609,
+          "total": 2714.602
+        },
+        "acquire_ms": {
+          "n": 300,
+          "p50": 12.497,
+          "p95": 14.853,
+          "p99": 15.553,
+          "max": 15.882,
+          "total": 3827.946
+        },
+        "decoded_to_draw_recent_ms": {
+          "n": 960,
+          "p50": 19.127,
+          "p95": 28.911,
+          "p99": 29.594,
+          "max": 29.857,
+          "total": 19336.945
+        },
+        "draw_ms": {
+          "n": 300,
+          "p50": 0.435,
+          "p95": 1.048,
+          "p99": 1.245,
+          "max": 1.565,
+          "total": 152.648
+        },
+        "force_draw_ms": {
+          "n": 300,
+          "p50": 13.126,
+          "p95": 15.6,
+          "p99": 16.169,
+          "max": 16.4,
+          "total": 4019.145
+        },
+        "poll_interval_ms": {
+          "n": 300,
+          "p50": 16.671,
+          "p95": 17.414,
+          "p99": 17.651,
+          "max": 17.93,
+          "total": 4999.896
+        },
+        "pointer_interval_ms": {
+          "n": 269,
+          "p50": 16.716,
+          "p95": 17.651,
+          "p99": 33.775,
+          "max": 317.294,
+          "total": 4999.876
+        },
+        "input_send_ms": {
+          "n": 279,
+          "p50": 0.085,
+          "p95": 0.32,
+          "p99": 0.584,
+          "max": 0.865,
+          "total": 31.364
+        },
+        "pointer_ms": {
+          "n": 269,
+          "p50": 0.126,
+          "p95": 0.383,
+          "p99": 0.622,
+          "max": 0.927,
+          "total": 42.219
+        },
+        "poll_ms": {
+          "n": 300,
+          "p50": 0.288,
+          "p95": 0.933,
+          "p99": 1.201,
+          "max": 2.155,
+          "total": 103.467
+        },
+        "wait_tile_ms": {
+          "n": 300,
+          "p50": 0.003,
+          "p95": 0.004,
+          "p99": 0.007,
+          "max": 0.013,
+          "total": 1.002
+        },
+        "decoded_to_upload_ms": {
+          "n": 961,
+          "p50": 3.877,
+          "p95": 15.59,
+          "p99": 16.463,
+          "max": 17.071,
+          "total": 5505.973
+        },
+        "upload_ms": {
+          "n": 961,
+          "p50": 0.783,
+          "p95": 1.341,
+          "p99": 1.684,
+          "max": 2.226,
+          "total": 809.851
+        },
+        "force_draw_interval_ms": {
+          "n": 300,
+          "p50": 16.698,
+          "p95": 18.38,
+          "p99": 19.057,
+          "max": 19.351,
+          "total": 5000.188
+        }
+      },
+      "5": {
+        "copy_pixels_ms": {
+          "n": 1067,
+          "p50": 0.291,
+          "p95": 0.432,
+          "p99": 0.499,
+          "max": 0.672,
+          "total": 322.55
+        },
+        "decode_ms": {
+          "n": 1067,
+          "p50": 2.502,
+          "p95": 2.927,
+          "p99": 3.193,
+          "max": 3.368,
+          "total": 2715.598
+        },
+        "acquire_ms": {
+          "n": 300,
+          "p50": 12.428,
+          "p95": 13.939,
+          "p99": 15.132,
+          "max": 15.832,
+          "total": 3718.823
+        },
+        "decoded_to_draw_recent_ms": {
+          "n": 973,
+          "p50": 18.87,
+          "p95": 28.868,
+          "p99": 29.674,
+          "max": 30.682,
+          "total": 19488.727
+        },
+        "draw_ms": {
+          "n": 300,
+          "p50": 0.451,
+          "p95": 0.954,
+          "p99": 1.169,
+          "max": 1.49,
+          "total": 152.738
+        },
+        "force_draw_ms": {
+          "n": 300,
+          "p50": 13.036,
+          "p95": 14.578,
+          "p99": 15.552,
+          "max": 16.439,
+          "total": 3906.959
+        },
+        "poll_interval_ms": {
+          "n": 308,
+          "p50": 16.632,
+          "p95": 17.368,
+          "p99": 17.506,
+          "max": 17.79,
+          "total": 5000.464
+        },
+        "pointer_interval_ms": {
+          "n": 289,
+          "p50": 16.609,
+          "p95": 17.423,
+          "p99": 17.812,
+          "max": 250.165,
+          "total": 5002.127
+        },
+        "input_send_ms": {
+          "n": 299,
+          "p50": 0.085,
+          "p95": 0.271,
+          "p99": 0.643,
+          "max": 0.8,
+          "total": 33.411
+        },
+        "pointer_ms": {
+          "n": 289,
+          "p50": 0.125,
+          "p95": 0.315,
+          "p99": 0.685,
+          "max": 0.843,
+          "total": 44.646
+        },
+        "poll_ms": {
+          "n": 308,
+          "p50": 0.309,
+          "p95": 2.151,
+          "p99": 2.577,
+          "max": 2.737,
+          "total": 172.285
+        },
+        "wait_tile_ms": {
+          "n": 308,
+          "p50": 0.003,
+          "p95": 0.005,
+          "p99": 5.638,
+          "max": 5.651,
+          "total": 59.789
+        },
+        "decoded_to_upload_ms": {
+          "n": 971,
+          "p50": 3.89,
+          "p95": 15.248,
+          "p99": 16.114,
+          "max": 16.856,
+          "total": 5590.494
+        },
+        "upload_ms": {
+          "n": 971,
+          "p50": 0.782,
+          "p95": 1.277,
+          "p99": 1.453,
+          "max": 1.69,
+          "total": 796.677
+        },
+        "force_draw_interval_ms": {
+          "n": 300,
+          "p50": 16.631,
+          "p95": 18.06,
+          "p99": 19.168,
+          "max": 60.585,
+          "total": 5000.81
+        }
+      }
+    }
+  },
+  "comparison_immediate": {
+    "windows": {
+      "1": {
+        "acquire_ms": {
+          "n": 1146,
+          "p50": 0.095,
+          "p95": 0.319,
+          "p99": 8.739,
+          "max": 12.376,
+          "total": 338.203
+        },
+        "decoded_to_draw_recent_ms": {
+          "n": 1190,
+          "p50": 1.716,
+          "p95": 4.707,
+          "p99": 10.702,
+          "max": 16.12,
+          "total": 2494.835
+        },
+        "draw_ms": {
+          "n": 1146,
+          "p50": 0.24,
+          "p95": 0.449,
+          "p99": 1.025,
+          "max": 2.219,
+          "total": 320.126
+        },
+        "force_draw_ms": {
+          "n": 1146,
+          "p50": 0.443,
+          "p95": 1.251,
+          "p99": 9.219,
+          "max": 12.697,
+          "total": 790.795
+        },
+        "poll_interval_ms": {
+          "n": 1290,
+          "p50": 3.471,
+          "p95": 6.778,
+          "p99": 10.192,
+          "max": 14.876,
+          "total": 5003.955
+        },
+        "poll_ms": {
+          "n": 1290,
+          "p50": 0.032,
+          "p95": 0.608,
+          "p99": 1.401,
+          "max": 2.195,
+          "total": 209.39
+        },
+        "copy_pixels_ms": {
+          "n": 1196,
+          "p50": 0.385,
+          "p95": 0.674,
+          "p99": 0.772,
+          "max": 1.163,
+          "total": 494.44
+        },
+        "wait_tile_ms": {
+          "n": 1290,
+          "p50": 1.282,
+          "p95": 5.641,
+          "p99": 5.74,
+          "max": 6.393,
+          "total": 2453.476
+        },
+        "decoded_to_upload_ms": {
+          "n": 1190,
+          "p50": 0.174,
+          "p95": 1.075,
+          "p99": 4.293,
+          "max": 14.154,
+          "total": 462.827
+        },
+        "decode_ms": {
+          "n": 1196,
+          "p50": 2.904,
+          "p95": 3.527,
+          "p99": 3.83,
+          "max": 4.37,
+          "total": 3515.772
+        },
+        "upload_ms": {
+          "n": 1189,
+          "p50": 1.082,
+          "p95": 1.71,
+          "p99": 2.111,
+          "max": 2.516,
+          "total": 1341.231
+        },
+        "force_draw_interval_ms": {
+          "n": 1145,
+          "p50": 3.416,
+          "p95": 8.926,
+          "p99": 14.114,
+          "max": 91.023,
+          "total": 4989.661
+        },
+        "pointer_interval_ms": {
+          "n": 295,
+          "p50": 16.715,
+          "p95": 20.917,
+          "p99": 28.374,
+          "max": 48.86,
+          "total": 4998.204
+        },
+        "input_send_ms": {
+          "n": 305,
+          "p50": 0.158,
+          "p95": 0.787,
+          "p99": 1.006,
+          "max": 1.335,
+          "total": 68.003
+        },
+        "pointer_ms": {
+          "n": 295,
+          "p50": 0.21,
+          "p95": 0.885,
+          "p99": 1.129,
+          "max": 1.394,
+          "total": 83.164
+        }
+      },
+      "2": {
+        "upload_ms": {
+          "n": 1121,
+          "p50": 1.068,
+          "p95": 1.729,
+          "p99": 2.057,
+          "max": 2.953,
+          "total": 1261.603
+        },
+        "decoded_to_upload_ms": {
+          "n": 1120,
+          "p50": 0.205,
+          "p95": 1.451,
+          "p99": 8.071,
+          "max": 15.126,
+          "total": 555.063
+        },
+        "copy_pixels_ms": {
+          "n": 1130,
+          "p50": 0.386,
+          "p95": 0.681,
+          "p99": 0.775,
+          "max": 1.313,
+          "total": 472.536
+        },
+        "decode_ms": {
+          "n": 1130,
+          "p50": 2.937,
+          "p95": 3.588,
+          "p99": 3.823,
+          "max": 4.796,
+          "total": 3349.334
+        },
+        "force_draw_interval_ms": {
+          "n": 1072,
+          "p50": 3.472,
+          "p95": 9.647,
+          "p99": 16.483,
+          "max": 102.585,
+          "total": 5008.089
+        },
+        "acquire_ms": {
+          "n": 1072,
+          "p50": 0.096,
+          "p95": 0.326,
+          "p99": 8.415,
+          "max": 15.465,
+          "total": 348.513
+        },
+        "decoded_to_draw_recent_ms": {
+          "n": 1121,
+          "p50": 1.73,
+          "p95": 6.415,
+          "p99": 12.281,
+          "max": 17.636,
+          "total": 2506.783
+        },
+        "draw_ms": {
+          "n": 1072,
+          "p50": 0.247,
+          "p95": 0.465,
+          "p99": 0.892,
+          "max": 1.796,
+          "total": 301.631
+        },
+        "force_draw_ms": {
+          "n": 1072,
+          "p50": 0.465,
+          "p95": 1.15,
+          "p99": 8.905,
+          "max": 15.939,
+          "total": 777.123
+        },
+        "poll_interval_ms": {
+          "n": 1235,
+          "p50": 3.574,
+          "p95": 6.72,
+          "p99": 10.89,
+          "max": 17.12,
+          "total": 4999.186
+        },
+        "pointer_interval_ms": {
+          "n": 268,
+          "p50": 17.072,
+          "p95": 21.145,
+          "p99": 27.399,
+          "max": 453.603,
+          "total": 5003.675
+        },
+        "input_send_ms": {
+          "n": 278,
+          "p50": 0.156,
+          "p95": 0.727,
+          "p99": 0.882,
+          "max": 0.991,
+          "total": 55.494
+        },
+        "pointer_ms": {
+          "n": 268,
+          "p50": 0.212,
+          "p95": 0.827,
+          "p99": 0.99,
+          "max": 1.279,
+          "total": 71.223
+        },
+        "poll_ms": {
+          "n": 1235,
+          "p50": 0.03,
+          "p95": 0.602,
+          "p99": 1.211,
+          "max": 1.779,
+          "total": 179.778
+        },
+        "wait_tile_ms": {
+          "n": 1234,
+          "p50": 1.4,
+          "p95": 5.642,
+          "p99": 5.679,
+          "max": 5.919,
+          "total": 2586.468
+        }
+      },
+      "3": {
+        "copy_pixels_ms": {
+          "n": 863,
+          "p50": 0.329,
+          "p95": 0.636,
+          "p99": 0.779,
+          "max": 1.149,
+          "total": 321.51
+        },
+        "wait_tile_ms": {
+          "n": 1136,
+          "p50": 1.665,
+          "p95": 5.65,
+          "p99": 5.924,
+          "max": 6.29,
+          "total": 3124.472
+        },
+        "decoded_to_upload_ms": {
+          "n": 860,
+          "p50": 0.171,
+          "p95": 2.052,
+          "p99": 6.348,
+          "max": 13.034,
+          "total": 438.115
+        },
+        "decode_ms": {
+          "n": 863,
+          "p50": 2.785,
+          "p95": 3.437,
+          "p99": 3.712,
+          "max": 4.5,
+          "total": 2456.998
+        },
+        "upload_ms": {
+          "n": 860,
+          "p50": 0.982,
+          "p95": 1.671,
+          "p99": 2.176,
+          "max": 2.647,
+          "total": 909.609
+        },
+        "force_draw_interval_ms": {
+          "n": 809,
+          "p50": 3.659,
+          "p95": 15.548,
+          "p99": 16.986,
+          "max": 22.832,
+          "total": 5000.228
+        },
+        "acquire_ms": {
+          "n": 809,
+          "p50": 0.092,
+          "p95": 1.933,
+          "p99": 8.295,
+          "max": 13.229,
+          "total": 329.147
+        },
+        "decoded_to_draw_recent_ms": {
+          "n": 860,
+          "p50": 1.599,
+          "p95": 6.996,
+          "p99": 10.977,
+          "max": 18.057,
+          "total": 1965.2
+        },
+        "draw_ms": {
+          "n": 809,
+          "p50": 0.255,
+          "p95": 0.594,
+          "p99": 0.986,
+          "max": 1.761,
+          "total": 239.639
+        },
+        "force_draw_ms": {
+          "n": 809,
+          "p50": 0.471,
+          "p95": 2.539,
+          "p99": 8.851,
+          "max": 13.609,
+          "total": 667.505
+        },
+        "poll_interval_ms": {
+          "n": 1136,
+          "p50": 4.199,
+          "p95": 7.403,
+          "p99": 10.34,
+          "max": 14.562,
+          "total": 5000.82
+        },
+        "pointer_interval_ms": {
+          "n": 152,
+          "p50": 16.118,
+          "p95": 21.518,
+          "p99": 24.402,
+          "max": 259.9,
+          "total": 2683.0
+        },
+        "input_send_ms": {
+          "n": 161,
+          "p50": 0.153,
+          "p95": 0.685,
+          "p99": 0.963,
+          "max": 1.046,
+          "total": 30.915
+        },
+        "pointer_ms": {
+          "n": 152,
+          "p50": 0.213,
+          "p95": 0.806,
+          "p99": 1.043,
+          "max": 1.098,
+          "total": 39.072
+        },
+        "poll_ms": {
+          "n": 1136,
+          "p50": 0.027,
+          "p95": 0.526,
+          "p99": 1.342,
+          "max": 9.807,
+          "total": 150.054
+        }
+      },
+      "4": {
+        "input_send_ms": {
+          "n": 77,
+          "p50": 0.124,
+          "p95": 0.29,
+          "p99": 0.981,
+          "max": 1.152,
+          "total": 12.305
+        },
+        "wait_tile_ms": {
+          "n": 1124,
+          "p50": 3.057,
+          "p95": 5.657,
+          "p99": 5.935,
+          "max": 6.58,
+          "total": 3762.578
+        },
+        "poll_interval_ms": {
+          "n": 1123,
+          "p50": 5.021,
+          "p95": 6.917,
+          "p99": 8.013,
+          "max": 13.981,
+          "total": 4998.235
+        },
+        "poll_ms": {
+          "n": 1123,
+          "p50": 0.025,
+          "p95": 0.313,
+          "p99": 0.726,
+          "max": 8.932,
+          "total": 83.445
+        },
+        "copy_pixels_ms": {
+          "n": 679,
+          "p50": 0.324,
+          "p95": 0.585,
+          "p99": 0.691,
+          "max": 0.868,
+          "total": 239.422
+        },
+        "decoded_to_upload_ms": {
+          "n": 679,
+          "p50": 0.144,
+          "p95": 0.433,
+          "p99": 1.505,
+          "max": 12.695,
+          "total": 161.489
+        },
+        "decode_ms": {
+          "n": 679,
+          "p50": 2.789,
+          "p95": 3.302,
+          "p99": 3.69,
+          "max": 4.48,
+          "total": 1926.155
+        },
+        "upload_ms": {
+          "n": 678,
+          "p50": 0.94,
+          "p95": 1.384,
+          "p99": 1.645,
+          "max": 6.718,
+          "total": 665.22
+        },
+        "force_draw_interval_ms": {
+          "n": 673,
+          "p50": 3.675,
+          "p95": 15.47,
+          "p99": 17.441,
+          "max": 27.401,
+          "total": 4999.061
+        },
+        "acquire_ms": {
+          "n": 673,
+          "p50": 0.091,
+          "p95": 0.168,
+          "p99": 1.211,
+          "max": 11.058,
+          "total": 104.547
+        },
+        "decoded_to_draw_recent_ms": {
+          "n": 678,
+          "p50": 1.427,
+          "p95": 2.225,
+          "p99": 6.346,
+          "max": 14.233,
+          "total": 1083.729
+        },
+        "draw_ms": {
+          "n": 673,
+          "p50": 0.258,
+          "p95": 0.404,
+          "p99": 0.605,
+          "max": 1.678,
+          "total": 185.59
+        },
+        "force_draw_ms": {
+          "n": 673,
+          "p50": 0.456,
+          "p95": 0.745,
+          "p99": 1.904,
+          "max": 11.414,
+          "total": 365.447
+        },
+        "pointer_interval_ms": {
+          "n": 67,
+          "p50": 14.497,
+          "p95": 28.726,
+          "p99": 273.755,
+          "max": 5868.304,
+          "total": 7316.885
+        },
+        "pointer_ms": {
+          "n": 67,
+          "p50": 0.181,
+          "p95": 0.341,
+          "p99": 1.047,
+          "max": 1.219,
+          "total": 15.179
+        }
+      },
+      "5": {
+        "upload_ms": {
+          "n": 1080,
+          "p50": 0.977,
+          "p95": 1.623,
+          "p99": 1.815,
+          "max": 2.171,
+          "total": 1122.107
+        },
+        "force_draw_interval_ms": {
+          "n": 1050,
+          "p50": 3.407,
+          "p95": 12.481,
+          "p99": 15.845,
+          "max": 18.982,
+          "total": 5000.327
+        },
+        "acquire_ms": {
+          "n": 1050,
+          "p50": 0.086,
+          "p95": 0.285,
+          "p99": 8.235,
+          "max": 11.987,
+          "total": 305.172
+        },
+        "decoded_to_draw_recent_ms": {
+          "n": 1080,
+          "p50": 1.576,
+          "p95": 3.622,
+          "p99": 9.896,
+          "max": 15.681,
+          "total": 2081.017
+        },
+        "draw_ms": {
+          "n": 1050,
+          "p50": 0.232,
+          "p95": 0.424,
+          "p99": 0.854,
+          "max": 6.259,
+          "total": 279.4
+        },
+        "force_draw_ms": {
+          "n": 1050,
+          "p50": 0.432,
+          "p95": 0.999,
+          "p99": 8.726,
+          "max": 12.284,
+          "total": 703.038
+        },
+        "poll_interval_ms": {
+          "n": 1254,
+          "p50": 3.492,
+          "p95": 6.862,
+          "p99": 10.235,
+          "max": 14.651,
+          "total": 5000.415
+        },
+        "poll_ms": {
+          "n": 1254,
+          "p50": 0.031,
+          "p95": 0.514,
+          "p99": 1.129,
+          "max": 2.396,
+          "total": 173.105
+        },
+        "copy_pixels_ms": {
+          "n": 1080,
+          "p50": 0.341,
+          "p95": 0.624,
+          "p99": 0.723,
+          "max": 0.842,
+          "total": 401.38
+        },
+        "wait_tile_ms": {
+          "n": 1254,
+          "p50": 1.401,
+          "p95": 5.645,
+          "p99": 5.812,
+          "max": 6.155,
+          "total": 2823.234
+        },
+        "decoded_to_upload_ms": {
+          "n": 1080,
+          "p50": 0.164,
+          "p95": 0.838,
+          "p99": 3.482,
+          "max": 13.585,
+          "total": 377.092
+        },
+        "decode_ms": {
+          "n": 1080,
+          "p50": 2.812,
+          "p95": 3.46,
+          "p99": 3.825,
+          "max": 6.453,
+          "total": 3086.636
+        },
+        "pointer_interval_ms": {
+          "n": 242,
+          "p50": 16.568,
+          "p95": 21.967,
+          "p99": 84.654,
+          "max": 290.789,
+          "total": 4499.633
+        },
+        "input_send_ms": {
+          "n": 252,
+          "p50": 0.155,
+          "p95": 0.627,
+          "p99": 0.925,
+          "max": 1.27,
+          "total": 48.201
+        },
+        "pointer_ms": {
+          "n": 242,
+          "p50": 0.208,
+          "p95": 0.725,
+          "p99": 1.183,
+          "max": 2.12,
+          "total": 62.134
+        }
+      }
+    }
+  },
+  "user_feedback": "Clearly smoother",
+  "change": "Pass vsync=False to primary and secondary RenderCanvas instances on macOS by default. ISS_VSYNC=1 restores synchronization; other platforms keep their previous default.",
+  "rtp_group_microbenchmark": {
+    "method": "Five isolated runs per group size of Session._queue_video_group_packet with HEVC, one unique sequence per packet, marker on final packet, and _flush_group replaced with a no-op. Excludes SRTP decrypt, sorting, reassembly, and decode. Synthetic group sizes do not establish the live packet-group distribution.",
+    "results": [
+      {
+        "packets_per_group": 100,
+        "median_ms": 0.401,
+        "max_ms": 0.425
+      },
+      {
+        "packets_per_group": 250,
+        "median_ms": 2.078,
+        "max_ms": 2.084
+      },
+      {
+        "packets_per_group": 500,
+        "median_ms": 8.315,
+        "max_ms": 8.731
+      },
+      {
+        "packets_per_group": 1000,
+        "median_ms": 32.397,
+        "max_ms": 33.138
+      },
+      {
+        "packets_per_group": 2000,
+        "median_ms": 130.239,
+        "max_ms": 132.211
+      }
+    ],
+    "finding": "Duplicate detection and marker detection each rescan the growing list on every packet, causing quadratic work. A per-group sequence set and marker-present flag would make these insertion checks constant-time.",
+    "optimized_results": [
+      {
+        "packets_per_group": 100,
+        "median_ms": 0.06,
+        "max_ms": 0.071
+      },
+      {
+        "packets_per_group": 250,
+        "median_ms": 0.128,
+        "max_ms": 0.148
+      },
+      {
+        "packets_per_group": 500,
+        "median_ms": 0.286,
+        "max_ms": 0.325
+      },
+      {
+        "packets_per_group": 1000,
+        "median_ms": 0.567,
+        "max_ms": 0.777
+      },
+      {
+        "packets_per_group": 2000,
+        "median_ms": 1.085,
+        "max_ms": 1.136
+      }
+    ]
+  },
+  "review_scope": [
+    "macOS native desktop input, rendering, frame handoff and VideoToolbox",
+    "shared SRTP/RTP receive, queues, recovery, control and clipboard",
+    "browser WebTransport, WebCodecs and input scheduling (source review only)",
+    "audio buffering and connection startup (source review only)"
+  ],
+  "follow_up_review": [
+    {
+      "priority": 1,
+      "area": "RTP reassembly",
+      "source": "src/isharescreen/proxy/session.py:2364",
+      "evidence": "Measured isolated quadratic insertion cost; live group sizes not captured.",
+      "action": "Track packet sequence membership with a per-group set and cache marker presence. Preserve duplicate and sequence-wrap behavior.",
+      "status": "implemented",
+      "resolution": "Implemented per-group sequence sets and cached marker presence; preserved duplicate and wrap behavior."
+    },
+    {
+      "priority": 2,
+      "area": "Input event wakeups",
+      "source": "src/isharescreen/frontend/desktop/app.py:1440",
+      "evidence": "Python Event wait blocks Cocoa processing for up to 5 ms when no tile arrives.",
+      "action": "Wake one main event loop for both window input and decoded tiles; use a thread-safe posted event and retain lifecycle guards.",
+      "status": "implemented",
+      "resolution": "Native event waits wake immediately for mouse events or posted decoded-tile notifications; input is independent of presentation pacing."
+    },
+    {
+      "priority": 3,
+      "area": "Input transport",
+      "source": "src/isharescreen/proxy/input.py:213",
+      "evidence": "Input callbacks synchronously acquire locks, encrypt and sendall on the same TCP channel as clipboard/control. Healthy measured sends were sub-millisecond; congestion was not tested.",
+      "action": "Use one ordered writer, coalesce stale motion before encryption, and preserve every key/button transition. Batch scroll records while retaining record/counter order.",
+      "status": "implemented",
+      "resolution": "Implemented an ordered input writer, bounded queue, motion coalescing that preserves transition coordinates, batched cipher records, queued resize messages, and a separate clipboard writer."
+    },
+    {
+      "priority": 4,
+      "area": "Pixel copies and uploads",
+      "source": "src/isharescreen/frontend/desktop/gpu.py:493",
+      "evidence": "Padded luma is compacted before texture upload; native pixel planes are also copied to bytes. Baseline copy and upload timing included in data.",
+      "action": "Preserve luma row pitch as already done for UV. Then evaluate CVPixelBuffer-to-Metal interop with correct retained buffer ownership and GPU completion.",
+      "status": "implemented",
+      "resolution": "Padded luma uploads preserve row pitch. Native CVPixelBuffers are retained through read-only exported views instead of copying both planes to bytes. A Metal integration check confirmed identical rendered pixels across three resizes. Direct external Metal-texture import is not part of the public wgpu Python path; this implementation retains the normal upload boundary."
+    },
+    {
+      "priority": 5,
+      "area": "Synchronous decode and queue age",
+      "source": "src/isharescreen/proxy/media/vtdecode.py:248",
+      "evidence": "VideoToolbox decoding blocks the packet-processing thread. A reported zero decode queue does not measure packets waiting upstream.",
+      "action": "Measure packet age and per-tile submission/completion timestamps. Evaluate bounded ordered asynchronous decode, preserving cross-tile references. Do not discard arbitrary encoded P frames to shrink queues.",
+      "status": "implemented",
+      "resolution": "Native VT submissions now run on an ordered worker with a bounded eight-NAL queue for four tiles. No encoded reference frames are arbitrarily discarded. UDP queue age and decode queue wait are reported."
+    },
+    {
+      "priority": 6,
+      "area": "HEVC recovery",
+      "source": "src/isharescreen/proxy/session.py:2369",
+      "evidence": "HEVC groups flush at marker without the AVC repair window; late repairs to a flushed key are ignored. Native VT never supplies last_clean_donl. VT decode-error gate updates do not explicitly wake the TX loop, whose ordinary period is 500 ms.",
+      "action": "Evaluate bounded HEVC retransmit repair in valid global decode order; wake feedback promptly on decode errors; validate clean decoded-frame DONL acknowledgment semantics before enabling LTR ACKs.",
+      "status": "implemented",
+      "resolution": "HEVC repair uses a 12 ms bounded window, holds later sibling tiles, and orders whole-AU retransmissions ahead of dependents. Successful native output carries DONL for LTR ACKs; callback and submit errors wake feedback immediately. Recovery gate public operations are serialized across threads."
+    },
+    {
+      "priority": 7,
+      "area": "Diagnostics and cursor shape",
+      "source": "src/isharescreen/proxy/control.py:201",
+      "evidence": "Stats broadcasts call sendall synchronously from the feedback thread. Clients acquire a 500 ms socket timeout in their read loop. Cursor rearming runs on feedback ticks.",
+      "action": "Move stats delivery to a bounded queue that replaces stale snapshots; rearm cursor requests in response to received updates with an explicit rate limit.",
+      "status": "implemented",
+      "resolution": "Stats delivery uses a bounded background sender, replacing obsolete snapshots. Cursor requests rearm on notification with a 16 ms minimum interval and the existing periodic backup."
+    },
+    {
+      "priority": 8,
+      "area": "Presentation efficiency and resize",
+      "source": "src/isharescreen/frontend/desktop/app.py:1249",
+      "evidence": "Immediate presentation increased drawing frequency and resource use. Canvas changes rebuild Renderer, including texture clears and pipelines. The comparison contained a 307 ms poll interval during a later resize, without isolating its cause.",
+      "action": "Cache pipelines across canvas sizes; rebuild only size-dependent resources. Evaluate render scheduling that keeps input independent and samples latest tiles late, avoiding a return to UI-thread FIFO blocking.",
+      "status": "implemented",
+      "resolution": "Renderer resize retains pipelines and cursor resources. Redundant empty submits are avoided. Explicit redraw pacing defaults to 120 Hz while native events remain unpaced. Partial tile canvases keep their full geometry; tile-count and encoded-height changes refresh layout."
+    },
+    {
+      "priority": 9,
+      "area": "Startup",
+      "source": "src/isharescreen/proxy/session.py:1357",
+      "evidence": "Initial socket collection uses a fixed two-second HEVC budget (four seconds AVC), followed by a default 300 ms settle in gather_initial_burst.",
+      "action": "End collection when required parameter sets and a usable reference picture are complete. Preserve warmup needed for session transitions.",
+      "status": "implemented",
+      "resolution": "Startup uses an independent incremental SRTP readiness probe. It requires parameters, a complete reference picture, and all negotiated tile SSRCs before early completion; shorter actual tile layouts retain the existing collection timeout fallback. Fixed post-collection sleep was removed."
+    },
+    {
+      "priority": 10,
+      "area": "Browser frontend",
+      "source": "src/isharescreen/frontend/wt/static/viewer.js:487",
+      "evidence": "Source review only: reorder timeout is checked on new arrivals; mouse moves wait for requestAnimationFrame; WebCodecs decode calls lack an age/depth cutoff; server schedules one event-loop callback per AU; Safari single-stream threshold is bytes rather than age.",
+      "action": "Use a real reorder timer, low-delay bounded move coalescing, queue-age-aware decode recovery, and bounded forwarding mailboxes. Budget reliable stream backlog against measured throughput and keyframe size.",
+      "status": "implemented",
+      "resolution": "Browser forwarding uses bounded per-viewer mailboxes and keyframe recovery; decoder queue depth/age have limits; reorder expiry has a timer; mouse moves use 4 ms coalescing and sequence/button-state protection; Safari byte budgets adapt to acknowledged throughput."
+    }
+  ],
+  "final_native_measurement": {
+    "method": "Same temporary timing wrappers, with native decode worker measured separately from enqueue. Full four-tile 2736x1740 canvas and default 120 Hz redraw limit. First five seconds excluded.",
+    "windows": {
+      "1": {
+        "copy_pixels_ms": {
+          "n": 852,
+          "p50": 0.042,
+          "p95": 0.132,
+          "p99": 0.276,
+          "max": 0.428,
+          "total": 49.952
+        },
+        "decoded_to_upload_ms": {
+          "n": 852,
+          "p50": 0.173,
+          "p95": 0.627,
+          "p99": 1.145,
+          "max": 11.766,
+          "total": 242.102
+        },
+        "decode_ms": {
+          "n": 852,
+          "p50": 2.493,
+          "p95": 3.471,
+          "p99": 3.876,
+          "max": 5.147,
+          "total": 2222.459
+        },
+        "upload_ms": {
+          "n": 852,
+          "p50": 0.829,
+          "p95": 1.458,
+          "p99": 1.707,
+          "max": 2.575,
+          "total": 770.93
+        },
+        "poll_interval_ms": {
+          "n": 2234,
+          "p50": 1.86,
+          "p95": 5.862,
+          "p99": 7.543,
+          "max": 27.609,
+          "total": 4998.166
+        },
+        "poll_ms": {
+          "n": 2234,
+          "p50": 0.014,
+          "p95": 0.102,
+          "p99": 0.291,
+          "max": 24.05,
+          "total": 89.264
+        },
+        "wait_tile_ms": {
+          "n": 2234,
+          "p50": 0.003,
+          "p95": 0.008,
+          "p99": 0.016,
+          "max": 0.043,
+          "total": 9.127
+        },
+        "force_draw_interval_ms": {
+          "n": 426,
+          "p50": 8.778,
+          "p95": 24.835,
+          "p99": 26.651,
+          "max": 32.881,
+          "total": 4994.02
+        },
+        "acquire_ms": {
+          "n": 426,
+          "p50": 0.066,
+          "p95": 0.151,
+          "p99": 0.22,
+          "max": 8.661,
+          "total": 44.324
+        },
+        "decoded_to_draw_recent_ms": {
+          "n": 847,
+          "p50": 4.389,
+          "p95": 8.192,
+          "p99": 9.079,
+          "max": 15.941,
+          "total": 3723.735
+        },
+        "draw_ms": {
+          "n": 426,
+          "p50": 0.455,
+          "p95": 0.95,
+          "p99": 1.2,
+          "max": 2.34,
+          "total": 216.264
+        },
+        "force_draw_ms": {
+          "n": 426,
+          "p50": 0.638,
+          "p95": 1.411,
+          "p99": 1.798,
+          "max": 9.111,
+          "total": 318.668
+        },
+        "enqueue_decode_ms": {
+          "n": 850,
+          "p50": 0.005,
+          "p95": 0.016,
+          "p99": 0.022,
+          "max": 0.047,
+          "total": 5.82
+        }
+      },
+      "2": {
+        "poll_interval_ms": {
+          "n": 1696,
+          "p50": 2.314,
+          "p95": 6.161,
+          "p99": 8.416,
+          "max": 10.465,
+          "total": 5002.502
+        },
+        "poll_ms": {
+          "n": 1696,
+          "p50": 0.014,
+          "p95": 0.119,
+          "p99": 0.388,
+          "max": 4.716,
+          "total": 71.518
+        },
+        "wait_tile_ms": {
+          "n": 1696,
+          "p50": 0.004,
+          "p95": 0.012,
+          "p99": 0.02,
+          "max": 0.025,
+          "total": 8.337
+        },
+        "enqueue_decode_ms": {
+          "n": 587,
+          "p50": 0.007,
+          "p95": 0.019,
+          "p99": 0.025,
+          "max": 0.049,
+          "total": 5.154
+        },
+        "copy_pixels_ms": {
+          "n": 586,
+          "p50": 0.056,
+          "p95": 0.153,
+          "p99": 0.309,
+          "max": 0.916,
+          "total": 44.349
+        },
+        "decode_ms": {
+          "n": 586,
+          "p50": 2.662,
+          "p95": 3.615,
+          "p99": 4.137,
+          "max": 7.967,
+          "total": 1642.824
+        },
+        "decoded_to_upload_ms": {
+          "n": 586,
+          "p50": 0.21,
+          "p95": 0.671,
+          "p99": 3.262,
+          "max": 5.257,
+          "total": 195.218
+        },
+        "upload_ms": {
+          "n": 586,
+          "p50": 0.884,
+          "p95": 1.659,
+          "p99": 1.86,
+          "max": 2.165,
+          "total": 584.898
+        },
+        "force_draw_interval_ms": {
+          "n": 371,
+          "p50": 8.876,
+          "p95": 26.273,
+          "p99": 30.247,
+          "max": 43.406,
+          "total": 5006.851
+        },
+        "acquire_ms": {
+          "n": 371,
+          "p50": 0.064,
+          "p95": 0.179,
+          "p99": 0.231,
+          "max": 1.49,
+          "total": 32.572
+        },
+        "decoded_to_draw_recent_ms": {
+          "n": 575,
+          "p50": 4.702,
+          "p95": 8.135,
+          "p99": 8.607,
+          "max": 9.231,
+          "total": 2671.078
+        },
+        "draw_ms": {
+          "n": 371,
+          "p50": 0.386,
+          "p95": 1.053,
+          "p99": 1.266,
+          "max": 1.998,
+          "total": 183.53
+        },
+        "force_draw_ms": {
+          "n": 371,
+          "p50": 0.574,
+          "p95": 1.526,
+          "p99": 1.843,
+          "max": 2.554,
+          "total": 270.715
+        }
+      },
+      "3": {
+        "copy_pixels_ms": {
+          "n": 635,
+          "p50": 0.048,
+          "p95": 0.176,
+          "p99": 0.302,
+          "max": 0.542,
+          "total": 45.692
+        },
+        "decoded_to_upload_ms": {
+          "n": 635,
+          "p50": 0.199,
+          "p95": 0.586,
+          "p99": 0.959,
+          "max": 3.086,
+          "total": 166.371
+        },
+        "decode_ms": {
+          "n": 635,
+          "p50": 2.592,
+          "p95": 3.719,
+          "p99": 4.269,
+          "max": 7.243,
+          "total": 1758.532
+        },
+        "upload_ms": {
+          "n": 635,
+          "p50": 0.855,
+          "p95": 1.559,
+          "p99": 1.772,
+          "max": 5.956,
+          "total": 624.69
+        },
+        "poll_interval_ms": {
+          "n": 1800,
+          "p50": 2.186,
+          "p95": 6.06,
+          "p99": 7.69,
+          "max": 17.117,
+          "total": 5000.112
+        },
+        "poll_ms": {
+          "n": 1800,
+          "p50": 0.014,
+          "p95": 0.107,
+          "p99": 0.313,
+          "max": 1.176,
+          "total": 52.257
+        },
+        "wait_tile_ms": {
+          "n": 1800,
+          "p50": 0.004,
+          "p95": 0.012,
+          "p99": 0.02,
+          "max": 0.036,
+          "total": 8.665
+        },
+        "force_draw_interval_ms": {
+          "n": 390,
+          "p50": 8.859,
+          "p95": 26.224,
+          "p99": 29.802,
+          "max": 32.263,
+          "total": 4998.603
+        },
+        "acquire_ms": {
+          "n": 390,
+          "p50": 0.064,
+          "p95": 0.168,
+          "p99": 0.339,
+          "max": 1.256,
+          "total": 34.258
+        },
+        "decoded_to_draw_recent_ms": {
+          "n": 618,
+          "p50": 4.525,
+          "p95": 8.014,
+          "p99": 8.586,
+          "max": 9.851,
+          "total": 2802.302
+        },
+        "draw_ms": {
+          "n": 390,
+          "p50": 0.397,
+          "p95": 1.006,
+          "p99": 1.317,
+          "max": 1.559,
+          "total": 192.607
+        },
+        "force_draw_ms": {
+          "n": 390,
+          "p50": 0.559,
+          "p95": 1.441,
+          "p99": 1.908,
+          "max": 2.389,
+          "total": 282.72
+        },
+        "enqueue_decode_ms": {
+          "n": 634,
+          "p50": 0.007,
+          "p95": 0.019,
+          "p99": 0.023,
+          "max": 0.053,
+          "total": 5.445
+        }
+      },
+      "4": {
+        "poll_interval_ms": {
+          "n": 1688,
+          "p50": 2.38,
+          "p95": 6.239,
+          "p99": 8.044,
+          "max": 8.947,
+          "total": 4999.562
+        },
+        "poll_ms": {
+          "n": 1688,
+          "p50": 0.015,
+          "p95": 0.134,
+          "p99": 0.419,
+          "max": 3.8,
+          "total": 70.534
+        },
+        "wait_tile_ms": {
+          "n": 1688,
+          "p50": 0.004,
+          "p95": 0.013,
+          "p99": 0.02,
+          "max": 0.171,
+          "total": 8.843
+        },
+        "force_draw_interval_ms": {
+          "n": 377,
+          "p50": 8.861,
+          "p95": 25.687,
+          "p99": 29.889,
+          "max": 45.743,
+          "total": 5001.864
+        },
+        "acquire_ms": {
+          "n": 377,
+          "p50": 0.07,
+          "p95": 0.179,
+          "p99": 0.23,
+          "max": 0.498,
+          "total": 33.041
+        },
+        "decoded_to_draw_recent_ms": {
+          "n": 578,
+          "p50": 4.567,
+          "p95": 8.193,
+          "p99": 8.577,
+          "max": 9.788,
+          "total": 2647.076
+        },
+        "draw_ms": {
+          "n": 377,
+          "p50": 0.425,
+          "p95": 0.999,
+          "p99": 1.406,
+          "max": 1.751,
+          "total": 192.552
+        },
+        "force_draw_ms": {
+          "n": 377,
+          "p50": 0.616,
+          "p95": 1.453,
+          "p99": 1.838,
+          "max": 2.291,
+          "total": 282.81
+        },
+        "enqueue_decode_ms": {
+          "n": 593,
+          "p50": 0.007,
+          "p95": 0.019,
+          "p99": 0.025,
+          "max": 0.059,
+          "total": 5.17
+        },
+        "copy_pixels_ms": {
+          "n": 592,
+          "p50": 0.054,
+          "p95": 0.174,
+          "p99": 0.31,
+          "max": 0.374,
+          "total": 44.64
+        },
+        "decode_ms": {
+          "n": 592,
+          "p50": 2.641,
+          "p95": 3.713,
+          "p99": 4.205,
+          "max": 8.581,
+          "total": 1670.324
+        },
+        "decoded_to_upload_ms": {
+          "n": 591,
+          "p50": 0.211,
+          "p95": 0.645,
+          "p99": 1.64,
+          "max": 3.613,
+          "total": 177.626
+        },
+        "upload_ms": {
+          "n": 591,
+          "p50": 0.865,
+          "p95": 1.595,
+          "p99": 1.808,
+          "max": 1.994,
+          "total": 580.248
+        }
+      },
+      "5": {
+        "decoded_to_upload_ms": {
+          "n": 609,
+          "p50": 0.197,
+          "p95": 0.571,
+          "p99": 1.166,
+          "max": 4.167,
+          "total": 167.408
+        },
+        "upload_ms": {
+          "n": 609,
+          "p50": 0.851,
+          "p95": 1.57,
+          "p99": 1.752,
+          "max": 1.905,
+          "total": 583.323
+        },
+        "poll_interval_ms": {
+          "n": 1760,
+          "p50": 2.227,
+          "p95": 6.067,
+          "p99": 7.578,
+          "max": 12.561,
+          "total": 4997.203
+        },
+        "poll_ms": {
+          "n": 1760,
+          "p50": 0.015,
+          "p95": 0.124,
+          "p99": 0.292,
+          "max": 4.397,
+          "total": 59.595
+        },
+        "wait_tile_ms": {
+          "n": 1760,
+          "p50": 0.004,
+          "p95": 0.013,
+          "p99": 0.02,
+          "max": 0.026,
+          "total": 8.834
+        },
+        "copy_pixels_ms": {
+          "n": 608,
+          "p50": 0.049,
+          "p95": 0.165,
+          "p99": 0.278,
+          "max": 0.377,
+          "total": 42.221
+        },
+        "decode_ms": {
+          "n": 608,
+          "p50": 2.596,
+          "p95": 3.64,
+          "p99": 3.942,
+          "max": 4.488,
+          "total": 1672.269
+        },
+        "force_draw_interval_ms": {
+          "n": 379,
+          "p50": 8.856,
+          "p95": 26.216,
+          "p99": 28.806,
+          "max": 32.752,
+          "total": 5000.99
+        },
+        "acquire_ms": {
+          "n": 379,
+          "p50": 0.065,
+          "p95": 0.181,
+          "p99": 0.27,
+          "max": 0.405,
+          "total": 32.386
+        },
+        "decoded_to_draw_recent_ms": {
+          "n": 600,
+          "p50": 4.611,
+          "p95": 8.098,
+          "p99": 8.8,
+          "max": 14.233,
+          "total": 2721.46
+        },
+        "draw_ms": {
+          "n": 378,
+          "p50": 0.395,
+          "p95": 1.037,
+          "p99": 1.229,
+          "max": 1.515,
+          "total": 186.464
+        },
+        "force_draw_ms": {
+          "n": 378,
+          "p50": 0.57,
+          "p95": 1.461,
+          "p99": 1.799,
+          "max": 2.096,
+          "total": 273.925
+        },
+        "enqueue_decode_ms": {
+          "n": 609,
+          "p50": 0.007,
+          "p95": 0.019,
+          "p99": 0.025,
+          "max": 0.085,
+          "total": 5.269
+        }
+      }
+    },
+    "limits": "Sequential manual interaction, not recorded replay. Decoded-to-draw age remains a local pre-submission measurement, filtered to newly uploaded tiles younger than 100 ms. Recovery ordering/error synchronization fixes landed after this healthy-path capture."
+  },
+  "final_validation": {
+    "tests": "327 passed, 1 skipped with ISS_NATIVE_TESTS=1",
+    "javascript": "node --check plus executed reorder timeout/wrap tests against the actual function",
+    "native_metal": "Retained-plane upload rendered identically across three canvas resizes while pipeline objects were reused.",
+    "native_hardware_decoder_reported": true,
+    "loss_smoke": {
+      "duration_s_including_handshake": 35,
+      "injected_burst_period_s": 8,
+      "injected_burst_duration_ms": 20,
+      "bursts_during_playback": 2,
+      "consumed_frames": 4143,
+      "per_tile": [
+        1061,
+        1004,
+        1015,
+        1063
+      ],
+      "outcome": "Continued output on every tile after loss, without a decode-stall warning. This does not measure physical recovery latency."
+    },
+    "user_feedback": "Correct image and smooth dragging",
+    "installed": true,
+    "normal_viewer_restored": true,
+    "not_exercised_live": [
+      "Full browser playback",
+      "Windows and Linux native sessions"
+    ]
+  }
+}

@@ -112,6 +112,17 @@ Useful keys in the live session: **f** force IDR refresh (fixes the
 rare gray patch the auto-recovery doesn't catch), **r** reconnect,
 **d** disconnect, **Ctrl-B** save a bug-report snapshot, **q** quit.
 
+The native desktop viewer uses immediate presentation on macOS to keep display
+buffer waits off the input path. Set `ISS_VSYNC=1` to restore display
+synchronization if needed. `ISS_PRESENT_FPS` controls the desktop redraw limit
+(default 120); input processing and decoding continue independently of that
+limit. For example, `ISS_PRESENT_FPS=240 iss --frontend desktop` favors more
+frequent updates at the cost of additional GPU work.
+
+The test suite uses deterministic protocol and queue tests by default. On
+macOS, `ISS_NATIVE_TESTS=1 pytest` also checks that decoded pixel planes remain
+valid after their frame and decoder are released.
+
 For CI / scripted use:
 
 ```sh

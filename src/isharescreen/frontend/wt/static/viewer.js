@@ -393,6 +393,8 @@ async function main() {
   const REORDER_GAP_MAX = 6;          // count budget — was 24 (~400ms worst-case stall)
   const REORDER_GAP_MAX_MS = 45;      // ...or skip ahead after this long stuck on a gap
   let gapSince = 0;
+  let reorderTimer = null;
+  let decodeStarted = [];
   let videoTs = 0;            // synthetic monotonic decode timestamp (µs)
 
   // Render at the display's vsync, NOT at the decoder's (irregular, bursty)
@@ -435,6 +437,7 @@ async function main() {
     const dec = new VideoDecoder({
       output: (frame) => {
         const tid = routeFifo.length ? routeFifo.shift() : 0;
+        decodeStarted.shift();
         if (slotHeight === 0) slotHeight = frame.codedHeight;
         // Replace this tile's pending frame (drop the un-drawn previous one —
         // we only ever show the newest), then paint at vsync.
@@ -475,7 +478,9 @@ async function main() {
     decoderErrored = false;
     try { if (decoder) decoder.close(); } catch (e) {}
     decoder = buildDecoder();
-    routeFifo = []; awaitingKey = true;
+    routeFifo = []; decodeStarted = []; awaitingKey = true;
+    if (reorderTimer !== null) clearTimeout(reorderTimer);
+    reorderTimer = null;
     pending.clear(); nextSeq = -1; videoTs = 0;
     for (const f of pendingFrames) { if (f) { try { f.close(); } catch (e) {} } }
     pendingFrames.length = 0;
@@ -483,10 +488,14 @@ async function main() {
   }
 
   function drainReorder() {
+    if (reorderTimer !== null) clearTimeout(reorderTimer);
+    reorderTimer = null;
+    if (!pending.size) return;
     if (nextSeq < 0) nextSeq = Math.min(...pending.keys());
     while (pending.has(nextSeq)) {
-      feedAU(pending.get(nextSeq)); pending.delete(nextSeq);
+      const au = pending.get(nextSeq); pending.delete(nextSeq);
       nextSeq = (nextSeq + 1) >>> 0;
+      feedAU(au);
       gapSince = 0;
     }
     // Head seq is missing (late/dropped stream). Don't stall waiting on it: skip
@@ -497,19 +506,36 @@ async function main() {
       if (!gapSince) gapSince = performance.now();
       if (pending.size > REORDER_GAP_MAX ||
           performance.now() - gapSince > REORDER_GAP_MAX_MS) {
-        let mn = Infinity; for (const k of pending.keys()) if (k < mn) mn = k;
+        let mn = -1, distance = Infinity;
+        for (const k of pending.keys()) {
+          const d = (k - nextSeq) >>> 0;
+          if (d < distance) { distance = d; mn = k; }
+        }
         nextSeq = mn; gapSince = 0;
         while (pending.has(nextSeq)) {
-          feedAU(pending.get(nextSeq)); pending.delete(nextSeq);
+          const au = pending.get(nextSeq); pending.delete(nextSeq);
           nextSeq = (nextSeq + 1) >>> 0;
+          feedAU(au);
         }
       }
+    }
+    if (pending.size) {
+      reorderTimer = setTimeout(drainReorder,
+        Math.max(1, REORDER_GAP_MAX_MS - (performance.now() - gapSince)));
     }
   }
 
   function feedAU(au) {
     if (au.isKey) awaitingKey = false;
     if (awaitingKey) return;
+    // Retain a short decode budget, rather than playing an old queue after
+    // overload. Recovery drops deltas until the requested keyframe arrives.
+    if (decoder.decodeQueueSize >= 4 ||
+        (decodeStarted.length > 1 && performance.now() - decodeStarted[0] > 50)) {
+      dropped++;
+      resetDecoder();
+      return;
+    }
     frames++;
     if (PROF) {
       const n = performance.now();
@@ -522,6 +548,7 @@ async function main() {
       __lastArr = n;
     }
     routeFifo.push(au.tileId);
+    decodeStarted.push(performance.now());
     try {
       decoder.decode(new EncodedVideoChunk({
         // Synthetic MONOTONIC timestamp, not the raw RTP ts. Apple's stream is
@@ -531,7 +558,7 @@ async function main() {
       }));
       videoTs += 16666;
     } catch (e) {
-      routeFifo.pop(); dropped++;
+      routeFifo.pop(); decodeStarted.pop(); dropped++;
       if (dropped <= 3) srvLog("error", `decode submit failed: ${e.message || e}`);
     }
   }
@@ -694,30 +721,37 @@ async function main() {
   const dgWriter = (dgrams && dgrams.writable) ? dgrams.writable.getWriter() : null;
   if (!dgWriter) srvLog("info", "no datagram writer (Safari) — mouse moves go over the input stream");
   let pendingMove = null;
+  let moveTimer = null;
+  let mouseSeq = 0;
   function flushMove() {
+    if (moveTimer !== null) clearTimeout(moveTimer);
+    moveTimer = null;
     if (pendingMove !== null) {
       if (dgWriter) {
         // 13-byte fixed-format mouse-move datagram.
         // [type=0x10][buttons:u32 BE][x:i32 BE][y:i32 BE]
-        const buf = new ArrayBuffer(13);
+        const buf = new ArrayBuffer(17);
         const v = new DataView(buf);
         v.setUint8(0, 0x10);
         v.setUint32(1, buttonMask >>> 0);
         v.setInt32(5, pendingMove[0]);
         v.setInt32(9, pendingMove[1]);
+        v.setUint32(13, mouseSeq++ >>> 0);
         dgWriter.write(new Uint8Array(buf)).catch(() => {});
       } else {
-        send({type: "mouse", buttons: buttonMask, x: pendingMove[0], y: pendingMove[1]});
+        send({type: "mouse", buttons: buttonMask, x: pendingMove[0], y: pendingMove[1],
+              motion: true, seq: mouseSeq++ >>> 0});
       }
       pendingMove = null;
     }
-    requestAnimationFrame(flushMove);
   }
-  requestAnimationFrame(flushMove);
 
   canvas.addEventListener("mousemove", (e) => {
     const xy = inWindowToCanvas(e);
-    if (xy) pendingMove = xy;
+    if (xy) {
+      pendingMove = xy;
+      if (moveTimer === null) moveTimer = setTimeout(flushMove, 4);
+    }
   });
   // Apple's button mask is non-standard: bit 0 = left, bit 1 = right,
   // bit 2 = middle (right and middle are SWAPPED from the RFB spec).
@@ -732,15 +766,17 @@ async function main() {
     e.preventDefault();
     const xy = inWindowToCanvas(e);
     if (!xy) return;
+    flushMove();
     buttonMask |= buttonBit(e.button);
-    send({type: "mouse", buttons: buttonMask, x: xy[0], y: xy[1]});
+    send({type: "mouse", buttons: buttonMask, x: xy[0], y: xy[1], seq: mouseSeq++ >>> 0});
   });
   canvas.addEventListener("mouseup", (e) => {
     e.preventDefault();
     const xy = inWindowToCanvas(e);
     if (!xy) return;
+    flushMove();
     buttonMask &= ~buttonBit(e.button);
-    send({type: "mouse", buttons: buttonMask, x: xy[0], y: xy[1]});
+    send({type: "mouse", buttons: buttonMask, x: xy[0], y: xy[1], seq: mouseSeq++ >>> 0});
   });
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
   // Wheel: convert pixel-mode `deltaY` to integer ticks for the host's

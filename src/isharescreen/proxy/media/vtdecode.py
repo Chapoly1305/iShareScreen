@@ -21,6 +21,8 @@ right tile by a per-decode closure. macOS-only; import guarded.
 from __future__ import annotations
 
 import logging
+import ctypes
+import queue
 import os
 import struct
 import threading
@@ -70,6 +72,23 @@ class _VTSlot:
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
+class _PixelBufferLease:
+    """Retain and lock a CVPixelBuffer until its last exported plane dies."""
+    def __init__(self, buf):
+        self.buf = buf
+
+    def plane(self, base, length):
+        array = (ctypes.c_ubyte * length).from_buffer(base.as_buffer(length))
+        array._pixel_buffer_lease = self
+        return memoryview(array).cast("B").toreadonly()
+
+    def __del__(self):
+        try:
+            _Q.CVPixelBufferUnlockBaseAddress(self.buf, _LOCK_READONLY)
+        except Exception:
+            pass
+
+
 class VTHevcDecoder:
     """Native VideoToolbox HEVC decoder. Mirrors `HevcDecoder`'s public API:
     `set_params`, `feed_burst`, `feed_nalu`, `get_frame`, `restart`, `close`,
@@ -90,9 +109,8 @@ class VTHevcDecoder:
         self.num_tiles = num_tiles
         self._on_frame_published = on_frame_published
         self._tiles = [_VTSlot() for _ in range(num_tiles)]
-        # API parity with HevcDecoder: session.py reads last_clean_donl[0] for
-        # the LTRP DON-ack. VideoToolbox steers its own references and never
-        # uses iss-side LTRP, so this stays all-None → session.py acks no DON.
+        # Successful output carries its submitted DONL into Session's LTR ACK.
+        # Failed submissions and decode errors never advance this anchor.
         self.last_clean_donl: list = [None] * num_tiles
         # Per-tile NAL-unit-type histogram (diagnostic; read by the snapshot).
         self.nalu_counts_per_tile: list = [{} for _ in range(num_tiles)]
@@ -121,10 +139,16 @@ class VTHevcDecoder:
         self._seen_fmt = False
         self._fmt_warned = False                # H1: warn once on non-nv24 output
         # Decode latency monitoring: EMA of submit→frame round-trip (ms).
-        # VT decode is synchronous on the RX thread, so this is the HW decode
-        # time per NAL. Shared with the control-socket snapshot.
+        # Native submission stays synchronous on the dedicated ordered worker.
+        # Queue wait is reported separately from submit-to-output latency.
         self._decode_latency_ms: float = 0.0
         self._submit_t: float = 0.0
+        self._queue = queue.Queue(maxsize=max(2, num_tiles * 2))
+        self._stop = threading.Event()
+        self._worker = None
+        self._feedback_wakeup = None
+        self._queue_wait_ms = 0.0
+        self._inflight = 0
 
     # -- params / session ---------------------------------------------------
 
@@ -133,7 +157,13 @@ class VTHevcDecoder:
         VPS/SPS/PPS harvested at session start. Re-callable (rebuilds)."""
         pps = tuple(bytes(p) for p in all_pps.values()) if all_pps else ()
         self._params = (bytes(vps), bytes(sps), pps)
+        if self._worker is not None and self._worker.is_alive():
+            self._queue.join()
         with self._lock:
+            for slot in self._tiles:
+                with slot.lock:
+                    slot.frame = None
+                    slot.last_evaluated_count = slot.good_count
             self._build_session_locked()
 
     def _build_session_locked(self) -> None:
@@ -159,6 +189,13 @@ class VTHevcDecoder:
         self._teardown_session_locked()
         self._fmt = fmt
         self._session = session
+        try:
+            status, using_hw = _VT.VTSessionCopyProperty(
+                session, _VT.kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
+                None, None)
+            log.info("VideoToolbox hardware decoder: %s", using_hw if status == 0 else "unknown")
+        except Exception:
+            log.debug("VT hardware selection property unavailable", exc_info=True)
         log.info("VTHevcDecoder: native VideoToolbox session ready (%d tiles)",
                  self.num_tiles)
 
@@ -187,17 +224,59 @@ class VTHevcDecoder:
                 if idx < len(nalus):
                     self.feed_nalu(nalus[idx], ti)
 
-    def feed_nalu(self, nalu: bytes, tile_idx: int,
+    def feed_nalu(self, nalu, tile_idx, donl=None):
+        if self._worker is None:
+            return self._decode_nalu(nalu, tile_idx, donl)
+        while not self._stop.is_set():
+            try:
+                self._queue.put((bytes(nalu), tile_idx, donl, time.perf_counter()), timeout=0.01)
+                return
+            except queue.Full:
+                continue  # Bound backlog without dropping reference pictures.
+
+    def set_feedback_wakeup(self, callback):
+        self._feedback_wakeup = callback
+
+    def _decode_loop(self):
+        try:
+            while not self._stop.is_set():
+                try:
+                    nalu, ti, donl, queued = self._queue.get(timeout=0.02)
+                except queue.Empty:
+                    continue
+                try:
+                    self._queue_wait_ms = (time.perf_counter() - queued) * 1000
+                    self._inflight = 1
+                    with self._lock:
+                        self._decode_nalu(nalu, ti, donl)
+                except Exception:
+                    log.exception("native decode worker failed for tile %d", ti)
+                    self._gate.mark_decode_error(ti)
+                    if self._feedback_wakeup is not None:
+                        self._feedback_wakeup()
+                finally:
+                    self._inflight = 0
+                    self._queue.task_done()
+        finally:
+            while True:
+                try:
+                    self._queue.get_nowait()
+                    self._queue.task_done()
+                except queue.Empty:
+                    break
+            if self._stop.is_set():
+                with self._lock:
+                    self._teardown_session_locked()
+
+    def _decode_nalu(self, nalu: bytes, tile_idx: int,
                   donl: Optional[int] = None) -> None:
         """Wrap one NAL unit in a length-prefixed CMSampleBuffer and submit it
         for async decode. The output is dispatched to `tile_idx` by the closure
         below. No RPS pre-check / no drop: VT manages its own DPB and conceals
         missing refs instead of blocking.
 
-        `donl` (the libav path's HEVC decoding-order number, used there for
-        DON-based LTRP reference tracking) is accepted for API parity with
-        `HevcDecoder.feed_nalu` and intentionally ignored: VideoToolbox owns
-        its own DPB + decode ordering, so iss does not steer its references."""
+        `donl` is carried through successful output for the host's LTR ACK;
+        VideoToolbox still owns its own DPB and reference selection."""
         session = self._session
         if session is None or not nalu:
             return
@@ -237,18 +316,20 @@ class VTHevcDecoder:
         seq = self._seq
         self._submit_t = time.monotonic()
         def _handler(status, info_flags, image_buffer, pts, dur,
-                     _ti=tile_idx, _seq=seq):
-            self._on_decoded(_ti, _seq, status, image_buffer)
+                     _ti=tile_idx, _seq=seq, _donl=donl):
+            self._on_decoded(_ti, _seq, status, image_buffer, _donl)
         try:
-            # Synchronous decode: the output handler fires inline before this
-            # returns. (Async mode only delivers frames when
-            # WaitForAsynchronousFrames is called, which a live stream never
-            # does — that starves the handlers.) Decode is fed from the RX
-            # thread; VT HW decode is sub-millisecond per tile.
-            _VT.VTDecompressionSessionDecodeFrameWithOutputHandler(
+            # Preserve deterministic reference order on the decode worker.
+            # Receive and UI threads never execute this native call.
+            result = _VT.VTDecompressionSessionDecodeFrameWithOutputHandler(
                 session, sb, 0, None, _handler)
+            status = result[0] if isinstance(result, tuple) else result
+            if status:
+                # VT does not call the output handler after a submit error.
+                self._on_decoded(tile_idx, seq, status, None, donl)
         except Exception as e:
             log.debug("VT decode submit failed (tile %d): %s", tile_idx, e)
+            self._on_decoded(tile_idx, seq, -1, None, donl)
 
     def _make_sample(self, nalu: bytes):
         payload = struct.pack(">I", len(nalu)) + (
@@ -266,10 +347,8 @@ class VTHevcDecoder:
 
     # -- output -------------------------------------------------------------
 
-    def _on_decoded(self, tile_idx, seq, status, image_buffer) -> None:
-        """VT output-handler (runs on a VT dispatch thread). On success, copy
-        the Y + interleaved-UV planes into a passthrough TileFrame and publish
-        to the tile slot.
+    def _on_decoded(self, tile_idx, seq, status, image_buffer, donl=None) -> None:
+        """Publish retained Y + interleaved-UV planes to the latest tile slot.
 
         On a decode error we do NOT touch the gate's `bad_streak`: VideoToolbox
         conceals the odd missing-ref frame and recovers on Apple's next IDR
@@ -294,6 +373,8 @@ class VTHevcDecoder:
                     and now - self._last_err_fir_t >= 0.5):
                 self._last_err_fir_t = now
                 self._gate.mark_decode_error(tile_idx)
+                if self._feedback_wakeup is not None:
+                    self._feedback_wakeup()
             return
         tile = self._cvbuf_to_tile(image_buffer)
         if tile is None:
@@ -306,7 +387,7 @@ class VTHevcDecoder:
             slot.seq = seq
             slot.good_count += 1
         # Diagnostic: measure the session-wide publish gap. _on_decoded is
-        # single-threaded (sync decode on the RX process thread), so the gap
+        # single-threaded (ordered decode worker), so the gap
         # between any two calls is the real publish gap. A long gap with MANY
         # feeds-in-between = VT stalled while being fed; with ~0 feeds = the
         # RX/host starved us. This is what the Path-A "decoder stuck" watchdog
@@ -332,6 +413,9 @@ class VTHevcDecoder:
         # (pairs with mark_idr_observed). Lets `keyframe_required` discharge
         # so the FIR storm stops once a real frame flows again.
         self._gate.mark_clean(tile_idx)
+        # Ack decoded output, never packet receipt or failed/concealed output.
+        if donl is not None:
+            self.last_clean_donl[tile_idx] = donl
         if self._on_frame_published is not None:
             try:
                 self._on_frame_published(tile_idx)
@@ -341,6 +425,7 @@ class VTHevcDecoder:
     def _cvbuf_to_tile(self, buf) -> Optional[TileFrame]:
         if _Q.CVPixelBufferLockBaseAddress(buf, _LOCK_READONLY) != 0:
             return None
+        lease = _PixelBufferLease(buf)
         try:
             w = _Q.CVPixelBufferGetWidth(buf)
             h = _Q.CVPixelBufferGetHeight(buf)
@@ -366,13 +451,11 @@ class VTHevcDecoder:
             uv_base = _Q.CVPixelBufferGetBaseAddressOfPlane(buf, 1)
             if y_base is None or uv_base is None:
                 return None
-            y_bytes = bytes(y_base.as_buffer(y_rb * y_h))
-            uv_bytes = bytes(uv_base.as_buffer(uv_rb * uv_h))
+            y_bytes = lease.plane(y_base, y_rb * y_h)
+            uv_bytes = lease.plane(uv_base, uv_rb * uv_h)
         except Exception as e:
             log.debug("CVPixelBuffer read failed: %s", e)
             return None
-        finally:
-            _Q.CVPixelBufferUnlockBaseAddress(buf, _LOCK_READONLY)
         if not self._seen_fmt:
             self._seen_fmt = True
             log.info("VTHevcDecoder output: nv24 %dx%d (y_stride=%d uv_stride=%d)",
@@ -385,6 +468,7 @@ class VTHevcDecoder:
             uv_stride=uv_rb,
             chroma_width=w,
             chroma_height=h,
+            owner=lease,
         )
 
     # -- consumer -----------------------------------------------------------
@@ -437,11 +521,11 @@ class VTHevcDecoder:
 
     @property
     def decode_queue_depth(self) -> int:
-        return 0  # synchronous VT path has no queue
+        return self._queue.qsize() + self._inflight
 
     @property
     def decode_queue_cap(self) -> int:
-        return 0
+        return self._queue.maxsize + 1
 
     @property
     def decode_queue_drops(self) -> int:
@@ -449,8 +533,10 @@ class VTHevcDecoder:
 
     # -- lifecycle ----------------------------------------------------------
 
-    def start(self) -> None:                   # parity no-op (no worker thread)
-        pass
+    def start(self) -> None:
+        if self._worker is None:
+            self._worker = threading.Thread(target=self._decode_loop, name="iss-vt-decode", daemon=True)
+            self._worker.start()
 
     def restart(self) -> None:
         """DPB-PRESERVING no-op by design. session.py calls restart() on SSRC
@@ -470,8 +556,16 @@ class VTHevcDecoder:
                      self._restart_suppressed)
 
     def close(self) -> None:
-        with self._lock:
-            self._teardown_session_locked()
+        self._stop.set()
+        if self._worker is not None:
+            if self._worker is not threading.current_thread():
+                self._worker.join(timeout=2.0)
+        else:
+            with self._lock:
+                self._teardown_session_locked()
+        for slot in self._tiles:
+            with slot.lock:
+                slot.frame = None
 
 
 __all__ = ["VTHevcDecoder", "available"]

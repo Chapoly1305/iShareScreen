@@ -218,6 +218,7 @@ class Renderer:
         # surface/canvas dims look healthy even when tile packing is wrong).
         self._dbg_uv = (1.0, 1.0)
         self._dbg_tiles: dict = {}
+        self._expected_tiles = 1
 
         # Two chroma layouts are supported and chosen per session from the
         # first uploaded tile (see `upload_tile`):
@@ -238,45 +239,7 @@ class Renderer:
         # shader's chroma_scale, so half-res chroma sampled correctly.
         self._chroma_ratio: tuple[float, float] = (1.0, 1.0)
 
-        tex_kw = dict(
-            format=wgpu.TextureFormat.r8unorm,
-            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
-            size=(canvas_w, canvas_h, 1),
-        )
-        self._y_tex = device.create_texture(**tex_kw)
-        self._u_tex = device.create_texture(**tex_kw)
-        self._v_tex = device.create_texture(**tex_kw)
-        self._uv_tex = device.create_texture(
-            format=wgpu.TextureFormat.rg8unorm,
-            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
-            size=(canvas_w, canvas_h, 1),
-        )
-        # WGPU does not guarantee initialised texture contents. On Mesa
-        # i915 we observed unwritten Y/U/V regions sample as bright
-        # green. Pre-fill: Y=0 + UV=128 → BT.709 full-range black.
-        zeros_y = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
-        neutral_uv = np.full((canvas_h, canvas_w), 128, dtype=np.uint8)
-        neutral_uv2 = np.full((canvas_h, canvas_w, 2), 128, dtype=np.uint8)
-        device.queue.write_texture(
-            {"texture": self._y_tex, "origin": (0, 0, 0)}, zeros_y,
-            {"offset": 0, "bytes_per_row": canvas_w},
-            (canvas_w, canvas_h, 1),
-        )
-        for tex in (self._u_tex, self._v_tex):
-            device.queue.write_texture(
-                {"texture": tex, "origin": (0, 0, 0)}, neutral_uv,
-                {"offset": 0, "bytes_per_row": canvas_w},
-                (canvas_w, canvas_h, 1),
-            )
-        device.queue.write_texture(
-            {"texture": self._uv_tex, "origin": (0, 0, 0)}, neutral_uv2,
-            {"offset": 0, "bytes_per_row": canvas_w * 2},
-            (canvas_w, canvas_h, 1),
-        )
-        log.info(
-            "renderer: Y r8 + (U,V r8 | UV rg8) %dx%d (%.1f MB) — pre-cleared to black",
-            canvas_w, canvas_h, 5 * canvas_w * canvas_h / 1e6,
-        )
+        self._allocate_canvas(canvas_w, canvas_h)
 
         sampler = device.create_sampler(
             mag_filter=wgpu.FilterMode.linear,
@@ -337,6 +300,7 @@ class Renderer:
             },
             primitive={"topology": wgpu.PrimitiveTopology.triangle_list},
         )
+        self._planar_layout = planar_layout
         self._bind_planar = device.create_bind_group(
             layout=planar_layout,
             entries=[
@@ -413,31 +377,100 @@ class Renderer:
             primitive={"topology": wgpu.PrimitiveTopology.triangle_strip},
         )
 
+    def _allocate_canvas(self, canvas_w, canvas_h):
+        device = self._device
+        tex_kw = dict(
+            format=wgpu.TextureFormat.r8unorm,
+            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
+            size=(canvas_w, canvas_h, 1),
+        )
+        self._y_tex = device.create_texture(**tex_kw)
+        self._u_tex = device.create_texture(**tex_kw)
+        self._v_tex = device.create_texture(**tex_kw)
+        self._uv_tex = device.create_texture(
+            format=wgpu.TextureFormat.rg8unorm,
+            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
+            size=(canvas_w, canvas_h, 1),
+        )
+        # WGPU does not guarantee initialised texture contents. On Mesa
+        # i915 we observed unwritten Y/U/V regions sample as bright
+        # green. Pre-fill: Y=0 + UV=128 → BT.709 full-range black.
+        zeros_y = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+        neutral_uv = np.full((canvas_h, canvas_w), 128, dtype=np.uint8)
+        neutral_uv2 = np.full((canvas_h, canvas_w, 2), 128, dtype=np.uint8)
+        device.queue.write_texture(
+            {"texture": self._y_tex, "origin": (0, 0, 0)}, zeros_y,
+            {"offset": 0, "bytes_per_row": canvas_w},
+            (canvas_w, canvas_h, 1),
+        )
+        for tex in (self._u_tex, self._v_tex):
+            device.queue.write_texture(
+                {"texture": tex, "origin": (0, 0, 0)}, neutral_uv,
+                {"offset": 0, "bytes_per_row": canvas_w},
+                (canvas_w, canvas_h, 1),
+            )
+        device.queue.write_texture(
+            {"texture": self._uv_tex, "origin": (0, 0, 0)}, neutral_uv2,
+            {"offset": 0, "bytes_per_row": canvas_w * 2},
+            (canvas_w, canvas_h, 1),
+        )
+        log.info(
+            "renderer: Y r8 + (U,V r8 | UV rg8) %dx%d (%.1f MB) — pre-cleared to black",
+            canvas_w, canvas_h, 5 * canvas_w * canvas_h / 1e6,
+        )
+
+
+    def resize(self, width, height, *, force=False):
+        """Replace size-dependent resources, retaining shaders and cursor state."""
+        if (width, height) == (self._w, self._h) and not force:
+            return
+        self._w, self._h = width, height
+        self._allocate_canvas(width, height)
+        self._content_w = self._content_h = 0
+        self._dbg_tiles.clear()
+        device = self._device
+        self._bind_planar = device.create_bind_group(
+            layout=self._planar_layout,
+            entries=[
+                {"binding": 0, "resource": self._y_tex.create_view()},
+                {"binding": 1, "resource": self._u_tex.create_view()},
+                {"binding": 2, "resource": self._v_tex.create_view()},
+                {"binding": 3, "resource": self._sampler},
+                {"binding": 4, "resource": self._uniform_resource},
+            ])
+        self._bind_biplanar = None
+        if self._pipeline_biplanar is not None:
+            self._ensure_biplanar()
+
     def _ensure_biplanar(self) -> None:
         """Lazily build the nv24 (Y r8 + interleaved-UV rg8) render pipeline on
         first use. Deferred from __init__ so platforms that only ever hit the
         planar yuv444p path never compile WGSL_BIPLANAR — some GPU backends
         (notably d3d on Windows) can't translate its nv24 shader, and failing
         there for a pipeline they'll never use is pointless. Idempotent."""
-        if self._pipeline_biplanar is not None:
+        if self._bind_biplanar is not None:
             return
         device = self._device
-        biplanar_shader = device.create_shader_module(code=WGSL_BIPLANAR)
-        biplanar_layout = device.create_bind_group_layout(entries=[
-            {"binding": 0, **self._tex_entry},
-            {"binding": 1, **self._tex_entry},
-            {"binding": 2, "visibility": wgpu.ShaderStage.FRAGMENT, "sampler": {}},
-            {"binding": 3, **self._uniform_entry},
-        ])
-        self._pipeline_biplanar = device.create_render_pipeline(
-            layout=device.create_pipeline_layout(bind_group_layouts=[biplanar_layout]),
-            vertex={"module": biplanar_shader, "entry_point": "vs"},
-            fragment={
-                "module": biplanar_shader, "entry_point": "fs",
-                "targets": [{"format": self._surface_format}],
-            },
-            primitive={"topology": wgpu.PrimitiveTopology.triangle_list},
-        )
+        if self._pipeline_biplanar is None:
+            device = self._device
+            biplanar_shader = device.create_shader_module(code=WGSL_BIPLANAR)
+            biplanar_layout = device.create_bind_group_layout(entries=[
+                {"binding": 0, **self._tex_entry},
+                {"binding": 1, **self._tex_entry},
+                {"binding": 2, "visibility": wgpu.ShaderStage.FRAGMENT, "sampler": {}},
+                {"binding": 3, **self._uniform_entry},
+            ])
+            self._pipeline_biplanar = device.create_render_pipeline(
+                layout=device.create_pipeline_layout(bind_group_layouts=[biplanar_layout]),
+                vertex={"module": biplanar_shader, "entry_point": "vs"},
+                fragment={
+                    "module": biplanar_shader, "entry_point": "fs",
+                    "targets": [{"format": self._surface_format}],
+                },
+                primitive={"topology": wgpu.PrimitiveTopology.triangle_list},
+            )
+            self._biplanar_layout = biplanar_layout
+        biplanar_layout = self._biplanar_layout
         self._bind_biplanar = device.create_bind_group(
             layout=biplanar_layout,
             entries=[
@@ -490,16 +523,12 @@ class Renderer:
         # Diagnostics: how this tile actually landed in the texture.
         self._dbg_tiles[tile_index] = (w, tile.height, slot_height, origin_y, rows)
 
-        y = np.frombuffer(tile.y, dtype=np.uint8)
-        if tile.y_stride == w:
-            y = y[: w * tile.height].reshape(tile.height, w)
-        else:
-            y = y[: tile.y_stride * tile.height].reshape(
-                tile.height, tile.y_stride)[:, :w]
+        # write_texture accepts padded row pitch, as on the UV path. Avoid a
+        # full luma-plane repack for every hardware-decoded tile.
         self._device.queue.write_texture(
             {"texture": self._y_tex, "origin": origin},
-            np.ascontiguousarray(y[:rows]),
-            {"offset": 0, "bytes_per_row": w},
+            np.frombuffer(tile.y, dtype=np.uint8)[:tile.y_stride * rows].reshape(rows, tile.y_stride),
+            {"offset": 0, "bytes_per_row": tile.y_stride},
             (w, rows, 1),
         )
 
@@ -550,6 +579,9 @@ class Renderer:
             (cw, chroma_rows, 1),
         )
 
+    def expect_tiles(self, count):
+        self._expected_tiles = max(1, count)
+
     def content_dims(self) -> tuple[int, int]:
         """Real decoded-frame size in canvas-texel units. Equals the full
         canvas once the encoder fills it; smaller (content pinned to the
@@ -558,6 +590,8 @@ class Renderer:
         before the first tile arrives."""
         cw = self._content_w or self._w
         ch = self._content_h or self._h
+        if len(self._dbg_tiles) < getattr(self, "_expected_tiles", 1):
+            return self._w, self._h
         return (min(cw, self._w), min(ch, self._h))
 
     def set_source_rect(self, rect: "tuple[int, int, int, int] | None") -> None:

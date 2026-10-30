@@ -80,9 +80,8 @@ def _build_msg10_pointer(
 class InputController:
     """Thread-safe wrapper around the RFB control socket.
 
-    All three event methods are non-blocking from the caller's perspective and
-    swallow per-call socket errors — a stale socket during hot reconnect must
-    not propagate up into the render loop. Resolution is only used to clamp
+    Socket errors during reconnect are contained here. Live sessions use the
+    AsyncInputController subclass so UI callbacks never execute socket writes. Resolution is only used to clamp
     out-of-range pointer coordinates; accurate clamping prevents wrap-around
     bugs in the macOS pointer handler.
     """
@@ -208,6 +207,10 @@ class InputController:
             return
         self._send(build_clipboard_send(text))
 
+    def send_record(self, payload: bytes) -> None:
+        """Send an already-built control message in input/control order."""
+        self._send(payload)
+
     # ── internals ─────────────────────────────────────────────────────
 
     def _send(self, payload: bytes) -> None:
@@ -232,3 +235,103 @@ class InputController:
                 self.tx_pkts += 1
             except OSError as e:
                 log.debug("input send dropped: %s", e)
+
+
+class AsyncInputController(InputController):
+    """One ordered writer; UI callbacks enqueue without touching the socket.
+
+    Only adjacent moves with the same button mask are replaced. Transitions,
+    keys and clipboard records retain their order, before cipher counters exist.
+    """
+    def __init__(self, *args, **kwargs):
+        from collections import deque
+        super().__init__(*args, **kwargs)
+        self._commands = deque()
+        self._ready = threading.Condition()
+        self._writer_closed = False
+        self.queue_high_water = 0
+        self.coalesced_moves = 0
+        self._queued_buttons = 0
+        self._writer = threading.Thread(target=self._write_loop, name="iss-input-tx", daemon=True)
+        self._writer.start()
+
+    def _enqueue(self, kind, value):
+        with self._ready:
+            if self._writer_closed:
+                return
+            if (kind == "pointer" and self._commands
+                    and self._commands[-1][0] == kind
+                    and self._commands[-1][1][0] == value[0]):
+                self._commands[-1] = (kind, value)
+                self.coalesced_moves += 1
+            else:
+                if len(self._commands) >= 4096:
+                    # A jammed control connection cannot safely lose key/button
+                    # transitions. Fail the connection instead of leaving a
+                    # permanently held remote button or an unbounded queue.
+                    self._writer_closed = True
+                    self._commands.clear()
+                    try:
+                        self._sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    self._ready.notify_all()
+                    return
+                self._commands.append((kind, value))
+                self.queue_high_water = max(self.queue_high_water, len(self._commands))
+            self._ready.notify()
+
+    def pointer_event(self, buttons, x, y):
+        with self._ready:
+            kind = "transition" if buttons != self._queued_buttons else "pointer"
+            self._queued_buttons = buttons
+            self._enqueue(kind, (buttons, x, y))
+
+    def _send(self, payload):
+        self._enqueue("record", payload)
+
+    def _write_loop(self):
+        while True:
+            with self._ready:
+                self._ready.wait_for(lambda: self._commands or self._writer_closed)
+                if not self._commands:
+                    return
+                batch = [self._commands.popleft() for _ in range(min(64, len(self._commands)))]
+            payloads = []
+            for kind, value in batch:
+                if kind == "record":
+                    payloads.append(value)
+                else:
+                    buttons, x, y = value
+                    x, y = max(0, min(self._w-1, int(x))), max(0, min(self._h-1, int(y)))
+                    payloads.append(_build_msg10_pointer(self._cipher.cbc_key, buttons, x, y)
+                                    if self._cipher is not None else
+                                    build_pointer_event(buttons=buttons, x=x, y=y))
+            try:
+                with self._lock:
+                    if self._closed:
+                        return
+                    if self._cipher is not None:
+                        self._cipher.encrypt_and_send_many(self._sock, payloads)
+                    else:
+                        self._sock.sendall(b"".join(payloads))
+                    self.tx_pkts += len(payloads)
+            except OSError as exc:
+                log.debug("input writer stopped: %s", exc)
+                with self._ready:
+                    self._writer_closed = True
+                    self._commands.clear()
+                try:
+                    self._sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                return
+
+    def close(self):
+        with self._ready:
+            self._writer_closed = True
+            self._ready.notify_all()
+        if threading.current_thread() is not self._writer:
+            self._writer.join(timeout=0.5)
+        # Do not wait for a blocked writer's send lock on the UI thread.
+        self._closed = True

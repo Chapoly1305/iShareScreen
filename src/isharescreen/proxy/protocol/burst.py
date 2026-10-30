@@ -265,3 +265,64 @@ def gather_initial_burst(
 
 
 __all__ = ["BurstStarved", "InitialBurst", "gather_initial_burst"]
+
+
+class BurstReadiness:
+    """Incremental startup probe, with its own SRTP state and no fixed settle."""
+    def __init__(self, decryptor, codec, quality_tier=0, tile_group_size=None):
+        self.decryptor = decryptor
+        self.codec = codec
+        self.quality_tier = quality_tier
+        self.tile_group_size = tile_group_size
+        self.groups = {}
+        self.marked = set()
+        self.params = set()
+        self.have_idr = False
+        self.complete_ssrcs = set()
+
+    def __call__(self, packet):
+        result = self.decryptor.decrypt(packet)
+        if result is None:
+            return False
+        header, payload = result
+        ssrc = struct.unpack_from('>I', header, 8)[0]
+        ts = struct.unpack_from('>I', header, 4)[0]
+        primary = self.decryptor.get_primary_ssrc_group(tier=self.quality_tier, group_size=self.tile_group_size)
+        if primary and ssrc not in primary:
+            return False
+        seq = struct.unpack_from('>H', header, 2)[0]
+        group = self.groups.setdefault((ssrc, ts), {})
+        group.setdefault(seq, (bool(header[1] & 0x80), payload))
+        if header[1] & 0x80:
+            self.marked.add((ssrc, ts))
+        if (ssrc, ts) not in self.marked:
+            return False
+        sequences = sorted(group)
+        if len(sequences) > 1:
+            gaps = [((sequences[(i+1) % len(sequences)]-n) & 0xffff, i)
+                    for i, n in enumerate(sequences)]
+            _, gap = max(gaps)
+            sequences = sequences[gap+1:] + sequences[:gap+1]
+        if (not group[sequences[-1]][0]
+                or any(((b-a) & 0xffff) != 1 for a, b in zip(sequences, sequences[1:]))):
+            return False
+        payloads = [group[n][1] for n in sequences]
+        self.complete_ssrcs.add(ssrc)
+        have_tiles = len(self.complete_ssrcs) >= (self.tile_group_size or 1)
+        del self.groups[(ssrc, ts)]
+        self.marked.discard((ssrc, ts))
+        if self.codec == 'avc':
+            for p in payloads:
+                if p and p[0] == APPLE_CONFIG_MARKER and parse_avc_config(p):
+                    self.params.update((7, 8))
+            for nalu in reassemble_h264(payloads):
+                nt = nalu[0] & 31
+                if nt in (7, 8): self.params.add(nt)
+                if nt == 5: self.have_idr = True
+            return have_tiles and self.have_idr and {7, 8} <= self.params
+        for nalu in reassemble_group(payloads):
+            if len(nalu) < 2: continue
+            nt = (nalu[0] >> 1) & 63
+            if nt in (32, 33, 34): self.params.add(nt)
+            if nt in IDR_RANGE: self.have_idr = True
+        return have_tiles and self.have_idr and {32, 33, 34} <= self.params
