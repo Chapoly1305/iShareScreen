@@ -1,0 +1,149 @@
+{
+  "complete": true,
+  "gpu": "NVIDIA GeForce RTX 4090, GPU-f3d8b210-4eb5-a38b-a81d-983611f83a6a, 595.99.02, 36, 17.70 W, 210 MHz, 342 MiB",
+  "clip": "2026-10-15_18-12-43",
+  "frame": 503,
+  "input": {
+    "frame": 503,
+    "time_s": 16.766666666666666,
+    "lr": "encodes/2026-10-15_18-12-43/720p-600k-420/frame-503.png",
+    "lr_sha256": "148a5ed6632b80c263a5d0f38f8cb98f2ba798565478a8f533e960aab6d554e6",
+    "hr": "references/2026-10-15_18-12-43/503.png",
+    "hr_sha256": "1529a03bc9159c949f41d991dae324a0b1f0f1b458aaea9b804f09668e15a375"
+  },
+  "precision": "FP32, matching the quality table; no source-detail supplement",
+  "selection": "Fixed middle validation frame from a chosen scene; illustrative, not a representative quality estimate",
+  "rows": [
+    {
+      "id": "reference",
+      "path": "reference.png",
+      "sha256": "1529a03bc9159c949f41d991dae324a0b1f0f1b458aaea9b804f09668e15a375",
+      "frame_psnr": null
+    },
+    {
+      "id": "bicubic",
+      "path": "bicubic.png",
+      "sha256": "b610a7af71455adeadcd90232eeddd5170e1860059d6a1d5dcb9dfe8a80ed20b",
+      "frame_psnr": 28.65789226471081
+    },
+    {
+      "id": "edsr-before",
+      "path": "edsr-before.png",
+      "sha256": "8dba8169c4cd780cde7a391e135ca7dacc45a0e02ad2069865c41fa429f99d0f",
+      "frame_psnr": 31.425497182359173,
+      "role": "official_pretrained",
+      "checkpoint_sha256": "1bc9523228fdc3b0a5ddb0d7062001e22b31bbb398ae09cfdefb97e8ee06e171"
+    },
+    {
+      "id": "edsr",
+      "path": "edsr.png",
+      "sha256": "0914b34d2575638514a2eee362efaaddd61611721663be590d27f18f0e999b7e",
+      "frame_psnr": 34.51060387753668,
+      "epoch": 25,
+      "validation_psnr": 31.50386324844595,
+      "checkpoint_sha256": "2c923e9ba9541cb85006684c0072868b2d71354d665cdd85cd2b0baac6faaabb"
+    },
+    {
+      "id": "imdn-before",
+      "path": "imdn-before.png",
+      "sha256": "4bcc617490789727fc1287ef3409135bc30691ed3144fa25343cf5ae08e22e91",
+      "frame_psnr": 31.419779281016954,
+      "role": "official_pretrained",
+      "checkpoint_sha256": "740b39653592bd3f49955a21cd9e16f2d37f2c413368cc09327601b8fbe42ce1"
+    },
+    {
+      "id": "imdn",
+      "path": "imdn.png",
+      "sha256": "45116b9ecdf26d8b03d7b2faac7065b04a7dac1044d1c896d89765025ee2c752",
+      "frame_psnr": 34.222384105692925,
+      "epoch": 85,
+      "validation_psnr": 31.361765438347998,
+      "checkpoint_sha256": "13a6decaec16c9171f2e4a93d532185b1b5a375b197ac9cb69216c929403eb8e"
+    },
+    {
+      "id": "safmn-before",
+      "path": "safmn-before.png",
+      "sha256": "a31aae166e6725c688db98141bded146067987023f1b8ec47d5640e65503fec5",
+      "frame_psnr": 31.45462531292229,
+      "role": "official_pretrained",
+      "checkpoint_sha256": "baee9b5d24fd718065ca9bbcc88bb32a8e302c9ef00bae7afac48466a4d6dfa7"
+    },
+    {
+      "id": "safmn",
+      "path": "safmn.png",
+      "sha256": "c2fceafdc66e77ccd7ad3e8263906c823d5f2d6300ef90eb2eb326f4b85ea438",
+      "frame_psnr": 33.43809180099984,
+      "epoch": 85,
+      "validation_psnr": 30.80592165013628,
+      "checkpoint_sha256": "a891b4cfec7f7d1422f3b585c48e2a46d28f8a60502d9e4b6ba57eaa87428004"
+    },
+    {
+      "id": "efrlfn-before",
+      "path": "efrlfn-before.png",
+      "sha256": "0585e1fc3fe49c5e8d340dff02b73a2a7ca995e7d472336c4f459ad07ef37d93",
+      "frame_psnr": 27.841841776669757,
+      "role": "official_pretrained",
+      "checkpoint_sha256": "fbfd1bb37973d2b8b53493c5b91c0ef106f74d200115250a8a025b8e6a121cb3"
+    },
+    {
+      "id": "efrlfn",
+      "path": "efrlfn.png",
+      "sha256": "2ccfe23718b1c317c4598f0acf6f00629ac56baa1c9f37eba3480940d566fb40",
+      "frame_psnr": 31.849865357161868,
+      "epoch": 100,
+      "validation_psnr": 29.81014116353066,
+      "checkpoint_sha256": "16b750abbd51d53d1ece079f88e90f58aa94072ba39636385bb14550ce45782c"
+    },
+    {
+      "id": "quicksrnet-before",
+      "path": "quicksrnet-before.png",
+      "sha256": "962f708a6e3a0659b61b647c2ee3d65df39c31ddef0a72e0e0c8e6c4e76fbb29",
+      "frame_psnr": 30.9471937456625,
+      "role": "official_pretrained",
+      "checkpoint_sha256": "d95d70f1d2366cb9c28d99f8c7aa5bb07e1ffeaf5d7e30d9c66ab0fa28c6d0f8"
+    },
+    {
+      "id": "quicksrnet",
+      "path": "quicksrnet.png",
+      "sha256": "e1e397b0094443276ced71d57469740168cd3113144ab5d12b6c590e5559e80f",
+      "frame_psnr": 31.43947320992069,
+      "epoch": 100,
+      "validation_psnr": 29.688957174976807,
+      "checkpoint_sha256": "94845ddc93262a16b99c6956c9c0d9c1a4851db5015b1d823385a1e715195ab2"
+    },
+    {
+      "id": "plainusr-before",
+      "path": "plainusr-before.png",
+      "sha256": "b8adaaf751450b55b21baf6064b441772551b2c07a15f2b69c21c99cc4c471d7",
+      "frame_psnr": 30.647735029763446,
+      "role": "official_pretrained",
+      "checkpoint_sha256": "8c6c9f82bceaab6b84bacad643443c367bee93e9ecdabb7c7e4cc595dc82df81"
+    },
+    {
+      "id": "plainusr",
+      "path": "plainusr.png",
+      "sha256": "b143c5490f8e28a0951a972a4c796e7217aa1df8325dd0ff08d94521976eb269",
+      "frame_psnr": 31.12205890636728,
+      "epoch": 30,
+      "validation_psnr": 29.500211521207092,
+      "checkpoint_sha256": "17524b89fbbd978a207be2ad9a7063297992b62a4bb86834744056a1d46bb7f8"
+    },
+    {
+      "id": "rt4ksr-before",
+      "path": "rt4ksr-before.png",
+      "sha256": "0db6dc31324d9eb1c875f55af44e34487ed3eb1446ad8bc767c2fb63b54d8261",
+      "frame_psnr": 29.88809970525349,
+      "role": "official_pretrained",
+      "checkpoint_sha256": "9ec7500092848a480e058a9c703e4b2254bc0cc97928c076bba272177752124f"
+    },
+    {
+      "id": "rt4ksr",
+      "path": "rt4ksr.png",
+      "sha256": "0cc2836b6e5dffa33df1bacd589becbcd0fd70eb32c99b9a2afa89bd1236d181",
+      "frame_psnr": 30.51301224834191,
+      "epoch": 95,
+      "validation_psnr": 28.97456252177133,
+      "checkpoint_sha256": "249617cfb90418aa5a1bccecbfe63fbaa53968ee3d8da4fe97adefbb4e99ee03"
+    }
+  ]
+}

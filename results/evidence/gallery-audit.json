@@ -1,0 +1,39 @@
+{
+  "complete": true,
+  "scenes": [
+    {
+      "clip": "2026-10-15_18-12-43",
+      "manifest_sha256": "1f8beafc9fd03946cbaf5a10dc1bb3d58d0cdc6b628a07c389c951617aeabbd3"
+    },
+    {
+      "clip": "2026-10-15_18-03-53",
+      "manifest_sha256": "3a2632ec544b02e9b9fefdaa515509d10921ae1bdf8e0e26fec8e28c5927edbb"
+    },
+    {
+      "clip": "2026-10-15_18-25-36",
+      "manifest_sha256": "ed6e8bd8e1f46a1df14e717fadf533cfff2db6c20f0778bef386c29e510ae8d5"
+    },
+    {
+      "clip": "2026-10-15_17-44-40",
+      "manifest_sha256": "9d5edfdce0bf8c0c384532119db5710b24c6219df563b193721d2ca653582575"
+    },
+    {
+      "clip": "2026-10-15_18-26-43",
+      "manifest_sha256": "f4ff1be0c3f9775fd2de615b6697cbbbb6e6017a10238f781e12573807e93bcd"
+    },
+    {
+      "clip": "2026-10-15_18-13-40",
+      "manifest_sha256": "bddfcae46c80770322169b6fd06fddb852fc08e52e370c3e8a493141a9ee79fa"
+    },
+    {
+      "clip": "2026-10-15_18-05-44",
+      "manifest_sha256": "219a8288df9742a5b3dae21c9caabd141e00b0beb54c52a581b0e2d0e084b0ef"
+    }
+  ],
+  "models": 7,
+  "pairs": 49,
+  "images": 112,
+  "latency_sha256": "cb08b2926a8077f5e42f6945bef8f73af398bb3bad265b849a078160ba40f64c",
+  "selection": "Fixed middle frames from seven previously available validation scenes; not selected by newly computed gains; includes previously observed limited/regressing scenes",
+  "test_used": false
+}

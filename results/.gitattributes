@@ -1,0 +1,3 @@
+# Preserve measured CSV bytes and release hashes across platforms.
+* -text
+*.csv whitespace=cr-at-eol

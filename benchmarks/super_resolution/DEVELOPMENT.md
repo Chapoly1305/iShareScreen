@@ -65,26 +65,15 @@ now release captured model/optimizer references by assigning `None` after the
 last checkpoint, avoiding deleted closure variables; their historical runs and
 checkpoints are preserved. These changes do not start or resume training.
 
-## Visual review
+## Published presentation
 
-Generate a separate preview from the actual receiver's saved screenshots:
+[`../../results/`](../../results/README.md) is the only maintained results
+presentation. It is independent of the local experiment archive and can be
+served unchanged by a static file host. The gallery preserves seven scenes,
+49 pretrained/fine-tuned pairs and the no-SR controls. Keep limitations and
+failure cases visible when editing it.
 
-```bash
-python -m benchmarks.super_resolution.mac_readability.visual_review \
-  --root benchmarks/super_resolution/experiments/mac-readability-v2-20261102/confirmation-v1 \
-  --output benchmarks/super_resolution/experiments/your-new-visual-review
-```
-
-The output contains `index.html`, native-pixel PNG crops, a 32-second MP4 and a
-hash-bound source manifest. It shows fixed code/table/English/Chinese examples
-at receiver ages 0.5, 1, 2 and 2.8 seconds. Each saved screenshot is held for two
-seconds for inspection, so this is **not continuous recording or real-time
-playback**. It cannot measure flicker, transition smoothness or end-to-end delay.
-The left side is decoded video without SR, not the trained EDSR comparator.
-Use the confirmation report for trained/official/source-only comparisons.
-
-Inspect the original PNGs at 100% to avoid player scaling and video compression.
-For human testing, record reading errors and preference separately from OCR;
-include cases with no improvement and regressions. A new continuous recording
-must capture every displayed transition and report recording overhead before it
-can support temporal-quality conclusions.
+Historical experiment outputs have moved outside the repository. The ignored
+`experiments/` compatibility link preserves paths used by frozen manifests and
+local training tooling. Old source-detail experiments are research history;
+their gains are not included in the published receiver-only SR results.

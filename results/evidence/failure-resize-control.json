@@ -1,0 +1,20 @@
+{
+  "rows": [
+    {
+      "method": "resize_only_rgb",
+      "psnr": 28.04387163969888,
+      "text_roi_psnr": 24.4734867570735
+    },
+    {
+      "method": "720p-600k-420",
+      "psnr": 24.66889632604201,
+      "text_roi_psnr": 20.855586087937038
+    },
+    {
+      "method": "720p-1000k-420",
+      "psnr": 26.031090120135943,
+      "text_roi_psnr": 22.186792450649286
+    }
+  ],
+  "scope": "Approximate resolution-only RGB control using OpenCV Lanczos4, not exact FFmpeg scale/chroma-matched encoder ablation"
+}

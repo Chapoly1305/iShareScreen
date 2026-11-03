@@ -5,6 +5,19 @@ Performance** mode (HEVC RExt 4:4:4 over UDP/SRTP). Renders the host
 Mac's screen in a native wgpu window with hardware decode where
 available.
 
+## Results
+
+The project's single results presentation is **[results/index.html](results/index.html)**.
+It includes seven desktop scenes, interactive pretrained/fine-tuned comparisons,
+a no-SR control, validation PSNR and RTX 4090 inference latency.
+See the [report and evaluation limits](results/README.md).
+
+Download or clone the repository and open `results/index.html` in a browser.
+For static hosting, publish the contents of `results/` as the site root; no build,
+backend, Python environment, model weights or external assets are required.
+GitHub's file view shows HTML source; use the downloaded page or a static host
+for the interactive presentation.
+
 ## Setup
 
 ### On the host Mac (the target you want to view)
@@ -201,8 +214,8 @@ conversions for non-strict fixed-540p sessions; see the same setup guide.
 See [setup and runtime architecture](docs/video-enhancement.md) and the
 [recorded-video evaluation tools](benchmarks/super_resolution/README.md).
 Evaluation uses paired PSNR, SSIM and LPIPS; offline timings are not client FPS.
-See the [fine-tuning results](benchmarks/super_resolution/RESULTS.md)
-for pretrained/fine-tuned quality scores, curves and comparison media.
+See the [project results](results/README.md) for the reported quality, latency,
+training curves and interactive comparisons.
 
 ## License
 

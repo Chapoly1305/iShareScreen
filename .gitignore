@@ -26,7 +26,7 @@ tools/*
 benchmarks/super_resolution/vendor/
 benchmarks/super_resolution/checkpoints/
 benchmarks/super_resolution/artifacts
-benchmarks/super_resolution/experiments/
+benchmarks/super_resolution/experiments
 archives/
 benchmarks/super_resolution/.venv*/
 debug-captures/

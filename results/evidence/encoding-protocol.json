@@ -1,0 +1,481 @@
+{
+  "schema": "mac_validation_official_matrix_v1",
+  "created": 1793317315.803088,
+  "models": [
+    "baseline",
+    "edsr",
+    "imdn",
+    "safmn",
+    "quicksrnet",
+    "plainusr",
+    "rt4ksr",
+    "efrlfn"
+  ],
+  "configurations": [
+    {
+      "id": "540p-600k-420",
+      "height": 540,
+      "width": 960,
+      "bitrate": 600000,
+      "chroma": "420"
+    },
+    {
+      "id": "540p-600k-444",
+      "height": 540,
+      "width": 960,
+      "bitrate": 600000,
+      "chroma": "444"
+    },
+    {
+      "id": "540p-1000k-420",
+      "height": 540,
+      "width": 960,
+      "bitrate": 1000000,
+      "chroma": "420"
+    },
+    {
+      "id": "540p-1000k-444",
+      "height": 540,
+      "width": 960,
+      "bitrate": 1000000,
+      "chroma": "444"
+    },
+    {
+      "id": "576p-600k-420",
+      "height": 576,
+      "width": 1024,
+      "bitrate": 600000,
+      "chroma": "420"
+    },
+    {
+      "id": "576p-600k-444",
+      "height": 576,
+      "width": 1024,
+      "bitrate": 600000,
+      "chroma": "444"
+    },
+    {
+      "id": "576p-1000k-420",
+      "height": 576,
+      "width": 1024,
+      "bitrate": 1000000,
+      "chroma": "420"
+    },
+    {
+      "id": "576p-1000k-444",
+      "height": 576,
+      "width": 1024,
+      "bitrate": 1000000,
+      "chroma": "444"
+    },
+    {
+      "id": "720p-600k-420",
+      "height": 720,
+      "width": 1280,
+      "bitrate": 600000,
+      "chroma": "420"
+    },
+    {
+      "id": "720p-600k-444",
+      "height": 720,
+      "width": 1280,
+      "bitrate": 600000,
+      "chroma": "444"
+    },
+    {
+      "id": "720p-1000k-420",
+      "height": 720,
+      "width": 1280,
+      "bitrate": 1000000,
+      "chroma": "420"
+    },
+    {
+      "id": "720p-1000k-444",
+      "height": 720,
+      "width": 1280,
+      "bitrate": 1000000,
+      "chroma": "444"
+    },
+    {
+      "id": "1080p-600k-420",
+      "height": 1080,
+      "width": 1920,
+      "bitrate": 600000,
+      "chroma": "420"
+    },
+    {
+      "id": "1080p-600k-444",
+      "height": 1080,
+      "width": 1920,
+      "bitrate": 600000,
+      "chroma": "444"
+    },
+    {
+      "id": "1080p-1000k-420",
+      "height": 1080,
+      "width": 1920,
+      "bitrate": 1000000,
+      "chroma": "420"
+    },
+    {
+      "id": "1080p-1000k-444",
+      "height": 1080,
+      "width": 1920,
+      "bitrate": 1000000,
+      "chroma": "444"
+    }
+  ],
+  "source_manifest": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/manifest.json",
+  "source_manifest_sha256": "c7b6e82c83f89a6d34b08eeacf8f19d5e6721155491dc9db5f31bdc949897c38",
+  "script_sha256": "aed8084a4c172844e61eeb712cc7a6b5b4ca703c476c8d6ff058d071f1b304b5",
+  "fps": 30,
+  "display_size": [
+    1920,
+    1080
+  ],
+  "sampling": "Three fixed frames at 25%, 50%, 75% of each complete video, at least 1 second after start. All 16 configurations share exact source frames.",
+  "encoder": "libx265 fast/zerolatency; no B frames/lookahead; 2-second GOP; one-second VBV; strict-CBR/HRD requests",
+  "color": "8-bit full-range BT.709; Lanczos reduction; explicit yuv420p/yuv444p",
+  "reconstruction": "baseline bicubic to FHD (1080p direct); models native x2 then area downsample to FHD",
+  "metrics": "RGB PSNR, RGB SSIM (skimage defaults), AlexNet LPIPS, Y/CbCr PSNR, per-frame processing time",
+  "aggregation": "Equal weight per recording after averaging sampled frames; 24 recordings share one capture session, not 24 independent sessions.",
+  "limits": "Development validation. Full videos encoded, model quality sampled at three timestamps, not every frame; no temporal-flicker score. RGB8 recording proxy is not pristine acquisition. No source-truth OCR labels for the full set; image quality cannot establish text accuracy. Video packet rate excludes network/audio overhead. CUDA time is not Mac playback time.",
+  "source_clips": [
+    {
+      "id": "2026-10-15_17-44-40",
+      "content": "web",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_17-44-40/reference-rgb8.mkv",
+      "reference_sha256": "c945b63cd3c25a6e2215c385f269e8cdd6ccadec6090b790bca66491f81f45ce",
+      "original_frames": 1308,
+      "frames_30fps": 654,
+      "sample_indices": [
+        163,
+        326,
+        489
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_17-54-06",
+      "content": "web",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_17-54-06/reference-rgb8.mkv",
+      "reference_sha256": "aafd20e7d04412b23c5df168a3f41028476da847504e21259e05b1ecddb1661c",
+      "original_frames": 2362,
+      "frames_30fps": 1181,
+      "sample_indices": [
+        295,
+        590,
+        885
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_17-54-52",
+      "content": "code",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_17-54-52/reference-rgb8.mkv",
+      "reference_sha256": "39638fe5401a4b03344f83fe1fe3cc3fba9affba3f86553134d887cbc9d7f744",
+      "original_frames": 2732,
+      "frames_30fps": 1366,
+      "sample_indices": [
+        341,
+        682,
+        1023
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_18-03-53",
+      "content": "code",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_18-03-53/reference-rgb8.mkv",
+      "reference_sha256": "2e038a136ce410c9649ab6b8319637e3bef50f37198a3f423690344dbbef578f",
+      "original_frames": 2120,
+      "frames_30fps": 1060,
+      "sample_indices": [
+        264,
+        529,
+        794
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_18-04-56",
+      "content": "code",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_18-04-56/reference-rgb8.mkv",
+      "reference_sha256": "efa40db88ed6a6903639d695bb76df9009e2569078fce3bc689b19a4e945e754",
+      "original_frames": 1907,
+      "frames_30fps": 954,
+      "sample_indices": [
+        238,
+        476,
+        714
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_18-05-44",
+      "content": "terminal",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_18-05-44/reference-rgb8.mkv",
+      "reference_sha256": "d0e6a4ed26db451acdf53505eb4c7738fd7eaafc37fbb9dd040dc07d49eb718e",
+      "original_frames": 1718,
+      "frames_30fps": 859,
+      "sample_indices": [
+        214,
+        429,
+        643
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_18-06-48",
+      "content": "web",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_18-06-48/reference-rgb8.mkv",
+      "reference_sha256": "d75cb1458f723ebce1767078e2c728ccb42c0dec33b6396ca7a453b69037449e",
+      "original_frames": 1808,
+      "frames_30fps": 904,
+      "sample_indices": [
+        225,
+        451,
+        677
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_18-09-37",
+      "content": "code",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_18-09-37/reference-rgb8.mkv",
+      "reference_sha256": "fd942f78e924f8b0b738c4b9edb189d9c707f20c9418f979c2a48280bcd0fd3c",
+      "original_frames": 2329,
+      "frames_30fps": 1165,
+      "sample_indices": [
+        291,
+        582,
+        873
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_18-12-03",
+      "content": "code",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_18-12-03/reference-rgb8.mkv",
+      "reference_sha256": "77371c43ba78a03512d321e84daf5bf5d76b86b75c86cf560f4e0b9d4357ccc6",
+      "original_frames": 1921,
+      "frames_30fps": 961,
+      "sample_indices": [
+        240,
+        480,
+        720
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_18-12-43",
+      "content": "code",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_18-12-43/reference-rgb8.mkv",
+      "reference_sha256": "2d6f8f704338e8c19423c5f67a6220f058b014091a1f7de466f3d428d944f04b",
+      "original_frames": 2015,
+      "frames_30fps": 1008,
+      "sample_indices": [
+        251,
+        503,
+        755
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_18-13-40",
+      "content": "mixed",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_18-13-40/reference-rgb8.mkv",
+      "reference_sha256": "1d896553524535d71567510a2733d6e6090e539e24cecfb9bda438d44512b052",
+      "original_frames": 2188,
+      "frames_30fps": 1094,
+      "sample_indices": [
+        273,
+        546,
+        819
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_18-14-29",
+      "content": "mixed",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_18-14-29/reference-rgb8.mkv",
+      "reference_sha256": "0688d534cfe08a3d71eeda3ba779ab85b69dea43b3d131a080361215350a43ce",
+      "original_frames": 1989,
+      "frames_30fps": 995,
+      "sample_indices": [
+        248,
+        497,
+        745
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_18-15-05",
+      "content": "mixed",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_18-15-05/reference-rgb8.mkv",
+      "reference_sha256": "21e064f3da0bf21cbce18126825e9d9bd542b62ba42ae4c380bfdc09ad005540",
+      "original_frames": 1921,
+      "frames_30fps": 961,
+      "sample_indices": [
+        240,
+        480,
+        720
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_18-15-48",
+      "content": "mixed",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_18-15-48/reference-rgb8.mkv",
+      "reference_sha256": "6cbeb5c1bd6e87d8c58e3f3dd611e1f7249429f0a638edf90034134ad9a93430",
+      "original_frames": 1954,
+      "frames_30fps": 977,
+      "sample_indices": [
+        244,
+        488,
+        732
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_18-16-34",
+      "content": "mixed",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_18-16-34/reference-rgb8.mkv",
+      "reference_sha256": "dd7e29d471d03ce048191b35690becd305fea0e3a2a2409641f118cbaca230db",
+      "original_frames": 1984,
+      "frames_30fps": 992,
+      "sample_indices": [
+        247,
+        495,
+        743
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_18-17-51",
+      "content": "mixed",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_18-17-51/reference-rgb8.mkv",
+      "reference_sha256": "81513fc0ec864d931443c9cb0e76f4c5be4b4757e0be40e87c98585c3a3584af",
+      "original_frames": 1989,
+      "frames_30fps": 995,
+      "sample_indices": [
+        248,
+        497,
+        745
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_18-18-30",
+      "content": "mixed",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_18-18-30/reference-rgb8.mkv",
+      "reference_sha256": "8feef8920bfdc0150e7c407e6b99a6f518683f1b905e1b10a7ce750304b0ab4e",
+      "original_frames": 1994,
+      "frames_30fps": 997,
+      "sample_indices": [
+        249,
+        498,
+        747
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_18-19-08",
+      "content": "mixed",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_18-19-08/reference-rgb8.mkv",
+      "reference_sha256": "c6e843ae10cf70ef9c799ce89574738afae242358b363af1ce9d56b98dfc792f",
+      "original_frames": 2008,
+      "frames_30fps": 1004,
+      "sample_indices": [
+        250,
+        501,
+        752
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_18-19-47",
+      "content": "terminal",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_18-19-47/reference-rgb8.mkv",
+      "reference_sha256": "12cdacc430669cfca49b1e35d73a207ef6b9c4fe028821a0eb2d4c265041858a",
+      "original_frames": 2436,
+      "frames_30fps": 1218,
+      "sample_indices": [
+        304,
+        608,
+        912
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_18-20-32",
+      "content": "mixed",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_18-20-32/reference-rgb8.mkv",
+      "reference_sha256": "64a2cc4e795188bcc28d14268cba2ac92abb9f2398717b00c9a435e014dbbfe1",
+      "original_frames": 2562,
+      "frames_30fps": 1281,
+      "sample_indices": [
+        320,
+        640,
+        960
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_18-21-29",
+      "content": "mixed",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_18-21-29/reference-rgb8.mkv",
+      "reference_sha256": "109398d9b9c0fd4798122c8f604ba8e57178b0888fceb3b7cae4bd45d71eeab1",
+      "original_frames": 3040,
+      "frames_30fps": 1520,
+      "sample_indices": [
+        379,
+        759,
+        1139
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_18-22-33",
+      "content": "code",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_18-22-33/reference-rgb8.mkv",
+      "reference_sha256": "0792d1c8096ba50d73a5787a5480af1f3100eb6474b8cd22a12f95ee69bcec67",
+      "original_frames": 3768,
+      "frames_30fps": 1884,
+      "sample_indices": [
+        470,
+        941,
+        1412
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_18-25-36",
+      "content": "web",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_18-25-36/reference-rgb8.mkv",
+      "reference_sha256": "ed00af213afbf3e68f805a7295fafdcaead0ab666e9042a8900cff3854e1b9dd",
+      "original_frames": 2799,
+      "frames_30fps": 1400,
+      "sample_indices": [
+        349,
+        699,
+        1049
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    },
+    {
+      "id": "2026-10-15_18-26-43",
+      "content": "terminal",
+      "reference": "/home/jchen73/iShareScreen-archives/before-retrain-2026-10-29_192818/artifacts/source-videos/2026-10-15_18-26-43/reference-rgb8.mkv",
+      "reference_sha256": "c8e6124f2324ffddc1bc59f94761d24f68ac31c68fa59b731e56677c7ee03921",
+      "original_frames": 2911,
+      "frames_30fps": 1456,
+      "sample_indices": [
+        363,
+        727,
+        1091
+      ],
+      "session_group": "2026-10-15-capture-session-unpartitioned"
+    }
+  ]
+}

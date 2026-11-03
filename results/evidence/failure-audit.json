@@ -1,0 +1,21 @@
+{
+  "checks": [
+    {
+      "role": "reference",
+      "index": 652,
+      "time": 10.867,
+      "pixel_equal": true,
+      "max_abs_delta": 0,
+      "corrupt": false
+    },
+    {
+      "role": "decoded",
+      "index": 326,
+      "time": 10.866666666666667,
+      "pixel_equal": true,
+      "max_abs_delta": 0,
+      "corrupt": false
+    }
+  ],
+  "scope": "Independent sequential decode from stream start; compare frozen saved reference/input pixels"
+}
