@@ -35,3 +35,5 @@ debug-captures/
 datasets/**
 !datasets/README.md
 !datasets/prepare_splits.py
+!datasets/split_codescan.py
+/codescan.zip

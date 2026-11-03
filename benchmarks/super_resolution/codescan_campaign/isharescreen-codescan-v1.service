@@ -1,0 +1,18 @@
+[Unit]
+Description=iShareScreen CodeSCAN smoke and sequential 100 epoch training
+StartLimitIntervalSec=3600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=/home/chen/iShareScreen
+Environment=CUDA_VISIBLE_DEVICES=GPU-f3d8b210-4eb5-a38b-a81d-983611f83a6a
+ExecStart=/bin/bash -lc 'source /home/chen/iShareScreen/dev-environment.sh; exec python -u -m benchmarks.super_resolution.codescan_campaign.runner --root /home/chen/iShareScreen/benchmarks/super_resolution/experiments/codescan-720p-600k-420-v1 --stage all'
+Restart=on-failure
+RestartSec=60
+TimeoutStopSec=30
+StandardOutput=append:/home/chen/iShareScreen/benchmarks/super_resolution/experiments/codescan-720p-600k-420-v1/campaign.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target

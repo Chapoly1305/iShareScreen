@@ -1,0 +1,8 @@
+[Unit]
+Description=Mirror and check iShareScreen lab training status
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jchen73/iShareScreen
+ExecStart=/bin/bash -lc 'source /home/jchen73/iShareScreen/dev-environment.sh; exec python -m benchmarks.super_resolution.codescan_campaign.monitor --root /home/jchen73/iShareScreen/benchmarks/super_resolution/experiments/codescan-720p-600k-420-v1'
+TimeoutStartSec=120

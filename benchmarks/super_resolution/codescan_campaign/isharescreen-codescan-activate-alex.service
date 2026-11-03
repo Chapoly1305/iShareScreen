@@ -1,0 +1,15 @@
+[Unit]
+Description=Finish approved alex dataset transfer and start training
+StartLimitIntervalSec=3600
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jchen73/iShareScreen
+ExecStart=/bin/bash -lc 'source /home/jchen73/iShareScreen/dev-environment.sh; exec python -u -m benchmarks.super_resolution.codescan_campaign.activate_alex'
+TimeoutStartSec=6h
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=default.target

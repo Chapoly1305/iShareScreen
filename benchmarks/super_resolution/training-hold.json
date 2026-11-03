@@ -1,0 +1,31 @@
+{
+  "status": "released",
+  "requested_on": "2026-10-29",
+  "reason": "User explicitly requested no training while materials are transferring",
+  "release_condition": "User lifts the training hold",
+  "pending_source": "codescan.zip",
+  "next_model": "EDSR-baseline x2, quality upper-bound comparison",
+  "target_input": {
+    "width": 1280,
+    "height": 720,
+    "video_bitrate_bps": 600000,
+    "chroma": "420"
+  },
+  "training_started": true,
+  "materials_status": "Null-text compatibility fixed,5 affected sample encodes verified;6291 completed pairs retained; seven-model smoke recheck running before full preparation resumes",
+  "source_location_on_h100": "/home/jchen73/iShareScreen/datasets/sources/codescan",
+  "source_split_catalog": "/home/jchen73/iShareScreen/datasets/codescan-splits.json",
+  "source_split_audit": "/home/jchen73/iShareScreen/datasets/sources/codescan/split-v1/AUDIT.json",
+  "released_on": "2026-10-30T04:14:38.348298+00:00",
+  "release_evidence": "User: 开始吧，你帮我盯着。先测流程，然后每个模型100，100，100这样推进。",
+  "campaign": "/home/jchen73/iShareScreen/benchmarks/super_resolution/experiments/codescan-720p-600k-420-v1",
+  "queue_models": [
+    "edsr",
+    "quicksrnet",
+    "imdn",
+    "safmn",
+    "plainusr",
+    "rt4ksr",
+    "efrlfn"
+  ]
+}

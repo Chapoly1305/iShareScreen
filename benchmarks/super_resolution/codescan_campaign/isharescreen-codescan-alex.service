@@ -1,0 +1,19 @@
+[Unit]
+Description=iShareScreen PlainUSR and RT4KSR100 epochs on alex RTX4090
+StartLimitIntervalSec=3600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=/home/alex/iShareScreen
+Environment=CUDA_VISIBLE_DEVICES=GPU-3891ef74-6e2a-740b-1d7e-45c90726699c
+ExecStartPre=/home/alex/iShareScreen/.venv/bin/python -m benchmarks.super_resolution.codescan_campaign.gpu_guard
+ExecStart=/bin/bash -lc 'source /home/alex/iShareScreen/dev-environment.sh; exec python -u -m benchmarks.super_resolution.codescan_campaign.runner --root /home/alex/iShareScreen/benchmarks/super_resolution/experiments/codescan-720p-600k-420-v1-rtx4090 --stage prepared'
+Restart=on-failure
+RestartSec=60
+TimeoutStopSec=30
+StandardOutput=append:/home/alex/iShareScreen/benchmarks/super_resolution/experiments/codescan-720p-600k-420-v1-rtx4090/campaign.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target

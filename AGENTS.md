@@ -67,3 +67,61 @@ project Goals, training, evaluation, and remote GPU work.
   unless the user explicitly requests a chroma comparison.
 - Keep completed 4:4:4 observations and frozen protocols as historical evidence.
   Present 4:2:0 as the primary comparison for the current baseline campaign.
+
+## Current training authorization (2026-10-30)
+
+- The user lifted the transfer-time training hold: start with a pipeline smoke
+  test, then train each queued model for 100 epochs, with unattended progression
+  and saved training/quality/inference-performance curves.
+- The user explicitly expanded the queue to all7 models: EDSR, QuickSRNet,
+  IMDN, SAFMN, PlainUSR, RT4KSR and EfRLFN. Use official pretrained initialization and fresh optimizer.
+- Freeze CodeSCAN split-v1 at 9,600 train / 1,200 validation / 1,200 test. Its
+  manifests and hashes are recorded in sources/codescan/split-v1/FROZEN.json.
+  Add future samples in a new version; preserve original ZIP and raw sources.
+- Keep Mac recordings as the primary development validation. Do not train on
+  Mac or CodeSCAN validation/test. Test does not select checkpoints.
+- Freeze codec-derived inputs separately at 720p / 600 Kbps / yuv420p after
+  whole-frame encoding and split-isolation checks. Use an independent output
+  directory for this campaign; preserve all archived experiments.
+
+## Parallel training allocation (2026-10-30)
+
+- The user authorized H100 physicalGPU1 for this training campaign. Check
+  occupancy before launching; physicalGPU0 has another user's workload.
+- lab4090 owns EDSR, QuickSRNet, PlainUSR, RT4KSR; H100 GPU1 owns IMDN,
+  SAFMN, EfRLFN. Do not launch duplicate copies of a model on both hosts.
+- Copy frozen codec pairs byte-for-byte; do not re-encode on H100. Record
+  cross-GPU baseline rounding tolerances separately from the frozen lab run.
+- Label performance curves by actual GPU/host. Different hardware timings
+  do not establish one hardware-normalized forward-performance ranking.
+
+## H100 concurrency update (2026-10-30)
+
+- User authorized a second concurrent worker on physicalGPU1. Main H100
+  service owns IMDN then SAFMN; h100-extra service owns EfRLFN only.
+- Both share frozen inputs and use a shared batch/exclusive validation lock.
+  Do not run forward timing concurrently with the other training batch.
+- Compare aggregate throughput before claiming acceleration. Epoch wall time
+  now includes contention and waits; preserve device labels and raw curves.
+
+## Third host allocation (2026-10-30)
+
+- User explicitly approved transferring code, official weights and frozen
+  train/validation pairs to alex@10.193.124.46:2022 for training.
+- alex4090 owns PlainUSR and RT4KSR; lab4090 now owns only EDSR and
+  QuickSRNet. H100 retains IMDN/SAFMN plus concurrent EfRLFN.
+- Use /home/alex/iShareScreen and GPU UUID
+  GPU-3891ef74-6e2a-740b-1d7e-45c90726699c. Preserve existing old projects.
+- Keep all seven models at100 epochs; validate copied hashes and device
+  smoke/recovery before formal training. No duplicate model jobs across hosts.
+
+## GPU0 explicit idle-resident exception (2026-10-30)
+
+- User stated GPU0 owner is not using the card tonight, identified the
+  existing process as idle, and explicitly reconfirmed use after being told
+  about the resident4.6GB and automatic approval rejection. The subsequent
+  start request was approved on that new authorization.
+- H100 physicalGPU0 now owns SAFMN100 epochs. Preserve xli62 PID2822608;
+  never stop or modify it. Refuse unexpected other GPU0 compute processes
+  and check utilization before launch. GPU1 main queue now owns IMDN only,
+  with EfRLFN on the concurrent GPU1 worker.

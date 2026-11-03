@@ -231,9 +231,54 @@ recording in the local performance artifacts separately demonstrates Neural
 Engine prediction activity for QuickSRNet. CPU preprocessing and output
 conversion are outside the GPU-only model-forward requirement.
 
+### Existing fine-tuned models on low-bitrate text
+
+`finetuned_text_poc` compares saved 540p/720p/1080p HEVC 420 inputs at
+256/600/1000 Kbps. It reuses the completed `pdf-single-width-poc-v1` and
+`base-sweep-dense-v1` input/ground-truth artifacts, the frozen curated fold and
+packed manifests, and the completed `candidate-training-1500` checkpoints.
+Install the native model assets first; this runner does not train or download.
+
+```sh
+PYTHONPATH=.:src .venv/bin/python -m benchmarks.super_resolution.finetuned_text_poc all \
+  --output /path/to/fresh-text-comparison --device mps
+```
+
+The `infer`, `ocr`, and `report` actions can also run separately against the same
+output directory. Inference and OCR require fresh stage destinations; the report
+can be regenerated. QuickSRNet and PlainUSR are the default deployment candidates.
+All outputs are FHD: native ×2 at 540p, area downsampling after ×2 at 720p/FHD.
+Baselines include the viewer's actual GPU Original shader on decoded YUV planes,
+plus RGB bilinear and bicubic. The same current FP32 adapter runs pretrained and
+fine-tuned weights, with strict checkpoint/data/fold/hash checks.
+
+Dense-paper and dense-Markdown use held-out folds 3 and 1 respectively. The PDF
+development scenes report every fold and average scores, rather than selecting
+the best fold or blending images. The HTML gallery fixes PDF examples to fold 0.
+Case-sensitive non-whitespace OCR CER retains digits and punctuation; exact OCR
+predictions, source truth, crop images, measured video rates and fold scores are
+saved. Selection considers the worse of the 2s keyframe and 3s inter-frame mean
+CERs. These two samples do not establish temporal stability, document-independent
+generalization, constrained-link feasibility or Live inference throughput.
+
+## Source-labeled text corpus and scratch training
+
+The [text corpus pipeline](text_corpus/README.md) organizes local Zotero PDFs,
+specifications and code into 10,000 audited source-labeled FHD views and aligned
+HEVC 540p/FHD pairs. The 4,155 legacy video pairs remain separate. Source groups
+are split before rendering; OCR ground truth comes from embedded PDF text or
+the exact rendered strings rather than OCR predictions.
+
+QuickSRNet-Small can be trained without loading pretrained weights. A separate
+Hopper campaign runs three seeds for each of two losses, with a common fixed
+validation protocol. [Current experiment status](artifacts/text-corpus-v1/EXPERIMENT_STATUS.md)
+links the frozen release, completed 100-epoch pilot, OCR comparisons, Slurm IDs
+and local overnight collector state. A submitted GPU task can still be waiting
+on data preparation or resources; check its actual Slurm state.
+
 ## Code layout and checks
 
-`train_epochs.py` is the only training runner; `epochs.py` handles sampling,
+`train_epochs.py` is the original epoch training runner; `epochs.py` handles sampling,
 `train.py` contains shared data/update/validation functions, and
 `training_state.py` handles atomic checkpoints. `epoch_report.py` audits and
 aggregates scores; `epoch_plots.py` renders curves. `gallery.py` owns image/HTML
@@ -249,3 +294,7 @@ Datasets, checkpoints and generated media remain local and ignored by Git.
 Offline timing is not live viewer latency or sustained FPS; live integration
 must be checked separately. Continuous comparison videos help inspect flicker,
 which frame-average image metrics do not measure.
+
+## Current experiment development
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for the campaign code map, regression checks, frozen-source handling and visual-review commands.

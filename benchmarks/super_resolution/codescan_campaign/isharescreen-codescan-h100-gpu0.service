@@ -1,0 +1,20 @@
+[Unit]
+Description=iShareScreen parallel IMDN SAFMN EfRLFN training on H100 GPU1
+StartLimitIntervalSec=3600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jchen73/iShareScreen
+Environment=ISS_CONCURRENT_CAMPAIGN=codescan-720p-600k-420-v1-h100-gpu0
+Environment=CUDA_VISIBLE_DEVICES=GPU-3bf9ecb9-5729-7ad7-1a71-197d4c00415e
+ExecStartPre=/home/jchen73/iShareScreen/.venv/bin/python -m benchmarks.super_resolution.codescan_campaign.gpu0_guard
+ExecStart=/bin/bash -lc 'source /home/jchen73/iShareScreen/dev-environment.sh; exec python -u -m benchmarks.super_resolution.codescan_campaign.runner --root /home/jchen73/iShareScreen/benchmarks/super_resolution/experiments/codescan-720p-600k-420-v1-h100-gpu0 --stage prepared'
+Restart=on-failure
+RestartSec=60
+TimeoutStopSec=30
+StandardOutput=append:/home/jchen73/iShareScreen/benchmarks/super_resolution/experiments/codescan-720p-600k-420-v1-h100-gpu0/campaign.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target

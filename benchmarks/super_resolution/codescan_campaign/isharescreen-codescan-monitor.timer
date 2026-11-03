@@ -1,0 +1,11 @@
+[Unit]
+Description=Check lab training and mirror curves every five minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=isharescreen-codescan-monitor.service
+
+[Install]
+WantedBy=timers.target
