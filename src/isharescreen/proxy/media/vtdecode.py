@@ -9,15 +9,16 @@ viewer never hits this because it decodes through a `VTDecompressionSession`
 directly: VideoToolbox does its own bitstream parsing + DPB and simply conceals
 the odd missing-ref frame without ever blocking. This module does the same.
 
-Validated offline against captured feeds: decodes Apple HEVC RExt 4:4:4 to
-`kCVPixelFormatType_444YpCbCr8BiPlanarFullRange` (`444f` = nv24) and never
-blocks. The two output planes (Y r8 + interleaved UV) map straight onto the
-existing nv24 *passthrough* `TileFrame` (v is None) and the biplanar GPU path.
+Preserves the source's chroma sampling: 4:2:0 decodes to full-range NV12
+(`420f`), while HEVC RExt 4:4:4 uses full-range NV24 (`444f`). Expanding 420
+to 444 before the CPU copy can fall behind a native-resolution stream. Both
+layouts map onto `TileFrame` (v is None) and the biplanar GPU path.
 
 One shared session decodes all tiles' NALUs (same shared-context model as the
 libav path — Apple uses cross-tile references). Output is dispatched to the
 right tile by a per-decode closure. macOS-only; import guarded.
 """
+
 from __future__ import annotations
 
 import logging
@@ -31,6 +32,8 @@ from typing import Callable, Optional
 from .tiles import TileFrame
 from .nalu import IDR_RANGE
 from .quality_gate import FrameQualityGate
+from .bitstream import remove_emulation_prevention
+from .hevc_rps import parse_sps
 
 log = logging.getLogger(__name__)
 
@@ -40,12 +43,14 @@ try:
     import VideoToolbox as _VT
     import CoreMedia as _CM
     import Quartz as _Q
+
     _VT_OK = True
 except Exception:  # pragma: no cover - non-macOS / missing pyobjc
     _VT_OK = False
 
-_LOCK_READONLY = 0x00000001                       # kCVPixelBufferLock_ReadOnly
-_NV24_FMT = 0x34343466                             # '444f'
+_LOCK_READONLY = 0x00000001  # kCVPixelBufferLock_ReadOnly
+_NV24_FMT = 0x34343466  # '444f'
+_NV12_FMT = 0x34323066  # '420f', full range
 _VT_DEBUG = os.environ.get("ISS_VT_DEBUG") == "1"
 # Diagnostic: dump every VCL NALU we feed VT (Annex-B framed, in feed order)
 # so the feed ORDER can be analysed offline against POC. Same env var as the
@@ -63,6 +68,7 @@ def available() -> bool:
 class _VTSlot:
     """Latest decoded `TileFrame` for one tile + a monotonic sequence so an
     out-of-order async callback can't replace a newer frame with an older one."""
+
     frame: Optional[TileFrame] = None
     seq: int = 0
     good_count: int = 0
@@ -79,7 +85,7 @@ class VTHevcDecoder:
         self,
         num_tiles: int,
         *,
-        prefer_hwaccel: bool = True,           # accepted for signature parity
+        prefer_hwaccel: bool = True,  # accepted for signature parity
         enable_quality_gate: bool = True,
         on_frame_published: Optional[Callable[[int], None]] = None,
     ) -> None:
@@ -107,19 +113,20 @@ class VTHevcDecoder:
         # direct-VTDecompressionSession path vs libav's VT *hwaccel* glue.
         self._hw_name = "videotoolbox-native"
 
-        self._fmt = None                       # CMVideoFormatDescription
-        self._session = None                   # VTDecompressionSession
-        self._params: Optional[tuple] = None   # (vps, sps, (pps...))
-        self._seq = 0                          # monotonic decode counter
+        self._fmt = None  # CMVideoFormatDescription
+        self._session = None  # VTDecompressionSession
+        self._params: Optional[tuple] = None  # (vps, sps, (pps...))
+        self._output_format = _NV24_FMT
+        self._seq = 0  # monotonic decode counter
         self._feed_total = 0
         self._feeds_at_last_pub = 0
         self._last_pub_t = 0.0
         self._last_err_fir_t = 0.0
         self._restart_suppressed = 0
-        self._decode_errors = 0                # benign VT conceals (diagnostic)
-        self._lock = threading.Lock()          # guards session create/teardown
+        self._decode_errors = 0  # benign VT conceals (diagnostic)
+        self._lock = threading.Lock()  # guards session create/teardown
         self._seen_fmt = False
-        self._fmt_warned = False                # H1: warn once on non-nv24 output
+        self._fmt_warned = False  # warn once on unsupported output
         # Decode latency monitoring: EMA of submit→frame round-trip (ms).
         # VT decode is synchronous on the RX thread, so this is the HW decode
         # time per NAL. Shared with the control-socket snapshot.
@@ -134,6 +141,10 @@ class VTHevcDecoder:
         pps = tuple(bytes(p) for p in all_pps.values()) if all_pps else ()
         self._params = (bytes(vps), bytes(sps), pps)
         with self._lock:
+            source = parse_sps(remove_emulation_prevention(sps[2:]))
+            self._output_format = (
+                _NV12_FMT if source.chroma_format_idc == 1 else _NV24_FMT
+            )
             self._build_session_locked()
 
     def _build_session_locked(self) -> None:
@@ -143,24 +154,29 @@ class VTHevcDecoder:
         psets = (vps, sps) + pps
         sizes = tuple(len(p) for p in psets)
         st, fmt = _CM.CMVideoFormatDescriptionCreateFromHEVCParameterSets(
-            None, len(psets), psets, sizes, 4, None, None)
+            None, len(psets), psets, sizes, 4, None, None
+        )
         if st != 0 or fmt is None:
             raise RuntimeError(f"CMVideoFormatDescription create failed: {st}")
-        # Ask for the native 4:4:4 biplanar output (nv24) so no conversion.
-        attrs = {_Q.kCVPixelBufferPixelFormatTypeKey: _NV24_FMT}
+        # Match the source chroma instead of expanding 420 to 444 before copy.
+        attrs = {_Q.kCVPixelBufferPixelFormatTypeKey: self._output_format}
         st, session = _VT.VTDecompressionSessionCreate(
-            None, fmt, None, attrs, None, None)
+            None, fmt, None, attrs, None, None
+        )
         if st != 0 or session is None:
             # fall back to letting VT pick the format
             st, session = _VT.VTDecompressionSessionCreate(
-                None, fmt, None, None, None, None)
+                None, fmt, None, None, None, None
+            )
             if st != 0 or session is None:
                 raise RuntimeError(f"VTDecompressionSession create failed: {st}")
         self._teardown_session_locked()
         self._fmt = fmt
         self._session = session
-        log.info("VTHevcDecoder: native VideoToolbox session ready (%d tiles)",
-                 self.num_tiles)
+        log.info(
+            "VTHevcDecoder: native VideoToolbox session ready (%d tiles)",
+            self.num_tiles,
+        )
 
     def _teardown_session_locked(self) -> None:
         if self._session is not None:
@@ -187,8 +203,7 @@ class VTHevcDecoder:
                 if idx < len(nalus):
                     self.feed_nalu(nalus[idx], ti)
 
-    def feed_nalu(self, nalu: bytes, tile_idx: int,
-                  donl: Optional[int] = None) -> None:
+    def feed_nalu(self, nalu: bytes, tile_idx: int, donl: Optional[int] = None) -> None:
         """Wrap one NAL unit in a length-prefixed CMSampleBuffer and submit it
         for async decode. The output is dispatched to `tile_idx` by the closure
         below. No RPS pre-check / no drop: VT manages its own DPB and conceals
@@ -223,22 +238,29 @@ class VTHevcDecoder:
         if t >= 32:
             return
         if _nalu_dump_f is not None:
-            _nalu_dump_f.write(b"\x00\x00\x00\x01" + (
-                nalu if isinstance(nalu, bytes) else bytes(nalu)))
+            _nalu_dump_f.write(
+                b"\x00\x00\x00\x01" + (nalu if isinstance(nalu, bytes) else bytes(nalu))
+            )
         self._feed_total += 1
         if _VT_DEBUG and self._feed_total % 200 == 0:
-            log.info("VTdbg feed/tile=%s good=%s errs=%d",
-                     [sum(d.values()) for d in self.nalu_counts_per_tile],
-                     self.good_counts, self._decode_errors)
+            log.info(
+                "VTdbg feed/tile=%s good=%s errs=%d",
+                [sum(d.values()) for d in self.nalu_counts_per_tile],
+                self.good_counts,
+                self._decode_errors,
+            )
         sb = self._make_sample(nalu)
         if sb is None:
             return
         self._seq += 1
         seq = self._seq
         self._submit_t = time.monotonic()
-        def _handler(status, info_flags, image_buffer, pts, dur,
-                     _ti=tile_idx, _seq=seq):
+
+        def _handler(
+            status, info_flags, image_buffer, pts, dur, _ti=tile_idx, _seq=seq
+        ):
             self._on_decoded(_ti, _seq, status, image_buffer)
+
         try:
             # Synchronous decode: the output handler fires inline before this
             # returns. (Async mode only delivers frames when
@@ -246,20 +268,24 @@ class VTHevcDecoder:
             # does — that starves the handlers.) Decode is fed from the RX
             # thread; VT HW decode is sub-millisecond per tile.
             _VT.VTDecompressionSessionDecodeFrameWithOutputHandler(
-                session, sb, 0, None, _handler)
+                session, sb, 0, None, _handler
+            )
         except Exception as e:
             log.debug("VT decode submit failed (tile %d): %s", tile_idx, e)
 
     def _make_sample(self, nalu: bytes):
         payload = struct.pack(">I", len(nalu)) + (
-            nalu if isinstance(nalu, bytes) else bytes(nalu))
+            nalu if isinstance(nalu, bytes) else bytes(nalu)
+        )
         st, bb = _CM.CMBlockBufferCreateWithMemoryBlock(
-            None, None, len(payload), None, None, 0, len(payload), 0, None)
+            None, None, len(payload), None, None, 0, len(payload), 0, None
+        )
         if st != 0 or bb is None:
             return None
         _CM.CMBlockBufferReplaceDataBytes(payload, bb, 0, len(payload))
         st, sb = _CM.CMSampleBufferCreateReady(
-            None, bb, self._fmt, 1, 0, (), 1, (len(payload),), None)
+            None, bb, self._fmt, 1, 0, (), 1, (len(payload),), None
+        )
         if st != 0:
             return None
         return sb
@@ -290,8 +316,7 @@ class VTHevcDecoder:
             # keeps bad_streak low so the Path-B watchdog never trips (and VT's
             # restart() is a no-op regardless) — no storm, no cascade.
             now = time.monotonic()
-            if (0 <= tile_idx < self.num_tiles
-                    and now - self._last_err_fir_t >= 0.5):
+            if 0 <= tile_idx < self.num_tiles and now - self._last_err_fir_t >= 0.5:
                 self._last_err_fir_t = now
                 self._gate.mark_decode_error(tile_idx)
             return
@@ -300,7 +325,7 @@ class VTHevcDecoder:
             return
         slot = self._tiles[tile_idx]
         with slot.lock:
-            if seq < slot.seq:                 # a newer frame already landed
+            if seq < slot.seq:  # a newer frame already landed
                 return
             slot.frame = tile
             slot.seq = seq
@@ -318,8 +343,12 @@ class VTHevcDecoder:
                 fed = self._feed_total - self._feeds_at_last_pub
                 if fed > 30:
                     # Fed but couldn't decode for >1.5 s = a real decode stall.
-                    log.warning("VT decode stall %.2fs — fed %d NALUs, all "
-                                "concealed (broken ref chain)", gap, fed)
+                    log.warning(
+                        "VT decode stall %.2fs — fed %d NALUs, all "
+                        "concealed (broken ref chain)",
+                        gap,
+                        fed,
+                    )
                 elif _VT_DEBUG:
                     # ~0 feeds = host/RX sent nothing (static screen / idle).
                     log.info("VT publish gap %.2fs — host idle (fed %d)", gap, fed)
@@ -346,22 +375,28 @@ class VTHevcDecoder:
             h = _Q.CVPixelBufferGetHeight(buf)
             if _Q.CVPixelBufferGetPlaneCount(buf) < 2:
                 return None
-            # H1: only nv24 (444f) is the biplanar 4:4:4 layout the rest of the
-            # pipeline assumes. The fallback decode session (set_params) can
-            # hand us a VT-chosen format (e.g. 4:2:0 biplanar) that would pass
-            # the plane-count guard above and be mislabeled 4:4:4 → garbage
-            # chroma. Reject it rather than render garbage.
+            # The renderer expects full-range 8-bit planes. A fallback session
+            # may choose limited-range 420v or a packed/10-bit format; reject
+            # these rather than interpreting their bytes as full-range NV12.
             fmt = _Q.CVPixelBufferGetPixelFormatType(buf)
-            if fmt != _NV24_FMT:
+            if fmt not in (_NV24_FMT, _NV12_FMT):
                 if not self._fmt_warned:
                     self._fmt_warned = True
-                    log.warning("VTHevcDecoder: non-nv24 output format 0x%x — "
-                                "dropping frames (expected 444f)", fmt)
+                    log.warning(
+                        "VTHevcDecoder: unsupported output format 0x%x — "
+                        "dropping frames (expected 444f or 420f)",
+                        fmt,
+                    )
                 return None
             y_rb = _Q.CVPixelBufferGetBytesPerRowOfPlane(buf, 0)
             uv_rb = _Q.CVPixelBufferGetBytesPerRowOfPlane(buf, 1)
             y_h = _Q.CVPixelBufferGetHeightOfPlane(buf, 0)
             uv_h = _Q.CVPixelBufferGetHeightOfPlane(buf, 1)
+            uv_w = _Q.CVPixelBufferGetWidthOfPlane(buf, 1)
+            expected = (w, h) if fmt == _NV24_FMT else ((w + 1) // 2, (h + 1) // 2)
+            if (uv_w, uv_h) != expected or y_h != h or y_rb < w or uv_rb < 2 * uv_w:
+                log.warning("VTHevcDecoder: inconsistent biplanar dimensions")
+                return None
             y_base = _Q.CVPixelBufferGetBaseAddressOfPlane(buf, 0)
             uv_base = _Q.CVPixelBufferGetBaseAddressOfPlane(buf, 1)
             if y_base is None or uv_base is None:
@@ -375,16 +410,25 @@ class VTHevcDecoder:
             _Q.CVPixelBufferUnlockBaseAddress(buf, _LOCK_READONLY)
         if not self._seen_fmt:
             self._seen_fmt = True
-            log.info("VTHevcDecoder output: nv24 %dx%d (y_stride=%d uv_stride=%d)",
-                     w, h, y_rb, uv_rb)
-        # nv24 passthrough: v is None, u carries the interleaved UV plane.
+            log.info(
+                "VTHevcDecoder output: %s %dx%d (y_stride=%d uv_stride=%d)",
+                "nv12" if fmt == _NV12_FMT else "nv24",
+                w,
+                h,
+                y_rb,
+                uv_rb,
+            )
+        # v is None; u carries the interleaved UV plane at its native size.
         return TileFrame(
-            y=y_bytes, u=uv_bytes, v=None,
-            width=w, height=h,
+            y=y_bytes,
+            u=uv_bytes,
+            v=None,
+            width=w,
+            height=h,
             y_stride=y_rb,
             uv_stride=uv_rb,
-            chroma_width=w,
-            chroma_height=h,
+            chroma_width=uv_w,
+            chroma_height=uv_h,
         )
 
     # -- consumer -----------------------------------------------------------
@@ -449,7 +493,7 @@ class VTHevcDecoder:
 
     # -- lifecycle ----------------------------------------------------------
 
-    def start(self) -> None:                   # parity no-op (no worker thread)
+    def start(self) -> None:  # parity no-op (no worker thread)
         pass
 
     def restart(self) -> None:
@@ -465,9 +509,11 @@ class VTHevcDecoder:
         real format/resolution change with a new SPS — rebuilds the session."""
         self._restart_suppressed += 1
         if _VT_DEBUG:
-            log.info("VT restart() suppressed (DPB-preserving, #%d) — "
-                     "recovering via FIR/IDR, not a session wipe",
-                     self._restart_suppressed)
+            log.info(
+                "VT restart() suppressed (DPB-preserving, #%d) — "
+                "recovering via FIR/IDR, not a session wipe",
+                self._restart_suppressed,
+            )
 
     def close(self) -> None:
         with self._lock:

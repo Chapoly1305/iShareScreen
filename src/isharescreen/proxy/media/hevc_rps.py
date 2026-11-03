@@ -21,6 +21,7 @@ References:
   header), 7.3.7 (st_ref_pic_set), 8.3.1 (POC derivation).
 - chemag/h265nal as a known-good cross-check.
 """
+
 from __future__ import annotations
 
 import logging
@@ -51,20 +52,22 @@ NAL_IDR_W_RADL = 19
 NAL_IDR_N_LP = 20
 NAL_CRA_NUT = 21
 
-IRAP_RANGE = range(NAL_BLA_W_LP, NAL_CRA_NUT + 1)   # 16..21
-IDR_RANGE = (NAL_IDR_W_RADL, NAL_IDR_N_LP)          # 19, 20
+IRAP_RANGE = range(NAL_BLA_W_LP, NAL_CRA_NUT + 1)  # 16..21
+IDR_RANGE = (NAL_IDR_W_RADL, NAL_IDR_N_LP)  # 19, 20
 
 
 @dataclass(slots=True)
 class _ShortTermRps:
     """Parsed st_ref_pic_set as a flat list of (delta_poc, used_by_curr)."""
+
     deltas: list[tuple[int, bool]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
 class HevcSpsState:
     """SPS fields we need to parse a slice header and an RPS."""
-    log2_max_pic_order_cnt_lsb: int = 8     # default if SPS not parsed yet
+
+    log2_max_pic_order_cnt_lsb: int = 8  # default if SPS not parsed yet
     num_short_term_ref_pic_sets: int = 0
     short_term_rps_sets: list[_ShortTermRps] = field(default_factory=list)
     num_long_term_ref_pics_sps: int = 0
@@ -75,9 +78,11 @@ class HevcSpsState:
     pic_height_in_luma_samples: int = 0
     log2_min_luma_coding_block_size_minus3: int = 0
     log2_diff_max_min_luma_coding_block_size: int = 0
+    chroma_format_idc: int = 1
 
 
 # ── parsers ──────────────────────────────────────────────────────────
+
 
 def _skip_profile_tier_level(br: BitReader, max_num_sub_layers: int) -> None:
     """Profile/tier/level — we don't need the values, just consume bits."""
@@ -100,13 +105,15 @@ def _skip_profile_tier_level(br: BitReader, max_num_sub_layers: int) -> None:
             br.read(2)
     for i in range(max_num_sub_layers - 1):
         if sub_layer_profile_present[i]:
-            br.read(8 + 32 + 48)        # same shape as general
+            br.read(8 + 32 + 48)  # same shape as general
         if sub_layer_level_present[i]:
             br.read(8)
 
 
 def _parse_st_ref_pic_set(
-    br: BitReader, idx: int, num_in_sps: int,
+    br: BitReader,
+    idx: int,
+    num_in_sps: int,
     sets: list[_ShortTermRps],
 ) -> _ShortTermRps:
     """Parse one short_term_ref_pic_set (HEVC 7.3.7). Returns the
@@ -185,12 +192,16 @@ def parse_sps(rbsp: bytes) -> HevcSpsState:
 
     sps_seq_parameter_set_id = br.read_ue()  # noqa: F841
     chroma_format_idc = br.read_ue()
+    state.chroma_format_idc = chroma_format_idc
     if chroma_format_idc == 3:
         state.separate_colour_plane_flag = bool(br.read1())
     state.pic_width_in_luma_samples = br.read_ue()
     state.pic_height_in_luma_samples = br.read_ue()
     if br.read1():  # conformance_window_flag
-        br.read_ue(); br.read_ue(); br.read_ue(); br.read_ue()
+        br.read_ue()
+        br.read_ue()
+        br.read_ue()
+        br.read_ue()
 
     bit_depth_luma_minus8 = br.read_ue()  # noqa: F841
     bit_depth_chroma_minus8 = br.read_ue()  # noqa: F841
@@ -201,14 +212,22 @@ def parse_sps(rbsp: bytes) -> HevcSpsState:
     if not sub_layer_ordering_info_present_flag:
         n_sub_lo = 1
     for _ in range(n_sub_lo):
-        br.read_ue(); br.read_ue(); br.read_ue()
+        br.read_ue()
+        br.read_ue()
+        br.read_ue()
 
     log2_min_luma_coding_block_size_minus3 = br.read_ue()
-    state.log2_min_luma_coding_block_size_minus3 = log2_min_luma_coding_block_size_minus3
+    state.log2_min_luma_coding_block_size_minus3 = (
+        log2_min_luma_coding_block_size_minus3
+    )
     log2_diff_max_min_luma_coding_block_size = br.read_ue()
-    state.log2_diff_max_min_luma_coding_block_size = log2_diff_max_min_luma_coding_block_size
-    br.read_ue(); br.read_ue()  # log2_min_transform / diff
-    br.read_ue(); br.read_ue()  # max_transform_hierarchy_depth_inter / intra
+    state.log2_diff_max_min_luma_coding_block_size = (
+        log2_diff_max_min_luma_coding_block_size
+    )
+    br.read_ue()
+    br.read_ue()  # log2_min_transform / diff
+    br.read_ue()
+    br.read_ue()  # max_transform_hierarchy_depth_inter / intra
 
     if br.read1():  # scaling_list_enabled_flag
         if br.read1():  # sps_scaling_list_data_present_flag
@@ -221,14 +240,18 @@ def parse_sps(rbsp: bytes) -> HevcSpsState:
     br.read1()  # amp_enabled_flag
     state.sample_adaptive_offset_enabled_flag = bool(br.read1())
     if br.read1():  # pcm_enabled_flag
-        br.read(4); br.read(4)
-        br.read_ue(); br.read_ue()
+        br.read(4)
+        br.read(4)
+        br.read_ue()
+        br.read_ue()
         br.read1()
 
     state.num_short_term_ref_pic_sets = br.read_ue()
     sets: list[_ShortTermRps] = []
     for i in range(state.num_short_term_ref_pic_sets):
-        sets.append(_parse_st_ref_pic_set(br, i, state.num_short_term_ref_pic_sets, sets))
+        sets.append(
+            _parse_st_ref_pic_set(br, i, state.num_short_term_ref_pic_sets, sets)
+        )
     state.short_term_rps_sets = sets
 
     state.long_term_ref_pics_present_flag = bool(br.read1())
@@ -298,7 +321,8 @@ def parse_slice_header_for_rps(
         short_term_ref_pic_set_sps_flag = br.read1()
         if not short_term_ref_pic_set_sps_flag:
             rps = _parse_st_ref_pic_set(
-                br, sps.num_short_term_ref_pic_sets,
+                br,
+                sps.num_short_term_ref_pic_sets,
                 sps.num_short_term_ref_pic_sets,
                 sps.short_term_rps_sets,
             )
@@ -331,6 +355,7 @@ def parse_slice_header_for_rps(
 
 
 # ── tracker ──────────────────────────────────────────────────────────
+
 
 class HevcRpsTracker:
     """Keeps a per-codec view of which POCs are in the DPB. Caller
@@ -404,7 +429,9 @@ class HevcRpsTracker:
         # NAL header is 2 bytes; the rest is the slice header + data.
         rbsp = remove_emulation_prevention(nalu[2:])
         result = parse_slice_header_for_rps(
-            nal_unit_type, rbsp, self.sps,
+            nal_unit_type,
+            rbsp,
+            self.sps,
         )
         if result is None:
             return set()
@@ -467,7 +494,8 @@ class HevcRpsTracker:
                         "long-distance reference: %d slices referenced a POC "
                         ">=16 frames back (max back-distance=%d) — LTR-style "
                         "recovery reference",
-                        self.far_ref_events, self.max_ref_distance,
+                        self.far_ref_events,
+                        self.max_ref_distance,
                     )
         return missing
 

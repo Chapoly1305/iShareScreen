@@ -3,6 +3,7 @@
 Discovery reads metadata only. Model definitions remain in user-owned official
 assets; optional ML libraries are imported only when explicitly loading a model.
 """
+
 from __future__ import annotations
 
 from collections import defaultdict
@@ -12,6 +13,7 @@ import importlib.util
 import json
 import logging
 from pathlib import Path, PurePosixPath
+import pickle
 import re
 import time
 
@@ -31,8 +33,12 @@ def specification(key: str) -> dict:
         raise ValueError("Candidate model identity mismatch")
     for name, asset in spec["files"].items():
         path = PurePosixPath(name)
-        if (path.is_absolute() or ".." in path.parts or not asset["url"].startswith("https://")
-                or not re.fullmatch(r"[0-9a-f]{64}", asset["sha256"])):
+        if (
+            path.is_absolute()
+            or ".." in path.parts
+            or not asset["url"].startswith("https://")
+            or not re.fullmatch(r"[0-9a-f]{64}", asset["sha256"])
+        ):
             raise ValueError("Unsafe candidate asset path or URL")
     return spec
 
@@ -48,8 +54,11 @@ def verify_assets(key: str, home: Path | None = None) -> dict:
     for name, asset in spec["files"].items():
         path = root / name
         parents = (root / parent for parent in Path(name).parents)
-        if (not path.is_file() or any(p.is_symlink() for p in (path, root, *parents))
-                or sha256(path) != asset["sha256"]):
+        if (
+            not path.is_file()
+            or any(p.is_symlink() for p in (path, root, *parents))
+            or sha256(path) != asset["sha256"]
+        ):
             raise ValueError(f"Missing, unsafe or changed {key} asset: {name}")
     return spec
 
@@ -64,38 +73,82 @@ def availability(home: Path | None = None) -> list[dict]:
         spec, reason = specification(key), ""
         if spec["scale"] != 2:
             reason = "Official weights are ×4; offline native-scale evaluation only"
-        elif any(importlib.util.find_spec(module) is None for module in ("torch", "cv2")):
+        elif any(
+            importlib.util.find_spec(module) is None for module in ("torch", "cv2")
+        ):
             reason = "Install the optional video enhancement dependencies"
         elif key == "rt4ksr" and importlib.util.find_spec("torchvision") is None:
             reason = "RT4KSR requires torchvision matching the installed PyTorch"
-        elif not all((asset_home(key, home) / name).is_file() for name in spec["files"]):
+        elif not all(
+            (asset_home(key, home) / name).is_file() for name in spec["files"]
+        ):
             reason = "Pinned official candidate assets are not installed"
-        result.append(dict(id=torch_id(key), label=f"{spec['label']} - Pretrained ×{spec['scale']} (PyTorch)",
-                           available=not reason, reason=reason))
+        result.append(
+            dict(
+                id=torch_id(key),
+                label=f"{spec['label']} - Pretrained ×{spec['scale']} (PyTorch)",
+                available=not reason,
+                reason=reason,
+            )
+        )
     return result
 
 
 def load_network(key: str, home: Path | None = None):
     """Strict-load official weights before any deployment-only transformation."""
     import torch
+
     spec = verify_assets(key, home)
     root = asset_home(key, home)
     module = importlib.import_module(f"{__name__}.{key}.loader")
     model = module.build(root / "source")
     with (root / "weights.pth").open("rb") as handle:
         digest = hashlib.sha256()
-        for block in iter(lambda: handle.read(1024*1024), b""):
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
         if digest.hexdigest() != spec["files"]["weights.pth"]["sha256"]:
             raise ValueError("Candidate checkpoint changed during loading")
         handle.seek(0)
         allowed = [torch.optim.Adam, dict, defaultdict] if key == "quicksrnet" else []
-        with torch.serialization.safe_globals(allowed):
-            state = torch.load(handle, map_location="cpu", weights_only=True)
+        try:
+            with torch.serialization.safe_globals(allowed):
+                state = torch.load(handle, map_location="cpu", weights_only=True)
+        except pickle.UnpicklingError:
+            if key != "quicksrnet":
+                raise
+            # Newer weights-only readers reject optimizer metadata in the
+            # official file. This tensor-only copy was created by the verified
+            # loader; bind it to the original bytes and the exact model state.
+            normalized_home = home or project_home()
+            metadata_path = normalized_home / "official-state.json"
+            normalized_path = normalized_home / "official-state.pt"
+            if any(p.is_symlink() for p in (metadata_path, normalized_path)):
+                raise ValueError("Unsafe normalized official checkpoint")
+            metadata = json.loads(metadata_path.read_text())
+            if (
+                metadata["original_sha256"] != spec["files"]["weights.pth"]["sha256"]
+                or sha256(normalized_path) != metadata["normalized_sha256"]
+            ):
+                raise ValueError("Normalized official checkpoint identity differs")
+            state = torch.load(normalized_path, map_location="cpu", weights_only=True)
+            identity = hashlib.sha256()
+            for name, value in sorted(state.items()):
+                if not isinstance(value, torch.Tensor):
+                    raise ValueError(
+                        "Normalized official checkpoint contains non-tensor data"
+                    )
+                identity.update(name.encode())
+                identity.update(str(tuple(value.shape)).encode())
+                identity.update(value.detach().cpu().numpy().tobytes())
+            if identity.hexdigest() != metadata["tensor_sha256"]:
+                raise ValueError("Normalized official model parameters differ")
     if "state_dict" in state:
         state = state["state_dict"]
     state = {name.removeprefix("module."): value for name, value in state.items()}
-    if not state or not all(isinstance(v, torch.Tensor) and torch.isfinite(v).all().item() for v in state.values()):
+    if not state or not all(
+        isinstance(v, torch.Tensor) and torch.isfinite(v).all().item()
+        for v in state.values()
+    ):
         raise ValueError("Candidate checkpoint must contain finite tensors")
     torch.nn.Module.load_state_dict(model, state, strict=True)
     model.eval().requires_grad_(False)
@@ -109,46 +162,80 @@ class TorchUpscaler:
 
     def __init__(self, key, device="auto", home=None, precision="fp32"):
         import torch
+
         self.key = key
         self.model, self.spec = load_network(key, home)
         if device == "auto":
-            device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+            device = (
+                "cuda"
+                if torch.cuda.is_available()
+                else ("mps" if torch.backends.mps.is_available() else "cpu")
+            )
         mps_half = key == "quicksrnet" and device == "mps" and precision == "fp16"
-        if precision not in ("fp32", "fp16", "amp-fp16") or (precision != "fp32" and not device.startswith("cuda") and not mps_half):
-            raise ValueError("Use FP32 on CPU/MPS; only validated QuickSRNet 540p supports MPS FP16; AMP requires CUDA")
+        if precision not in ("fp32", "fp16", "amp-fp16") or (
+            precision != "fp32" and not device.startswith("cuda") and not mps_half
+        ):
+            raise ValueError(
+                "Use FP32 on CPU/MPS; only validated QuickSRNet 540p supports MPS FP16; AMP requires CUDA"
+            )
         self.device, self.precision = device, precision
         self.dtype = torch.float16 if precision == "fp16" else torch.float32
         self.model.to(device=device, dtype=self.dtype)
         self._mps_packer = None
         if mps_half:
             from ..mps_output import MPSRGBPacker
+
             try:
                 self._mps_packer = MPSRGBPacker()
             except RuntimeError:
                 # Keep the existing GPU tensor conversion on older compilers.
                 log.debug("MPS RGB shader unavailable", exc_info=True)
-        self.provenance = dict(id=torch_id(key), label=self.spec["label"], variant="pretrained",
-            backend="pytorch", device=device, precision=precision, scale=self.spec["scale"],
-            parameters=sum(p.numel() for p in self.model.parameters()), source_revision=self.spec["revision"],
-            checkpoint=str(asset_home(key, home)/"weights.pth"),
-            checkpoint_sha256=self.spec["files"]["weights.pth"]["sha256"])
+        self.provenance = dict(
+            id=torch_id(key),
+            label=self.spec["label"],
+            variant="pretrained",
+            backend="pytorch",
+            device=device,
+            precision=precision,
+            scale=self.spec["scale"],
+            parameters=sum(p.numel() for p in self.model.parameters()),
+            source_revision=self.spec["revision"],
+            checkpoint=str(asset_home(key, home) / "weights.pth"),
+            checkpoint_sha256=self.spec["files"]["weights.pth"]["sha256"],
+        )
         if mps_half:
-            self.provenance["output_conversion"] = "metal-fused" if self._mps_packer else "torch-mps"
+            self.provenance["output_conversion"] = (
+                "metal-fused" if self._mps_packer else "torch-mps"
+            )
 
     def sync(self):
         if self.device == "mps":
             import torch
+
             torch.mps.synchronize()
         elif self.device.startswith("cuda"):
             import torch
+
             torch.cuda.synchronize(self.device)
 
     def __call__(self, rgb):
         import torch
-        if not isinstance(rgb, np.ndarray) or rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3:
+
+        if (
+            not isinstance(rgb, np.ndarray)
+            or rgb.dtype != np.uint8
+            or rgb.ndim != 3
+            or rgb.shape[2] != 3
+        ):
             raise ValueError("Expected H×W×3 RGB uint8")
-        if self.device == "mps" and self.precision == "fp16" and rgb.shape != (540,960,3):
-            raise ValueError("Validated QuickSRNet MPS FP16 requires RGB uint8 960×540 input")
+        if (
+            self.device == "mps"
+            and self.precision == "fp16"
+            and rgb.shape != (540, 960, 3)
+        ):
+            raise ValueError(
+                "Validated QuickSRNet MPS FP16 requires RGB uint8 960×540 input"
+            )
         self.sync()
         t0 = time.perf_counter()
         mps_half = self.device == "mps" and self.precision == "fp16"
@@ -157,26 +244,47 @@ class TorchUpscaler:
             # produces the same FP16 input as CPU FP32 division followed by cast.
             x = torch.from_numpy(np.ascontiguousarray(rgb))
         else:
-            x = torch.from_numpy(np.ascontiguousarray((rgb.astype(np.float32)/255).transpose(2, 0, 1)[None]))
+            x = torch.from_numpy(
+                np.ascontiguousarray(
+                    (rgb.astype(np.float32) / 255).transpose(2, 0, 1)[None]
+                )
+            )
         t1 = time.perf_counter()
         x = x.to(device=self.device, dtype=self.dtype)
         if mps_half:
             x = x.permute(2, 0, 1)[None].contiguous().div_(255)
         self.sync()
         t2 = time.perf_counter()
-        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16, enabled=self.precision == "amp-fp16"):
+        with (
+            torch.inference_mode(),
+            torch.autocast(
+                "cuda", dtype=torch.float16, enabled=self.precision == "amp-fp16"
+            ),
+        ):
             output = self.model(x)
-        if output.shape != (1, 3, rgb.shape[0]*self.spec["scale"], rgb.shape[1]*self.spec["scale"]):
+        if output.shape != (
+            1,
+            3,
+            rgb.shape[0] * self.spec["scale"],
+            rgb.shape[1] * self.spec["scale"],
+        ):
             raise ValueError("Candidate model returned invalid pixels")
         packed = None
         packer = getattr(self, "_mps_packer", None)
-        if packer is not None and output.dtype == torch.float16 and output.is_contiguous():
+        if (
+            packer is not None
+            and output.dtype == torch.float16
+            and output.is_contiguous()
+        ):
             packed = packer(output)
         else:
             # MPS amax propagates NaN; abs exposes either sign of infinity.
             # Reduce first to avoid several full-resolution masks.
-            finite = (torch.isfinite(output.abs().amax()).item() if self.device == "mps"
-                      else torch.isfinite(output).all().item())
+            finite = (
+                torch.isfinite(output.abs().amax()).item()
+                if self.device == "mps"
+                else torch.isfinite(output).all().item()
+            )
             if not finite:
                 raise ValueError("Candidate model returned invalid pixels")
         self.sync()
@@ -184,7 +292,21 @@ class TorchUpscaler:
         if packed is not None:
             out = packed.cpu().numpy()
         else:
-            out = (output[0].float()*255).round().clamp(0, 255).to(torch.uint8).permute(1, 2, 0).contiguous().cpu().numpy()
+            out = (
+                (output[0].float() * 255)
+                .round()
+                .clamp(0, 255)
+                .to(torch.uint8)
+                .permute(1, 2, 0)
+                .contiguous()
+                .cpu()
+                .numpy()
+            )
         t4 = time.perf_counter()
-        return out, dict(prepare_ms=(t1-t0)*1000, upload_ms=(t2-t1)*1000, inference_ms=(t3-t2)*1000,
-                         download_ms=(t4-t3)*1000, total_ms=(t4-t0)*1000)
+        return out, dict(
+            prepare_ms=(t1 - t0) * 1000,
+            upload_ms=(t2 - t1) * 1000,
+            inference_ms=(t3 - t2) * 1000,
+            download_ms=(t4 - t3) * 1000,
+            total_ms=(t4 - t0) * 1000,
+        )

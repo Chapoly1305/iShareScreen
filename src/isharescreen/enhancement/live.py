@@ -1,4 +1,5 @@
 """Bounded latest-canvas inference; all Torch work lives off the render thread."""
+
 from __future__ import annotations
 
 from collections import deque
@@ -30,6 +31,7 @@ class FrameRequest(NamedTuple):
     generation: int
     submitted_at: float
     frame: CanvasSnapshot | np.ndarray
+    revision: int
 
 
 class EnhancedFrame(NamedTuple):
@@ -39,23 +41,31 @@ class EnhancedFrame(NamedTuple):
     model: str
     rgb: np.ndarray
     timing: dict[str, float]
+    revision: int
 
 
 def tile_rgb(tile):
     """Match the viewer's full-range BT.709 shader, including row padding."""
     import cv2
-    y = np.frombuffer(tile.y, np.uint8).reshape(tile.height, tile.y_stride)[:, :tile.width]
+
+    y = np.frombuffer(tile.y, np.uint8).reshape(tile.height, tile.y_stride)[
+        :, : tile.width
+    ]
     ch, cw = tile.chroma_height, tile.chroma_width
     u = np.frombuffer(tile.u, np.uint8).reshape(ch, tile.uv_stride)
     if tile.v is None:
-        u, v = u[:, :2*cw:2], u[:, 1:2*cw:2]
+        u, v = u[:, : 2 * cw : 2], u[:, 1 : 2 * cw : 2]
     else:
         u = u[:, :cw]
         v = np.frombuffer(tile.v, np.uint8).reshape(ch, tile.uv_stride)[:, :cw]
-    if (cw,ch) != (tile.width,tile.height):
-        u = cv2.resize(u, (tile.width,tile.height), interpolation=cv2.INTER_LINEAR)
-        v = cv2.resize(v, (tile.width,tile.height), interpolation=cv2.INTER_LINEAR)
-    yf, cb, cr = y.astype(np.float32)/255, u.astype(np.float32)/255-0.5, v.astype(np.float32)/255-0.5
+    if (cw, ch) != (tile.width, tile.height):
+        u = cv2.resize(u, (tile.width, tile.height), interpolation=cv2.INTER_LINEAR)
+        v = cv2.resize(v, (tile.width, tile.height), interpolation=cv2.INTER_LINEAR)
+    yf, cb, cr = (
+        y.astype(np.float32) / 255,
+        u.astype(np.float32) / 255 - 0.5,
+        v.astype(np.float32) / 255 - 0.5,
+    )
     # Keep contiguous planes through quantization, then interleave bytes.
     # Interleaving FP32 first creates several full RGB temporaries per tile.
     # Preserve the shader's FP32 operation order and round-to-even convention.
@@ -64,7 +74,7 @@ def tile_rgb(tile):
     np.add(yf, rgb[0], out=rgb[0])
     np.multiply(cb, 0.187324, out=rgb[1])
     np.subtract(yf, rgb[1], out=rgb[1])
-    np.subtract(rgb[1], 0.468124*cr, out=rgb[1])
+    np.subtract(rgb[1], 0.468124 * cr, out=rgb[1])
     np.multiply(cb, 1.8556, out=rgb[2])
     np.add(yf, rgb[2], out=rgb[2])
     np.multiply(rgb, 255, out=rgb)
@@ -80,27 +90,36 @@ class TileCanvas:
     Tiles have no common frame timestamp in TileFrame. This composes a fully
     populated latest-state canvas, not an atomic cross-tile video frame.
     """
+
     def __init__(self, width, height, num_tiles):
         self.width, self.height, self.num_tiles = width, height, num_tiles
         self.tiles = {}
 
     def update(self, index, tile, slot_height):
+        previous = self.tiles.get(index)
+        # Decoders may publish the same still image repeatedly. Byte equality
+        # avoids invalidating a useful refinement for an identical picture.
+        if previous is not None and previous == (tile, slot_height):
+            return False
         self.tiles[index] = (tile, slot_height)
+        return True
 
     def snapshot(self):
         if len(self.tiles) != self.num_tiles:
             return None
-        return CanvasSnapshot(self.width, self.height, tuple(self.tiles[i] for i in range(self.num_tiles)))
+        return CanvasSnapshot(
+            self.width, self.height, tuple(self.tiles[i] for i in range(self.num_tiles))
+        )
 
 
 def compose(snapshot):
     width, height, tiles = snapshot
-    out = np.zeros((height,width,3), dtype=np.uint8)
+    out = np.zeros((height, width, 3), dtype=np.uint8)
     for i, (tile, slot) in enumerate(tiles):
-        y = i*slot
-        rows, cols = min(tile.height, slot, height-y), min(tile.width,width)
+        y = i * slot
+        rows, cols = min(tile.height, slot, height - y), min(tile.width, width)
         if rows > 0 and cols > 0:
-            out[y:y+rows,:cols] = tile_rgb(tile)[:rows,:cols]
+            out[y : y + rows, :cols] = tile_rgb(tile)[:rows, :cols]
     return out
 
 
@@ -116,14 +135,34 @@ class EnhancementWorker:
         self.device, self.factory = device, factory
         self._wakeup = wakeup
         self._cv = threading.Condition()
-        self._selected, self._generation, self._pending, self._result = "off", 0, None, None
+        self._selected, self._generation, self._pending, self._result = (
+            "off",
+            0,
+            None,
+            None,
+        )
+        self._revision = 0
         self._closed = False
         self._options = availability()
-        self._stats = {"selected":"off", "active":"off", "displayed":"off", "state":"bypass",
-                       "error":"", "submitted":0, "processed":0, "dropped":0, "device":device,
-                       "provenance":{}, "timing_ms":{}, "display_upload_ms":None}
+        self._stats = {
+            "selected": "off",
+            "active": "off",
+            "displayed": "off",
+            "state": "bypass",
+            "error": "",
+            "submitted": 0,
+            "processed": 0,
+            "dropped": 0,
+            "device": device,
+            "provenance": {},
+            "timing_ms": {},
+            "display_upload_ms": None,
+            "discarded_stale": 0,
+        }
         self._latencies = deque(maxlen=120)
-        self._thread = threading.Thread(target=self._run, name="iss-super-resolution", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run, name="iss-super-resolution", daemon=True
+        )
         self._thread.start()
 
     def select(self, key):
@@ -138,9 +177,18 @@ class EnhancementWorker:
             self._generation += 1
             self._pending = self._result = None
             self._latencies.clear()
-            self._stats.update(selected=key, active="off", displayed="off",
-                               state="bypass" if key == "off" else "loading", error="",
-                               last_ms=None,age_ms=None,provenance={},timing_ms={},display_upload_ms=None)
+            self._stats.update(
+                selected=key,
+                active="off",
+                displayed="off",
+                state="bypass" if key == "off" else "loading",
+                error="",
+                last_ms=None,
+                age_ms=None,
+                provenance={},
+                timing_ms={},
+                display_upload_ms=None,
+            )
             self._cv.notify_all()
 
     def invalidate(self):
@@ -149,54 +197,101 @@ class EnhancementWorker:
             self._generation += 1
             self._pending = self._result = None
             self._latencies.clear()
-            self._stats.update(displayed="off",last_ms=None,age_ms=None,timing_ms={},display_upload_ms=None)
+            self._stats.update(
+                displayed="off",
+                last_ms=None,
+                age_ms=None,
+                timing_ms={},
+                display_upload_ms=None,
+            )
             self._cv.notify_all()
 
     def submit(self, frame):
         with self._cv:
-            if self._selected == "off" or self._closed or self._stats["state"] == "error":
+            if (
+                self._selected == "off"
+                or self._closed
+                or self._stats["state"] == "error"
+            ):
                 return
             if self._pending is not None:
                 self._stats["dropped"] += 1
+            self._revision += 1
+            self._result = None
             # TileFrames own immutable byte buffers; retaining a snapshot is cheap.
-            self._pending = FrameRequest(self._generation, time.monotonic(), frame)
+            self._pending = FrameRequest(
+                self._generation, time.monotonic(), frame, self._revision
+            )
             self._stats["submitted"] += 1
             self._cv.notify_all()
+
+    def content_changed(self):
+        """Invalidate old pixels immediately, without unloading the model.
+
+        This is separate from the model/geometry generation: new decoded text
+        must be visible while inference runs, including an incomplete canvas.
+        """
+        with self._cv:
+            self._revision += 1
+            if self._pending is not None:
+                self._stats["dropped"] += 1
+            self._pending = self._result = None
+            self._stats.update(displayed="off", display_upload_ms=None)
 
     def poll(self):
         with self._cv:
             result, self._result = self._result, None
-            if result is None or result.generation != self._generation:
+            if (
+                result is None
+                or result.generation != self._generation
+                or result.revision != self._revision
+            ):
                 return None
             return result
 
-    def displayed(self, generation, key, upload_ms=None):
+    def displayed(self, generation, key, upload_ms=None, revision=None):
         """Confirm presentation only if the control state still owns this output."""
         with self._cv:
-            if (not self._closed and generation == self._generation and key == self._selected
-                    and self._stats["state"] != "error"):
+            if (
+                not self._closed
+                and generation == self._generation
+                and key == self._selected
+                and (revision is None or revision == self._revision)
+                and self._stats["state"] != "error"
+            ):
                 self._stats["displayed"] = key
                 self._stats["display_upload_ms"] = upload_ms
                 return True
             return False
 
-    def fail(self, error, generation=None):
+    def fail(self, error, generation=None, revision=None):
         """Fail only the generation that owns a render-thread upload error."""
         with self._cv:
-            if self._closed or (generation is not None and generation != self._generation):
+            if (
+                self._closed
+                or (generation is not None and generation != self._generation)
+                or (revision is not None and revision != self._revision)
+            ):
                 return False
             self._generation += 1
             self._pending = self._result = None
-            self._stats.update(state="error",active="off",displayed="off",error=str(error))
+            self._stats.update(
+                state="error", active="off", displayed="off", error=str(error)
+            )
             return True
 
     def snapshot(self):
         with self._cv:
-            return dict(self._stats, provenance=dict(self._stats["provenance"]),
-                        timing_ms=dict(self._stats["timing_ms"]),
-                        options=[dict(option) for option in self._options], pending=int(self._pending is not None),
-                        generation=self._generation,
-                        p50_ms=float(np.median(self._latencies)) if self._latencies else None)
+            return dict(
+                self._stats,
+                provenance=dict(self._stats["provenance"]),
+                timing_ms=dict(self._stats["timing_ms"]),
+                options=[dict(option) for option in self._options],
+                pending=int(self._pending is not None),
+                generation=self._generation,
+                content_revision=self._revision,
+                p50_ms=float(np.median(self._latencies)) if self._latencies else None,
+            )
 
     def close(self):
         with self._cv:
@@ -218,7 +313,13 @@ class EnhancementWorker:
         model, loaded = None, "off"
         while True:
             with self._cv:
-                self._cv.wait_for(lambda: self._closed or self._pending is not None or self._selected != loaded)
+                self._cv.wait_for(
+                    lambda: (
+                        self._closed
+                        or self._pending is not None
+                        or self._selected != loaded
+                    )
+                )
                 if self._closed:
                     return
                 generation, key = self._generation, self._selected
@@ -227,7 +328,7 @@ class EnhancementWorker:
                 if key != loaded:
                     model = None  # release previous model before loading the next
                     if key != "off":
-                        options = {"device":self.device}
+                        options = {"device": self.device}
                         if os.environ.get("ISS_SR_PRECISION", "fp32") != "fp32":
                             options["precision"] = os.environ["ISS_SR_PRECISION"]
                         model = self.factory(key, **options)
@@ -236,8 +337,11 @@ class EnhancementWorker:
                         if self._closed:
                             return
                         if generation == self._generation:
-                            self._stats.update(active=key, state="bypass" if key == "off" else "ready",
-                                               provenance=dict(getattr(model, "provenance", {})))
+                            self._stats.update(
+                                active=key,
+                                state="bypass" if key == "off" else "ready",
+                                provenance=dict(getattr(model, "provenance", {})),
+                            )
                             # Loading may take seconds. Start with the latest
                             # canvas that arrived during loading, rather than
                             # briefly displaying a cold, obsolete first frame.
@@ -250,43 +354,77 @@ class EnhancementWorker:
                 with self._cv:
                     if self._closed:
                         return
-                    if generation != self._generation:
+                    if (
+                        generation != self._generation
+                        or item.revision != self._revision
+                    ):
                         continue  # Selection/geometry changed during cold loading.
                 started = time.monotonic()
                 frame = item.frame
                 rgb = compose(frame) if isinstance(frame, tuple) else frame
-                assembly_ms = (time.monotonic()-started)*1000
+                assembly_ms = (time.monotonic() - started) * 1000
                 with self._cv:
                     if self._closed:
                         return
-                    if generation != self._generation:
+                    if (
+                        generation != self._generation
+                        or item.revision != self._revision
+                    ):
                         continue  # Canvas assembly also runs outside the control lock.
                 out, timing = model(rgb)
                 timing["assembly_ms"] = assembly_ms
-                timing["assembly_and_processing_ms"] = (time.monotonic()-started)*1000
-                timing["age_ms"] = (time.monotonic()-item.submitted_at)*1000
+                timing["assembly_and_processing_ms"] = (
+                    time.monotonic() - started
+                ) * 1000
+                timing["age_ms"] = (time.monotonic() - item.submitted_at) * 1000
                 published = False
                 with self._cv:
-                    if not self._closed and generation == self._generation and self._stats["state"] != "error":
-                        self._result = EnhancedFrame(generation, key, out, timing)
-                        self._stats.update(active=key, state="ready", last_ms=timing["assembly_and_processing_ms"],
-                                           age_ms=timing["age_ms"], device=getattr(model,"device",self.device),
-                                           timing_ms=dict(timing))
+                    if (
+                        not self._closed
+                        and generation == self._generation
+                        and item.revision == self._revision
+                        and self._stats["state"] != "error"
+                    ):
+                        self._result = EnhancedFrame(
+                            generation, key, out, timing, item.revision
+                        )
+                        self._stats.update(
+                            active=key,
+                            state="ready",
+                            last_ms=timing["assembly_and_processing_ms"],
+                            age_ms=timing["age_ms"],
+                            device=getattr(model, "device", self.device),
+                            timing_ms=dict(timing),
+                        )
                         self._stats["processed"] += 1
                         self._latencies.append(timing["assembly_and_processing_ms"])
                         published = True
+                    elif not self._closed and generation == self._generation:
+                        self._stats["discarded_stale"] += 1
                 if published:
                     self._wake_renderer()
             except Exception as exc:
                 log.exception("enhancement %s failed", key)
                 failed = False
                 with self._cv:
-                    if not self._closed and generation == self._generation:
+                    if (
+                        not self._closed
+                        and generation == self._generation
+                        and (
+                            model is None
+                            or item is None
+                            or item.revision == self._revision
+                        )
+                    ):
                         # Do not spin/retry a broken model on every render iteration.
-                        self._stats.update(state="error", active="off", displayed="off", error=str(exc))
+                        self._stats.update(
+                            state="error", active="off", displayed="off", error=str(exc)
+                        )
                         self._pending = self._result = None
                         loaded = key
                         failed = True
+                    elif not self._closed and generation == self._generation:
+                        self._stats["discarded_stale"] += 1
                 if failed:
                     self._wake_renderer()
 
@@ -307,8 +445,10 @@ class EnhancementDisplay:
         self._dirty = False
 
     def update_tile(self, index, tile, slot_height):
-        self.canvas.update(index, tile, slot_height)
-        self._dirty = True
+        if self.canvas.update(index, tile, slot_height):
+            self.worker.content_changed()
+            self.renderer.clear_enhancement()
+            self._dirty = True
 
     def step(self):
         """Return whether a model switch/result/error requires repainting."""
@@ -330,8 +470,12 @@ class EnhancementDisplay:
         result = self.worker.poll()
         if result is None:
             return selection_changed or error_changed
-        generation, key, rgb, timing = result
-        if self.worker.snapshot()["generation"] != generation:
+        generation, key, rgb, timing, revision = result
+        current = self.worker.snapshot()
+        if (
+            current["generation"] != generation
+            or current["content_revision"] != revision
+        ):
             self.renderer.clear_enhancement()
             return True
         started = time.perf_counter()
@@ -339,13 +483,21 @@ class EnhancementDisplay:
             self.renderer.upload_enhanced(rgb)
             # Controls stay responsive during potentially slow GPU allocation.
             # If selection/geometry changed during upload, bypass before draw.
-            if not self.worker.displayed(generation, key, (time.perf_counter()-started)*1000):
+            if not self.worker.displayed(
+                generation,
+                key,
+                (time.perf_counter() - started) * 1000,
+                revision=revision,
+            ):
                 self.renderer.clear_enhancement()
         except Exception as exc:
             log.exception("enhancement output upload failed")
             self.renderer.clear_enhancement()
-            self.worker.fail(exc, generation=generation)
-        log.debug("enhancement %s processing %.2fms, display upload enqueue %.2fms",
-                  key, timing["assembly_and_processing_ms"],
-                  (time.perf_counter() - started) * 1000)
+            self.worker.fail(exc, generation=generation, revision=revision)
+        log.debug(
+            "enhancement %s processing %.2fms, display upload enqueue %.2fms",
+            key,
+            timing["assembly_and_processing_ms"],
+            (time.perf_counter() - started) * 1000,
+        )
         return True

@@ -20,6 +20,7 @@ Password input, in order of precedence:
 There is no ``-p`` / ``--password`` flag on purpose — anything in argv
 shows up in ``ps`` and shell history.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -40,6 +41,7 @@ faulthandler.enable()
 
 from . import __version__
 from .proxy.protocol.negotiation import AdvertiseDims
+from .proxy.protocol.media_config import MediaOfferConfig
 from .proxy.session import Session, SessionConfig
 
 
@@ -61,10 +63,12 @@ def _hidpi_arg(v: str) -> str:
         f = float(s)
     except ValueError:
         raise argparse.ArgumentTypeError(
-            f"--hidpi must be auto/on/off or a scale like 2.5 (got {v!r})")
+            f"--hidpi must be auto/on/off or a scale like 2.5 (got {v!r})"
+        )
     if not (_HIDPI_MIN <= f <= _HIDPI_MAX):
         raise argparse.ArgumentTypeError(
-            f"--hidpi scale must be between {_HIDPI_MIN} and {_HIDPI_MAX} (got {f})")
+            f"--hidpi scale must be between {_HIDPI_MIN} and {_HIDPI_MAX} (got {f})"
+        )
     return repr(f) if f != int(f) else str(int(f))
 
 
@@ -80,7 +84,7 @@ def _make_parser() -> argparse.ArgumentParser:
             "Examples:\n"
             "  iss                                       # interactive prompt\n"
             "  iss --host mac.lan -u user                # asks for password\n"
-            "  echo \"$PW\" | iss --host mac.lan -u user --password-stdin\n"
+            '  echo "$PW" | iss --host mac.lan -u user --password-stdin\n'
             "  iss --host mac.lan -u user --password-stdin < pw.txt\n"
             "  iss --host mac.lan -u user --headless --auto-quit-secs 30\n"
         ),
@@ -96,35 +100,64 @@ def _make_parser() -> argparse.ArgumentParser:
     # (`echo "$PW" | iss ... --password-stdin`); for interactive use,
     # let the connect prompt handle it via getpass.
     g.add_argument(
-        "--password-stdin", action="store_true",
+        "--password-stdin",
+        action="store_true",
         help="read password from the first line of stdin",
     )
     secrets = g.add_mutually_exclusive_group()
-    secrets.add_argument("--remember-password", action="store_true",
-                         help="save password in the system credential store after successful login")
-    secrets.add_argument("--no-keyring", action="store_true",
-                         help="do not read or write the system credential store")
-    secrets.add_argument("--forget-password", action="store_true",
-                         help="delete the saved password for host/port/user and exit")
+    secrets.add_argument(
+        "--remember-password",
+        action="store_true",
+        help="save password in the system credential store after successful login",
+    )
+    secrets.add_argument(
+        "--no-keyring",
+        action="store_true",
+        help="do not read or write the system credential store",
+    )
+    secrets.add_argument(
+        "--forget-password",
+        action="store_true",
+        help="delete the saved password for host/port/user and exit",
+    )
     g.add_argument("--port", type=int, default=5900, help="TCP port (default 5900)")
     g.add_argument(
-        "--auth", choices=("srp", "nonsrp", "kerberos"), default="srp",
+        "--auth",
+        choices=("srp", "nonsrp", "kerberos"),
+        default="srp",
         help="srp (default), nonsrp, or kerberos (cached tickets; no password fallback)",
     )
-    g.add_argument("--krb-realm", default="", help="Kerberos realm; omitted = discover the target Mac's LKDC realm")
-    g.add_argument("--krb-principal", default="", help="Kerberos client principal; defaults to user[@realm]")
-    g.add_argument("--krb-service", default="", help="Kerberos service principal; defaults to vnc@host or vnc/REALM@REALM for LKDC")
     g.add_argument(
-        "--frontend", choices=("browser", "desktop"), default="browser",
+        "--krb-realm",
+        default="",
+        help="Kerberos realm; omitted = discover the target Mac's LKDC realm",
+    )
+    g.add_argument(
+        "--krb-principal",
+        default="",
+        help="Kerberos client principal; defaults to user[@realm]",
+    )
+    g.add_argument(
+        "--krb-service",
+        default="",
+        help="Kerberos service principal; defaults to vnc@host or vnc/REALM@REALM for LKDC",
+    )
+    g.add_argument(
+        "--frontend",
+        choices=("browser", "desktop"),
+        default="browser",
         help="browser = WebTransport+WebCodecs in a browser tab, H.264 "
         "pass-through (default); desktop = native wgpu/Qt window",
     )
     g.add_argument(
-        "--bridge-port", type=int, default=4433,
+        "--bridge-port",
+        type=int,
+        default=4433,
         help="browser frontend: WebTransport/HTTP3 listen port (default 4433)",
     )
     g.add_argument(
-        "--trust-cert-for-safari", action="store_true",
+        "--trust-cert-for-safari",
+        action="store_true",
         help="macOS only: install iss's WebTransport cert into the login "
         "keychain (one-time auth prompt) so Safari works. Safari can't use "
         "the self-signed cert otherwise — WebKit lacks serverCertificateHashes. "
@@ -133,7 +166,9 @@ def _make_parser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("display")
     g.add_argument(
-        "--advertise", metavar="WxH[@HIDPI]|auto", default=None,
+        "--advertise",
+        metavar="WxH[@HIDPI]|auto",
+        default=None,
         help=(
             "virtual display geometry advertised to the host "
             "(e.g. '2560x1440' or '1920x1200@2'). 'auto' (the default "
@@ -142,7 +177,9 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
     g.add_argument(
-        "--dynamic", action=argparse.BooleanOptionalAction, default=None,
+        "--dynamic",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
             "re-advertise the host's virtual display to match the viewer "
             "window whenever it's resized, so the remote re-renders sharp "
@@ -153,11 +190,14 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
     g.add_argument(
-        "--hdr", action="store_true",
+        "--hdr",
+        action="store_true",
         help="advertise HDR-capable viewer to the host",
     )
     g.add_argument(
-        "--display", metavar="N|all|combined", default=None,
+        "--display",
+        metavar="N|all|combined",
+        default=None,
         help=(
             "when the host has multiple monitors it streams them as one "
             "combined canvas. By default iss auto-opens one window per host "
@@ -169,7 +209,10 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
     g.add_argument(
-        "--hidpi", type=_hidpi_arg, metavar="auto|on|off|SCALE", default="auto",
+        "--hidpi",
+        type=_hidpi_arg,
+        metavar="auto|on|off|SCALE",
+        default="auto",
         help=(
             "Display scale of the host UI — how large everything is drawn. "
             "'auto' = match the local display (2x Retina / 1x otherwise); "
@@ -180,7 +223,9 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
     g.add_argument(
-        "--decoder", metavar="NAME", default=None,
+        "--decoder",
+        metavar="NAME",
+        default=None,
         help=(
             "video decoder to use. 'auto' (default) picks the best available "
             "decoder for the negotiated codec; or force one by name — "
@@ -189,10 +234,16 @@ def _make_parser() -> argparse.ArgumentParser:
             "see the matrix and which are available on this machine."
         ),
     )
-    g.add_argument("--chroma", choices=["auto", "444", "420"], default=None,
-                   help="chroma sampling preference, independent of codec (H.264 4:4:4 is not supported)")
     g.add_argument(
-        "--codec", choices=["auto", "hevc", "avc"], default=None,
+        "--chroma",
+        choices=["auto", "444", "420"],
+        default=None,
+        help="chroma sampling preference, independent of codec (H.264 4:4:4 is not supported)",
+    )
+    g.add_argument(
+        "--codec",
+        choices=["auto", "hevc", "avc"],
+        default=None,
         help=(
             "video codec: 'auto' (default) probes GPU capability and picks "
             "HEVC 4:4:4 when available, else H.264 4:2:0; 'hevc' forces "
@@ -201,12 +252,28 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
     g.add_argument(
-        "--list-decoders", action="store_true",
-        help=("print the decoder capability matrix (with live availability on "
-              "this machine) and exit"),
+        "--video-bitrate-cap-kbps",
+        type=int,
+        metavar="KBPS",
+        default=None,
+        help=(
+            "experimental desktop video bitrate cap to offer to the Mac "
+            "(for example 1250); the server may ignore or reject it, so "
+            "measure actual traffic"
+        ),
     )
     g.add_argument(
-        "--curtain", action=argparse.BooleanOptionalAction, default=True,
+        "--list-decoders",
+        action="store_true",
+        help=(
+            "print the decoder capability matrix (with live availability on "
+            "this machine) and exit"
+        ),
+    )
+    g.add_argument(
+        "--curtain",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "blank the host's physical screen via a SkyLight virtual "
             "display while we view (default on; --no-curtain to mirror "
@@ -214,7 +281,8 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
     g.add_argument(
-        "--share-console", action="store_true",
+        "--share-console",
+        action="store_true",
         help=(
             "force 'share the logged-in user's session'. This is now the "
             "AUTO-DEFAULT: iss detects whether someone is logged in at the "
@@ -225,7 +293,8 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
     g.add_argument(
-        "--alt-session", action="store_true",
+        "--alt-session",
+        action="store_true",
         help=(
             "override the auto-default: instead of sharing the logged-in "
             "user's session, log in to a fresh virtual display as the auth "
@@ -238,7 +307,9 @@ def _make_parser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("audio")
     g.add_argument(
-        "--audio", action=argparse.BooleanOptionalAction, default=True,
+        "--audio",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "play the host's audio through the local sound device "
             "(default on; --no-audio for video-only)"
@@ -247,7 +318,8 @@ def _make_parser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("mode")
     g.add_argument(
-        "--headless", action="store_true",
+        "--headless",
+        action="store_true",
         help="run a protocol smoke test instead of opening the viewer window",
     )
     g = p.add_argument_group("logging")
@@ -255,7 +327,9 @@ def _make_parser() -> argparse.ArgumentParser:
     g.add_argument("-q", "--quiet", action="store_true", help="warnings + errors only")
     g.add_argument("--log-file", metavar="PATH", help="tee logs to a file")
     g.add_argument(
-        "--control-socket", metavar="PATH", default=None,
+        "--control-socket",
+        metavar="PATH",
+        default=None,
         help=(
             "open a local control socket so a TUI / monitor can subscribe "
             "to live session stats. POSIX: UDS path; Windows: the real TCP "
@@ -263,7 +337,9 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
     g.add_argument(
-        "--record", metavar="PATH", default=None,
+        "--record",
+        metavar="PATH",
+        default=None,
         help=(
             "capture the whole session to a libpcap file at PATH. Every byte "
             "on the TCP control socket and the two UDP media sockets is "
@@ -274,7 +350,9 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
     g.add_argument(
-        "--auto-quit-secs", type=int, default=0,
+        "--auto-quit-secs",
+        type=int,
+        default=0,
         help=(
             "exit after N seconds. In --headless mode, this is the smoke-test "
             "duration (default 10s). For the viewer, 0 means run forever."
@@ -285,6 +363,7 @@ def _make_parser() -> argparse.ArgumentParser:
 
 
 # ── value parsing ────────────────────────────────────────────────────
+
 
 def _parse_advertise(spec: Optional[str]) -> Optional[AdvertiseDims]:
     # None / "" / "auto" all mean "no fixed geometry" — the desktop viewer
@@ -312,6 +391,7 @@ def _password_from_args(args: argparse.Namespace) -> Optional[str]:
             # Typed at a terminal, not piped: read it masked (getpass) so the
             # password isn't echoed. Piped input (a GUI / script) is unaffected.
             import getpass
+
             return getpass.getpass("password: ")
         line = sys.stdin.readline()
         if not line:
@@ -330,6 +410,7 @@ def _ask_session_choice(console_user: str = "") -> str:
         return "share_console"
     import urllib.request
     import urllib.parse
+
     try:
         data = urllib.parse.urlencode({"console_user": console_user}).encode()
         with urllib.request.urlopen(url, data=data, timeout=60) as r:
@@ -342,8 +423,15 @@ def _ask_session_choice(console_user: str = "") -> str:
 
 # ── logging setup ────────────────────────────────────────────────────
 
+
 def _setup_logging(args: argparse.Namespace) -> None:
-    level = logging.DEBUG if args.verbose else logging.WARNING if args.quiet else logging.INFO
+    level = (
+        logging.DEBUG
+        if args.verbose
+        else logging.WARNING
+        if args.quiet
+        else logging.INFO
+    )
     fmt = logging.Formatter(
         "%(asctime)s.%(msecs)03d %(levelname)-7s %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -368,12 +456,16 @@ def _setup_logging(args: argparse.Namespace) -> None:
 
 # ── config build ─────────────────────────────────────────────────────
 
+
 def _build_session_config(args: argparse.Namespace) -> SessionConfig:
     """Resolve CLI input or saved credentials. Prompt only on a terminal,
     when password authentication was requested without --password-stdin."""
     from . import credentials
+
     if not args.host or not args.user:
-        raise SystemExit("--host and -u/--user are required (run plain `iss` for the connect GUI)")
+        raise SystemExit(
+            "--host and -u/--user are required (run plain `iss` for the connect GUI)"
+        )
     if not 1 <= args.port <= 65535:
         raise SystemExit("--port must be between 1 and 65535")
     cli_password = _password_from_args(args)
@@ -382,8 +474,14 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
             cli_password = credentials.get_password(args.host, args.port, args.user)
         except credentials.CredentialStoreError as error:
             log.warning("%s", error)
-    if not cli_password and args.auth != "kerberos" and not args.password_stdin and sys.stdin.isatty():
+    if (
+        not cli_password
+        and args.auth != "kerberos"
+        and not args.password_stdin
+        and sys.stdin.isatty()
+    ):
         import getpass
+
         cli_password = getpass.getpass("password: ")
     cli_advertise = _parse_advertise(args.advertise)
     # For a fixed --advertise WxH, the --hidpi mode determines the backing
@@ -415,25 +513,44 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
             "No password supplied or saved; enter one, use --password-stdin, "
             "or run plain `iss` for the connect GUI"
         )
+    media_offer = _bitrate_offer(args.video_bitrate_cap_kbps)
     return SessionConfig(
-        host=args.host, port=args.port,
-        username=args.user, password=cli_password or "",
+        host=args.host,
+        port=args.port,
+        username=args.user,
+        password=cli_password or "",
         auth_mode=args.auth,
-        krb_realm=args.krb_realm, krb_principal=args.krb_principal, krb_service=args.krb_service,
-        on_authenticated=(credentials.save_after_auth(
-            args.host, args.port, args.user, cli_password
-        ) if args.remember_password and cli_password else None),
+        krb_realm=args.krb_realm,
+        krb_principal=args.krb_principal,
+        krb_service=args.krb_service,
+        on_authenticated=(
+            credentials.save_after_auth(args.host, args.port, args.user, cli_password)
+            if args.remember_password and cli_password
+            else None
+        ),
         advertise=cli_advertise,
         dynamic_resolution=dynamic_resolution,
         hdr=args.hdr,
         hidpi=args.hidpi,
         curtain=args.curtain,
         audio=args.audio,
-        share_console=args.share_console, alt_session=args.alt_session,
-        on_session_choice=_ask_session_choice if os.environ.get("ISS_SESSION_CHOICE_URL") else None,
+        share_console=args.share_console,
+        alt_session=args.alt_session,
+        on_session_choice=_ask_session_choice
+        if os.environ.get("ISS_SESSION_CHOICE_URL")
+        else None,
         control_socket=args.control_socket,
         record_pcap=args.record,
+        media_offer=media_offer,
     )
+
+
+def _bitrate_offer(kbps: int | None) -> MediaOfferConfig | None:
+    if kbps is None:
+        return None
+    if not 1 <= kbps <= 4_294_967:
+        raise SystemExit("--video-bitrate-cap-kbps must be between 1 and 4294967")
+    return MediaOfferConfig.from_environment().set_video_bitrate(kbps * 1000)
 
 
 # ── mode runners ─────────────────────────────────────────────────────
@@ -450,7 +567,9 @@ def _run_smoke(config: SessionConfig, args: argparse.Namespace) -> int:
     with Session(config) as session:
         log.info(
             "connected: server=%dx%d  canvas=%dx%d  hw=%s",
-            *session.server_dims, *session.canvas_dims, session.hw_accel,
+            *session.server_dims,
+            *session.canvas_dims,
+            session.hw_accel,
         )
         n_tiles = session.num_tiles
         frames_per_tile = [0] * n_tiles
@@ -470,7 +589,9 @@ def _run_smoke(config: SessionConfig, args: argparse.Namespace) -> int:
                 last_report = now
 
         total = sum(frames_per_tile)
-        log.info("smoke complete: %d frames in %ds %s", total, duration, frames_per_tile)
+        log.info(
+            "smoke complete: %d frames in %ds %s", total, duration, frames_per_tile
+        )
         return 0 if total > 0 else 2
 
 
@@ -487,32 +608,44 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
         # unchanged. An explicit --codec / --decoder still wins (env already set).
         if args.codec in (None, "auto") and "ISS_VIDEO_CODEC" not in os.environ:
             from .proxy.media.registry import resolve_codec
+
             if resolve_codec("auto") == "avc":
                 os.environ["ISS_VIDEO_CODEC"] = "avc"
+        if args.video_bitrate_cap_kbps is not None:
+            config.media_offer = _bitrate_offer(args.video_bitrate_cap_kbps)
         from isharescreen.frontend.desktop.app import run as run_desktop
+
         # --display: default (omitted) auto-opens one window per host monitor if
         # the host has more than one; a single-monitor host stays one window with
         # dynamic resolution intact. 'combined' = the old single window showing
         # the whole stacked multi-monitor canvas. 'N' = crop to host monitor N in
         # one window. 'all' = explicit alias for the per-monitor default.
-        display_all = True   # auto per-monitor is the default
+        display_all = True  # auto per-monitor is the default
         display_idx = -1
         if args.display is not None:
             _d = str(args.display).strip().lower()
             if _d == "all":
                 display_all = True
             elif _d == "combined":
-                display_all = False           # whole stacked canvas, one window
+                display_all = False  # whole stacked canvas, one window
             else:
                 try:
                     display_idx = int(args.display)
-                    display_all = False        # crop to one monitor, one window
+                    display_all = False  # crop to one monitor, one window
                 except ValueError:
-                    log.warning("--display %r not understood (want N, 'all', or "
-                                "'combined') — auto-opening one window per "
-                                "monitor", args.display)
-        return run_desktop(config, exit_process=True, auto_quit_secs=args.auto_quit_secs,
-                           display=display_idx, display_all=display_all)
+                    log.warning(
+                        "--display %r not understood (want N, 'all', or "
+                        "'combined') — auto-opening one window per "
+                        "monitor",
+                        args.display,
+                    )
+        return run_desktop(
+            config,
+            exit_process=True,
+            auto_quit_secs=args.auto_quit_secs,
+            display=display_idx,
+            display_all=display_all,
+        )
     # browser (default): H.264 pass-through needs the AVC codec path. The
     # Session reads ISS_VIDEO_CODEC at construction, so force it unless the
     # user explicitly chose a codec.
@@ -528,14 +661,19 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
     # structure of the 4-tile stream (drift/"fleas"); one stream decodes
     # cleanly with one decoder, no compositing.
     os.environ.setdefault("ISS_TILES_PER_FRAME", "1")
+    if args.video_bitrate_cap_kbps is not None:
+        config.media_offer = _bitrate_offer(args.video_bitrate_cap_kbps)
     from isharescreen.frontend.wt.server import run as run_browser
+
     return run_browser(
-        config, port=args.bridge_port,
+        config,
+        port=args.bridge_port,
         trust_cert_for_safari=getattr(args, "trust_cert_for_safari", False),
     )
 
 
 # ── entry point ──────────────────────────────────────────────────────
+
 
 def _apply_video_overrides(args: argparse.Namespace) -> None:
     """Omitted CLI values inherit settings; explicit auto clears an override."""
@@ -546,31 +684,62 @@ def _apply_video_overrides(args: argparse.Namespace) -> None:
         decoder = decoder.strip().lower()
         # Hardware APIs such as d3d11va are not decoder registry IDs.
         normalized = registry.normalize_override(decoder, args.codec or "hevc")
-        if not decoder or (normalized is not None and normalized not in {
-            spec.name for spec in registry.all_specs()
-        }):
+        if not decoder or (
+            normalized is not None
+            and normalized not in {spec.name for spec in registry.all_specs()}
+        ):
             raise ValueError(
                 f"unknown decoder {args.decoder!r}; use --list-decoders "
                 "for supported names (for H.264 use libav-avc420)"
             )
 
     chroma = args.chroma
-    effective_chroma = chroma if chroma is not None else os.environ.get("ISS_VIDEO_CHROMA", "auto")
-    effective_codec = args.codec if args.codec is not None else os.environ.get("ISS_VIDEO_CODEC", "auto")
-    if effective_chroma == "444" and (effective_codec == "avc" or args.frontend == "browser"):
-        raise ValueError("4:4:4 requires the desktop HEVC path; H.264/browser 4:4:4 is not supported")
-    effective_decoder = decoder if decoder is not None else os.environ.get("ISS_DECODER", "auto")
+    effective_chroma = (
+        chroma if chroma is not None else os.environ.get("ISS_VIDEO_CHROMA", "auto")
+    )
+    effective_codec = (
+        args.codec
+        if args.codec is not None
+        else os.environ.get("ISS_VIDEO_CODEC", "auto")
+    )
+    if effective_chroma == "444" and (
+        effective_codec == "avc" or args.frontend == "browser"
+    ):
+        raise ValueError(
+            "4:4:4 requires the desktop HEVC path; H.264/browser 4:4:4 is not supported"
+        )
+    effective_decoder = (
+        decoder if decoder is not None else os.environ.get("ISS_DECODER", "auto")
+    )
     decoder_id = registry.normalize_override(effective_decoder, "hevc")
-    if effective_chroma == "444" and any(spec.name == decoder_id and spec.codec == "avc" for spec in registry.all_specs()):
-        raise ValueError("4:4:4 requires an HEVC decoder; choose Auto or an HEVC decoder")
+    if effective_chroma == "444" and any(
+        spec.name == decoder_id and spec.codec == "avc" for spec in registry.all_specs()
+    ):
+        raise ValueError(
+            "4:4:4 requires an HEVC decoder; choose Auto or an HEVC decoder"
+        )
     if decoder_id == "amd-hevc420":
-        if args.frontend == "browser" or effective_codec == "avc" or effective_chroma == "444":
-            raise ValueError("AMD HEVC requires Desktop, HEVC/Auto codec and 4:2:0/Auto chroma")
+        if (
+            args.frontend == "browser"
+            or effective_codec == "avc"
+            or effective_chroma == "444"
+        ):
+            raise ValueError(
+                "AMD HEVC requires Desktop, HEVC/Auto codec and 4:2:0/Auto chroma"
+            )
         chroma = "420"
         effective_codec = "hevc"
         args.codec = "hevc"
-    codec = "hevc" if effective_chroma == "444" and effective_codec in ("auto", "both") else args.codec
-    for name, value in (("ISS_DECODER", decoder), ("ISS_VIDEO_CODEC", codec), ("ISS_VIDEO_CHROMA", chroma)):
+    codec = (
+        "hevc"
+        if effective_chroma == "444" and effective_codec in ("auto", "both")
+        else args.codec
+    )
+    for name, value in (
+        ("ISS_DECODER", decoder),
+        ("ISS_VIDEO_CODEC", codec),
+        ("ISS_VIDEO_CHROMA", chroma),
+    ):
         if value == "auto":
             os.environ.pop(name, None)
         elif value is not None:
@@ -583,10 +752,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     _setup_logging(args)
     if args.list_decoders:
         from .proxy.media import registry
+
         print(registry.describe())
         return 0
     if args.forget_password:
         from . import credentials
+
         if not args.host or not args.user:
             raise SystemExit("--forget-password requires --host and -u/--user")
         if not 1 <= args.port <= 65535:
@@ -609,12 +780,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     # asyncio task) prints nothing and the process can appear to die
     # silently. Mostly diagnostic.
     import threading
+
     def _thread_excepthook(args):
         log.exception(
             "unhandled exception in thread %s — process state may be compromised",
             args.thread.name if args.thread else "<unknown>",
             exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
         )
+
     threading.excepthook = _thread_excepthook
 
     try:
@@ -628,7 +801,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
 
     try:
-        return _run_smoke(config, args) if args.headless else _run_frontend(config, args)
+        return (
+            _run_smoke(config, args) if args.headless else _run_frontend(config, args)
+        )
     except KeyboardInterrupt:
         log.info("interrupted")
         return 130
@@ -636,6 +811,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         # Bad credentials are a user error, not a bug — clean message,
         # no traceback even in --verbose, distinct exit code.
         from isharescreen.proxy.protocol.auth import AuthError
+
         if isinstance(e, AuthError):
             log.error("authentication failed: %s", e)
             return 2
