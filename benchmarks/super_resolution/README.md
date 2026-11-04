@@ -21,6 +21,8 @@ and training curves remain supplementary validation evidence. See the results re
 - `seven_model_gallery.py`: reference, bicubic and pretrained/fine-tuned PNGs.
 - `benchmark_best_latency.py`: repeated resident-forward timing on RTX 4090.
 - `benchmark_bicubic_latency.py` and `bicubic_quality.py`: no-SR controls.
+- `edsr_cuda/`: optional GPU-resident NVDEC/EDSR build, validation and timing
+  tools; see its [scope and retained measurements](../../docs/analysis/edsr-cuda/README.md).
 - `validation_baselines.py` and related modules: codec and quality evaluation.
 - `text_corpus/`, `low_bandwidth_e2e/`, `mac_readability/`: retained research
   tooling, including historical approaches not used in the final presentation.

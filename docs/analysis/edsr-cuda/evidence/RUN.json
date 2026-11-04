@@ -1,0 +1,103 @@
+{
+  "complete": true,
+  "started": 1793803337.3375037,
+  "jobs": [
+    {
+      "name": "build",
+      "command": [
+        "/home/chen/iShareScreen/.venv/bin/python",
+        "-m",
+        "benchmarks.super_resolution.edsr_cuda.build_native",
+        "--output",
+        "benchmarks/super_resolution/artifacts/edsr-cuda-cleanup-20261104/nvdec.so",
+        "--cuda-include",
+        "/usr/local/cuda-13.4/include"
+      ],
+      "started": 1793803337.3375058,
+      "returncode": 0,
+      "finished": 1793803337.634301
+    },
+    {
+      "name": "quality",
+      "command": [
+        "/home/chen/iShareScreen/.venv/bin/python",
+        "-m",
+        "benchmarks.super_resolution.edsr_cuda.validate",
+        "--output",
+        "benchmarks/super_resolution/artifacts/edsr-cuda-cleanup-20261104/quality.json",
+        "--engine",
+        "research/edsr-packed-state-20261104/engine-byte-cache/edsr.engine",
+        "--engine-sha256",
+        "74f418fb7ad0cd03ae25d6ff701fead1414a6f180e334d13e9281263007dde74",
+        "--validation",
+        "benchmarks/super_resolution/experiments/validation-baselines-2026-10-29",
+        "--native-library",
+        "benchmarks/super_resolution/artifacts/edsr-cuda-cleanup-20261104/nvdec.so",
+        "--expected-gpu-uuid",
+        "GPU-f3d8b210-4eb5-a38b-a81d-983611f83a6a"
+      ],
+      "started": 1793803337.634542,
+      "returncode": 0,
+      "finished": 1793803349.2475715
+    },
+    {
+      "name": "latency-first",
+      "command": [
+        "/home/chen/iShareScreen/.venv/bin/python",
+        "-m",
+        "benchmarks.super_resolution.edsr_cuda.benchmark",
+        "--output",
+        "benchmarks/super_resolution/artifacts/edsr-cuda-cleanup-20261104/latency-first.json",
+        "--samples",
+        "1000",
+        "--fps",
+        "30",
+        "--mode",
+        "inline",
+        "--engine",
+        "research/edsr-packed-state-20261104/engine-byte-cache/edsr.engine",
+        "--engine-sha256",
+        "74f418fb7ad0cd03ae25d6ff701fead1414a6f180e334d13e9281263007dde74",
+        "--validation",
+        "benchmarks/super_resolution/experiments/validation-baselines-2026-10-29",
+        "--native-library",
+        "benchmarks/super_resolution/artifacts/edsr-cuda-cleanup-20261104/nvdec.so",
+        "--expected-gpu-uuid",
+        "GPU-f3d8b210-4eb5-a38b-a81d-983611f83a6a"
+      ],
+      "started": 1793803349.2478588,
+      "returncode": 0,
+      "finished": 1793803388.4332397
+    },
+    {
+      "name": "latency-repeat",
+      "command": [
+        "/home/chen/iShareScreen/.venv/bin/python",
+        "-m",
+        "benchmarks.super_resolution.edsr_cuda.benchmark",
+        "--output",
+        "benchmarks/super_resolution/artifacts/edsr-cuda-cleanup-20261104/latency-repeat.json",
+        "--samples",
+        "1000",
+        "--fps",
+        "30",
+        "--mode",
+        "inline",
+        "--engine",
+        "research/edsr-packed-state-20261104/engine-byte-cache/edsr.engine",
+        "--engine-sha256",
+        "74f418fb7ad0cd03ae25d6ff701fead1414a6f180e334d13e9281263007dde74",
+        "--validation",
+        "benchmarks/super_resolution/experiments/validation-baselines-2026-10-29",
+        "--native-library",
+        "benchmarks/super_resolution/artifacts/edsr-cuda-cleanup-20261104/nvdec.so",
+        "--expected-gpu-uuid",
+        "GPU-f3d8b210-4eb5-a38b-a81d-983611f83a6a"
+      ],
+      "started": 1793803388.4335577,
+      "returncode": 0,
+      "finished": 1793803427.596292
+    }
+  ],
+  "finished": 1793803427.5966678
+}

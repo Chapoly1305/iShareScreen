@@ -1,0 +1,26 @@
+{
+  "command": [
+    "g++",
+    "-std=c++17",
+    "-O3",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-shared",
+    "-fPIC",
+    "-I/usr/local/cuda-13.4/include",
+    "-I/home/chen/iShareScreen/src/isharescreen/enhancement/native/include",
+    "/home/chen/iShareScreen/src/isharescreen/enhancement/native/nvdec.cpp",
+    "-l:libcuda.so.1",
+    "-l:libnvcuvid.so.1",
+    "-o",
+    "benchmarks/super_resolution/artifacts/edsr-cuda-cleanup-20261104/nvdec.so"
+  ],
+  "files": {
+    "/home/chen/iShareScreen/src/isharescreen/enhancement/native/nvdec.cpp": "6862d29fb1bf8a6ecd1118973822b9b109beb49f7a3a776c87eb5642f2d9483e",
+    "/home/chen/iShareScreen/src/isharescreen/enhancement/native/include/nvcuvid.h": "77c9799f05f2cab54812a8310a609c0d61f3763e5b1d2dbb25a8fa4c002d32e3",
+    "/home/chen/iShareScreen/src/isharescreen/enhancement/native/include/cuviddec.h": "8a81af15fc86cda83c10fea74ca56f2bf3738c1fa3f66b64c86ae2bcd96af000",
+    "/usr/local/cuda-13.4/include/cuda.h": "7a79d67ca888061b1dfbe4739b51ad64f85a2f3ad874947ce09b2c635b4c7072",
+    "benchmarks/super_resolution/artifacts/edsr-cuda-cleanup-20261104/nvdec.so": "d4da738825feb29db1e42e35dc868cf832f5c96631f8fdad5eab3a7b5e394ed2"
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "checkpoint_sha256": "2c923e9ba9541cb85006684c0072868b2d71354d665cdd85cd2b0baac6faaabb",
+  "engine_sha256": "74f418fb7ad0cd03ae25d6ff701fead1414a6f180e334d13e9281263007dde74",
+  "engine_precision": "30 convolutions INT8, remaining final block/projection/tail FP16; byte-coded residual correction state",
+  "mode": "inline",
+  "frames_per_run": 1000,
+  "fps": 30,
+  "p95_ms": [
+    10.351915436331183,
+    10.369873011950403
+  ],
+  "frozen_quality_frames": 72,
+  "ownership": {
+    "native_callback_inflight_rejected": true,
+    "output_reservation_before_decode": true,
+    "two_slot_bound": true,
+    "held_output_preserved": true,
+    "stale_mapping_rejected": true,
+    "close_with_live_lease_rejected": true,
+    "graph_cache_eviction_and_rebind": true,
+    "partial_launch_failure_cleanup": true,
+    "recovery_with_new_decoder": true,
+    "delayed_callback_input_reuse_event": true
+  },
+  "ticket_checks": {
+    "single_reservation_bound": true,
+    "close_reserved_rejected": true,
+    "decoder_close_reserved_rejected": true,
+    "bypass_decode_rejected": true,
+    "foreign_and_stale_ticket_rejected": true,
+    "producer_thread_enforced": true,
+    "cancellation_reclaims_output": true,
+    "invalid_packet_cancels_without_poison": true,
+    "wrong_context_rejected_before_native_work": true,
+    "context_recovery": true,
+    "delayed_consumer_blocks_reuse": true,
+    "eos_releases_reservation": true
+  },
+  "source_sha256": {
+    "src/isharescreen/enhancement/cuda_kernels.py": "58f5a0a1418d4bc6fc3b3c97fbc4f2f1bde664e27b1586c340e47863021313f1",
+    "src/isharescreen/enhancement/cuda_surface.py": "7cbb3431ca65706c6ff45ae43c5c80a6df64692f84ecc1796cb1130c62f23b14",
+    "src/isharescreen/enhancement/cuda_native.py": "e7c60879b95860d7467e752a0e54615c90bc135928eca87ae6e76b0acb9c1b7f",
+    "src/isharescreen/enhancement/cuda_native_kernels.py": "77e051f308dc48fec171d856e9da6faad2aa3900253372f9581015fbd498ec7e",
+    "src/isharescreen/enhancement/cuda_decoder.py": "be814016d6afab1457f24df67e3e90b402b1456e9f02ef035e611ee996b94028",
+    "src/isharescreen/enhancement/native/nvdec.cpp": "6862d29fb1bf8a6ecd1118973822b9b109beb49f7a3a776c87eb5642f2d9483e",
+    "src/isharescreen/enhancement/native/NOTICE": "a343f5357abdf3f37a3ca7fd691b678dc6d53b3e63389987939f308ea53fd659",
+    "src/isharescreen/enhancement/native/include/nvcuvid.h": "77c9799f05f2cab54812a8310a609c0d61f3763e5b1d2dbb25a8fa4c002d32e3",
+    "src/isharescreen/enhancement/native/include/cuviddec.h": "8a81af15fc86cda83c10fea74ca56f2bf3738c1fa3f66b64c86ae2bcd96af000",
+    "benchmarks/super_resolution/edsr_cuda/__init__.py": "f2da89f91264d5f7a1814156a90c94f15d8840391ddc47113b93c69d2b874ade",
+    "benchmarks/super_resolution/edsr_cuda/benchmark.py": "c700b9c5c556f47fa1f0da09f710ce25a471c34973f031fb5f269f08cce9b631",
+    "benchmarks/super_resolution/edsr_cuda/telemetry.py": "d22ca89321a89b00083f8f658028684560267dcc3a19a7b7a5bfc147c870ad4e",
+    "benchmarks/super_resolution/edsr_cuda/validate.py": "355ac68b4000398cad52cb3320149b0ca05ffcdb1bb52b8409648be59cd94381",
+    "benchmarks/super_resolution/edsr_cuda/ownership.py": "f37355a9f9bea8381f9751208ae5575c6a5eff999439f3ad9580d6f8e993a00c",
+    "benchmarks/super_resolution/edsr_cuda/ticket_checks.py": "d3715371b0e2486e6ff1d3e4ebcd652255a460d317fef03ac2ae3b79f8e81392",
+    "benchmarks/super_resolution/edsr_cuda/common.py": "30fffa9ba31cf0eedcbe759438dc9f38e72d96faafdc27cc78cf4f77000998c2",
+    "benchmarks/super_resolution/edsr_cuda/build_native.py": "c6a9e9c2e4d50b6495f3b05e3bebc144399cf677e2422922f97cbe0dc999f064"
+  },
+  "scope": "Compressed packet submit -> GPU decode/color -> native GPU mapping -> EDSR -> GPU RGBA1080 -> consumer stream handoff/release. No CPU pixels during measurement. Includes mapped-surface release after readers complete. Excludes demux/network/pacing/presentation/encode. Complete HEVC access units explicitly marked end-of-picture. Same-packet output verified by PTS. Separate same-frame PTS-matched age under controlled 30fps arrival; excludes network/demux/presentation.",
+  "limitations": [
+    "Not integrated with the desktop renderer; no actual display or Mac latency measured.",
+    "72-frame exact comparison is against the accepted mixed-precision engine, not FP32.",
+    "Not a new evaluation on the held-out CodeSCAN test set.",
+    "Whole-engine TensorRT sanitizer diagnostics from earlier investigation remain unresolved.",
+    "Does not establish a stable sub-10ms GPU pipeline."
+  ]
+}

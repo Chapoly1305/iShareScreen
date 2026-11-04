@@ -1,0 +1,10 @@
+nvcuvid.h and cuviddec.h are unmodified NVIDIA headers from PyNvVideoCodec 2.2.3.
+Their full MIT license notices are retained in the headers.
+
+Upstream package: https://catalog.ngc.nvidia.com/orgs/nvidia/resources/pynvvideocodec/files
+Package SHA256: 29f7c0694d683266c563aca9a4f8e979ba0c5dce8f0ccc1efe500073e0948be0
+nvcuvid.h SHA256: 77c9799f05f2cab54812a8310a609c0d61f3763e5b1d2dbb25a8fa4c002d32e3
+cuviddec.h SHA256: 8a81af15fc86cda83c10fea74ca56f2bf3738c1fa3f66b64c86ae2bcd96af000
+
+nvdec.cpp is the project-authored, fixed-format lifetime wrapper. This module
+uses the installed NVIDIA driver libraries; it does not replace PyNvVideoCodec.

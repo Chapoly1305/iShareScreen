@@ -37,3 +37,11 @@ datasets/**
 !datasets/prepare_splits.py
 !datasets/split_codescan.py
 /codescan.zip
+
+# Frozen local profiling outputs (engines, captures, caches and downloaded SDKs).
+# Keep the original exploratory source archive; the maintained CUDA runtime and
+# reproducible checks live under src/ and benchmarks/super_resolution/edsr_cuda/.
+/research/*
+!/research/README.md
+!/research/edsr-source-archive-20261104/
+/src/isharescreen/enhancement/native/*.so

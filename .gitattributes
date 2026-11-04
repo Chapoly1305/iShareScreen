@@ -1,0 +1,4 @@
+# Keep vendored SDK headers and frozen research sources byte-identical to their
+# recorded SHA256 values, including original line endings and whitespace.
+/src/isharescreen/enhancement/native/include/*.h -text whitespace=-blank-at-eol,-blank-at-eof,cr-at-eol
+/research/edsr-source-archive-20261104/source/** -text
