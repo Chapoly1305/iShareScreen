@@ -31,6 +31,20 @@ def stats(values):
     )
 
 
+def reference_resize(native, *, quantize_first=False):
+    """Independent CPU 1440-to-1080 reference; input HWC float RGB in 0..255 units.
+
+    Values may exceed that range. Preserve them until after resizing unless
+    explicitly reproducing the historical RGB8-first output protocol.
+    """
+    import cv2
+
+    if quantize_first:
+        native = np.clip(np.rint(native), 0, 255).astype(np.uint8)
+    resized = cv2.resize(native, (1920, 1080), interpolation=cv2.INTER_AREA)
+    return np.clip(np.rint(resized), 0, 255).astype(np.uint8)
+
+
 def guard():
     """Require the explicitly selected physical device and exclusive compute."""
     expected = os.environ.get("ISS_EXPECTED_GPU_UUID")

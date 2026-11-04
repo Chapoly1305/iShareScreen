@@ -1,0 +1,1089 @@
+{
+  "complete": true,
+  "gpu": "NVIDIA GeForce RTX 4090, GPU-f3d8b210-4eb5-a38b-a81d-983611f83a6a, 595.99.02, 39, 17.75 W, 210 MHz, 345 MiB",
+  "engine_sha256": "74f418fb7ad0cd03ae25d6ff701fead1414a6f180e334d13e9281263007dde74",
+  "frames": [
+    {
+      "clip": "2026-10-15_17-44-40",
+      "frame": 163,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 28.339974019602433,
+        "legacy": 28.30870727876167,
+        "fp32": 28.342158133574046,
+        "amp": 28.34284667609912
+      }
+    },
+    {
+      "clip": "2026-10-15_17-44-40",
+      "frame": 326,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 25.16245327649415,
+        "legacy": 25.16865641306786,
+        "fp32": 25.164674476836577,
+        "amp": 25.165163333751007
+      }
+    },
+    {
+      "clip": "2026-10-15_17-44-40",
+      "frame": 489,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 27.14258711598184,
+        "legacy": 27.116585193062683,
+        "fp32": 27.142461344106927,
+        "amp": 27.14274524373769
+      }
+    },
+    {
+      "clip": "2026-10-15_17-54-06",
+      "frame": 295,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 30.407365066809827,
+        "legacy": 30.334138300355093,
+        "fp32": 30.410154058779003,
+        "amp": 30.409499327737596
+      }
+    },
+    {
+      "clip": "2026-10-15_17-54-06",
+      "frame": 590,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 25.572844487089025,
+        "legacy": 25.52985385839262,
+        "fp32": 25.57563861728104,
+        "amp": 25.575250349671173
+      }
+    },
+    {
+      "clip": "2026-10-15_17-54-06",
+      "frame": 885,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 30.486893300354296,
+        "legacy": 29.955420886338565,
+        "fp32": 30.496649206372073,
+        "amp": 30.495965527631768
+      }
+    },
+    {
+      "clip": "2026-10-15_17-54-52",
+      "frame": 341,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 24.806321109671345,
+        "legacy": 24.759648520786662,
+        "fp32": 24.807706021399063,
+        "amp": 24.80823911147619
+      }
+    },
+    {
+      "clip": "2026-10-15_17-54-52",
+      "frame": 682,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 20.289206073872887,
+        "legacy": 20.288420803467908,
+        "fp32": 20.29068121511107,
+        "amp": 20.290758140428537
+      }
+    },
+    {
+      "clip": "2026-10-15_17-54-52",
+      "frame": 1023,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 21.071572224421335,
+        "legacy": 21.075820472225175,
+        "fp32": 21.073323986296842,
+        "amp": 21.073723312498576
+      }
+    },
+    {
+      "clip": "2026-10-15_18-03-53",
+      "frame": 264,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 36.91780771818547,
+        "legacy": 36.62703451691623,
+        "fp32": 36.90571939663422,
+        "amp": 36.904510423251615
+      }
+    },
+    {
+      "clip": "2026-10-15_18-03-53",
+      "frame": 529,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 37.581527433418586,
+        "legacy": 37.21073395903533,
+        "fp32": 37.57711844024211,
+        "amp": 37.5751738311418
+      }
+    },
+    {
+      "clip": "2026-10-15_18-03-53",
+      "frame": 794,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 36.28874558934481,
+        "legacy": 36.05934775310767,
+        "fp32": 36.275818585878994,
+        "amp": 36.274676333859894
+      }
+    },
+    {
+      "clip": "2026-10-15_18-04-56",
+      "frame": 238,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 37.81122142011485,
+        "legacy": 37.38467078554657,
+        "fp32": 37.80634393124272,
+        "amp": 37.804507525411594
+      }
+    },
+    {
+      "clip": "2026-10-15_18-04-56",
+      "frame": 476,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 37.78999255119626,
+        "legacy": 37.36455594747083,
+        "fp32": 37.7865487432331,
+        "amp": 37.78473480500074
+      }
+    },
+    {
+      "clip": "2026-10-15_18-04-56",
+      "frame": 714,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 37.77415682500683,
+        "legacy": 37.35436754349002,
+        "fp32": 37.763042729711316,
+        "amp": 37.76121402357623
+      }
+    },
+    {
+      "clip": "2026-10-15_18-05-44",
+      "frame": 214,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 37.129366407120926,
+        "legacy": 36.786106025661276,
+        "fp32": 37.116696808086644,
+        "amp": 37.115390197197755
+      }
+    },
+    {
+      "clip": "2026-10-15_18-05-44",
+      "frame": 429,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 35.78202041356605,
+        "legacy": 35.56451371101704,
+        "fp32": 35.77538702403064,
+        "amp": 35.77494910283847
+      }
+    },
+    {
+      "clip": "2026-10-15_18-05-44",
+      "frame": 643,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 37.31375398606074,
+        "legacy": 36.95196749599714,
+        "fp32": 37.31093089228346,
+        "amp": 37.30985583070896
+      }
+    },
+    {
+      "clip": "2026-10-15_18-06-48",
+      "frame": 225,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 37.47309071042175,
+        "legacy": 37.08069932409556,
+        "fp32": 37.46600945316827,
+        "amp": 37.46457420143494
+      }
+    },
+    {
+      "clip": "2026-10-15_18-06-48",
+      "frame": 451,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 37.066820414026395,
+        "legacy": 36.716680210989225,
+        "fp32": 37.053091062045674,
+        "amp": 37.051279891584755
+      }
+    },
+    {
+      "clip": "2026-10-15_18-06-48",
+      "frame": 677,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 36.42585762691207,
+        "legacy": 36.147823023266085,
+        "fp32": 36.41708792983507,
+        "amp": 36.415815252524276
+      }
+    },
+    {
+      "clip": "2026-10-15_18-09-37",
+      "frame": 291,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 35.81725432588124,
+        "legacy": 34.2196306795819,
+        "fp32": 35.83147534781196,
+        "amp": 35.82829549063568
+      }
+    },
+    {
+      "clip": "2026-10-15_18-09-37",
+      "frame": 582,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 34.757068740686265,
+        "legacy": 33.53800677421529,
+        "fp32": 34.76875758507097,
+        "amp": 34.765925803574376
+      }
+    },
+    {
+      "clip": "2026-10-15_18-09-37",
+      "frame": 873,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 34.512911056444075,
+        "legacy": 33.36241942030536,
+        "fp32": 34.52422257665337,
+        "amp": 34.521729558346095
+      }
+    },
+    {
+      "clip": "2026-10-15_18-12-03",
+      "frame": 240,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 31.74987422922092,
+        "legacy": 31.43784791068211,
+        "fp32": 31.75791960652571,
+        "amp": 31.756270146089015
+      }
+    },
+    {
+      "clip": "2026-10-15_18-12-03",
+      "frame": 480,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 31.726395213413724,
+        "legacy": 31.418896900814094,
+        "fp32": 31.73320981004865,
+        "amp": 31.732100649746656
+      }
+    },
+    {
+      "clip": "2026-10-15_18-12-03",
+      "frame": 720,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 31.74096650039899,
+        "legacy": 31.431990129677573,
+        "fp32": 31.74997151197681,
+        "amp": 31.74668044968255
+      }
+    },
+    {
+      "clip": "2026-10-15_18-12-43",
+      "frame": 251,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 34.827432714587516,
+        "legacy": 33.97163009392284,
+        "fp32": 34.83754642065501,
+        "amp": 34.835410827595624
+      }
+    },
+    {
+      "clip": "2026-10-15_18-12-43",
+      "frame": 503,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 35.51034426710401,
+        "legacy": 34.49633383224058,
+        "fp32": 35.52192457516793,
+        "amp": 35.519329690360074
+      }
+    },
+    {
+      "clip": "2026-10-15_18-12-43",
+      "frame": 755,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 35.98421749083777,
+        "legacy": 34.84573099822354,
+        "fp32": 35.9914651112854,
+        "amp": 35.98839982458117
+      }
+    },
+    {
+      "clip": "2026-10-15_18-13-40",
+      "frame": 273,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 35.42616557946384,
+        "legacy": 34.70957031489319,
+        "fp32": 35.45103895467018,
+        "amp": 35.44727561338454
+      }
+    },
+    {
+      "clip": "2026-10-15_18-13-40",
+      "frame": 546,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 33.51577491884326,
+        "legacy": 33.09120121533044,
+        "fp32": 33.53089583157646,
+        "amp": 33.52864087281297
+      }
+    },
+    {
+      "clip": "2026-10-15_18-13-40",
+      "frame": 819,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 35.7017710465155,
+        "legacy": 34.930829294937816,
+        "fp32": 35.72541488407785,
+        "amp": 35.72115360888666
+      }
+    },
+    {
+      "clip": "2026-10-15_18-14-29",
+      "frame": 248,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 33.296470885390065,
+        "legacy": 32.89139793799444,
+        "fp32": 33.3180618093847,
+        "amp": 33.31686378590583
+      }
+    },
+    {
+      "clip": "2026-10-15_18-14-29",
+      "frame": 497,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 34.03811253621101,
+        "legacy": 33.5333368364465,
+        "fp32": 34.05966792474476,
+        "amp": 34.05841993102992
+      }
+    },
+    {
+      "clip": "2026-10-15_18-14-29",
+      "frame": 745,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 34.524938495602065,
+        "legacy": 33.94911167311022,
+        "fp32": 34.54313166990172,
+        "amp": 34.540651020270246
+      }
+    },
+    {
+      "clip": "2026-10-15_18-15-05",
+      "frame": 240,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 30.28254046670134,
+        "legacy": 30.08660151812127,
+        "fp32": 30.286797807748968,
+        "amp": 30.28680137470749
+      }
+    },
+    {
+      "clip": "2026-10-15_18-15-05",
+      "frame": 480,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 30.31211904571434,
+        "legacy": 30.11510713327318,
+        "fp32": 30.31509474401403,
+        "amp": 30.314994471478386
+      }
+    },
+    {
+      "clip": "2026-10-15_18-15-05",
+      "frame": 720,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 30.301985725139357,
+        "legacy": 30.104577389071135,
+        "fp32": 30.30491455549129,
+        "amp": 30.304792531836977
+      }
+    },
+    {
+      "clip": "2026-10-15_18-15-48",
+      "frame": 244,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 32.14592222726067,
+        "legacy": 31.78040035116419,
+        "fp32": 32.15631454706632,
+        "amp": 32.15676589777545
+      }
+    },
+    {
+      "clip": "2026-10-15_18-15-48",
+      "frame": 488,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 33.08447421954541,
+        "legacy": 32.596291685049536,
+        "fp32": 33.097374029183456,
+        "amp": 33.096669712637066
+      }
+    },
+    {
+      "clip": "2026-10-15_18-15-48",
+      "frame": 732,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 33.46484871208638,
+        "legacy": 32.9174310474627,
+        "fp32": 33.4791011421208,
+        "amp": 33.47789550773841
+      }
+    },
+    {
+      "clip": "2026-10-15_18-16-34",
+      "frame": 247,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 33.65456637951653,
+        "legacy": 33.2242389632906,
+        "fp32": 33.66804475434183,
+        "amp": 33.66632514544789
+      }
+    },
+    {
+      "clip": "2026-10-15_18-16-34",
+      "frame": 495,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 34.471026411869595,
+        "legacy": 33.93174705635219,
+        "fp32": 34.49688708346057,
+        "amp": 34.49452436035123
+      }
+    },
+    {
+      "clip": "2026-10-15_18-16-34",
+      "frame": 743,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 34.949169426411004,
+        "legacy": 34.33516622404542,
+        "fp32": 34.97201338764955,
+        "amp": 34.96953230261431
+      }
+    },
+    {
+      "clip": "2026-10-15_18-17-51",
+      "frame": 248,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 33.7957915329596,
+        "legacy": 33.35073288350169,
+        "fp32": 33.81165976878799,
+        "amp": 33.80971284245089
+      }
+    },
+    {
+      "clip": "2026-10-15_18-17-51",
+      "frame": 497,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 34.603447619052034,
+        "legacy": 34.03527862235363,
+        "fp32": 34.618123350048585,
+        "amp": 34.615042203720535
+      }
+    },
+    {
+      "clip": "2026-10-15_18-17-51",
+      "frame": 745,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 35.07597244015878,
+        "legacy": 34.435463042950815,
+        "fp32": 35.09992343391533,
+        "amp": 35.096450452565186
+      }
+    },
+    {
+      "clip": "2026-10-15_18-18-30",
+      "frame": 249,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 33.89760204045849,
+        "legacy": 33.43368363261695,
+        "fp32": 33.91206448945489,
+        "amp": 33.91067763777288
+      }
+    },
+    {
+      "clip": "2026-10-15_18-18-30",
+      "frame": 498,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 34.69708543283371,
+        "legacy": 34.118930467329854,
+        "fp32": 34.713201292004015,
+        "amp": 34.710401364265735
+      }
+    },
+    {
+      "clip": "2026-10-15_18-18-30",
+      "frame": 747,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 35.12330850345112,
+        "legacy": 34.478065087887884,
+        "fp32": 35.14646798228904,
+        "amp": 35.14309780723376
+      }
+    },
+    {
+      "clip": "2026-10-15_18-19-08",
+      "frame": 250,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 34.01925825235737,
+        "legacy": 33.54457732619204,
+        "fp32": 34.034795944186214,
+        "amp": 34.03316579987472
+      }
+    },
+    {
+      "clip": "2026-10-15_18-19-08",
+      "frame": 501,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 33.814363531946185,
+        "legacy": 33.168229900715886,
+        "fp32": 33.82262561588351,
+        "amp": 33.82063107055393
+      }
+    },
+    {
+      "clip": "2026-10-15_18-19-08",
+      "frame": 752,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 28.66361826390471,
+        "legacy": 28.70150723340567,
+        "fp32": 28.66838397685089,
+        "amp": 28.668119956520385
+      }
+    },
+    {
+      "clip": "2026-10-15_18-19-47",
+      "frame": 304,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 27.528715354639953,
+        "legacy": 27.578416778976276,
+        "fp32": 27.536053074540856,
+        "amp": 27.535707366122907
+      }
+    },
+    {
+      "clip": "2026-10-15_18-19-47",
+      "frame": 608,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 28.38715782898905,
+        "legacy": 28.428605484528397,
+        "fp32": 28.392896253053014,
+        "amp": 28.39272939002743
+      }
+    },
+    {
+      "clip": "2026-10-15_18-19-47",
+      "frame": 912,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 32.11397745100314,
+        "legacy": 32.1097603513111,
+        "fp32": 32.124632929741416,
+        "amp": 32.124467922902205
+      }
+    },
+    {
+      "clip": "2026-10-15_18-20-32",
+      "frame": 320,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 27.983377315487413,
+        "legacy": 27.98154455582622,
+        "fp32": 27.98498609490761,
+        "amp": 27.984381986079878
+      }
+    },
+    {
+      "clip": "2026-10-15_18-20-32",
+      "frame": 640,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 28.030391156287525,
+        "legacy": 27.43953929892791,
+        "fp32": 28.030854208349165,
+        "amp": 28.028187418674804
+      }
+    },
+    {
+      "clip": "2026-10-15_18-20-32",
+      "frame": 960,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 17.29055783250876,
+        "legacy": 17.290131145604462,
+        "fp32": 17.290990747273252,
+        "amp": 17.291456487563693
+      }
+    },
+    {
+      "clip": "2026-10-15_18-21-29",
+      "frame": 379,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 24.78938909533159,
+        "legacy": 24.4935408265721,
+        "fp32": 24.79425194595445,
+        "amp": 24.794228774564854
+      }
+    },
+    {
+      "clip": "2026-10-15_18-21-29",
+      "frame": 759,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 24.758549204976998,
+        "legacy": 24.46990348727333,
+        "fp32": 24.763132639481995,
+        "amp": 24.762806902540117
+      }
+    },
+    {
+      "clip": "2026-10-15_18-21-29",
+      "frame": 1139,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 26.59847614368886,
+        "legacy": 26.3723442422608,
+        "fp32": 26.601838020009097,
+        "amp": 26.600779689691628
+      }
+    },
+    {
+      "clip": "2026-10-15_18-22-33",
+      "frame": 470,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 31.61605261008125,
+        "legacy": 30.66721628902105,
+        "fp32": 31.622129432855406,
+        "amp": 31.620276528791425
+      }
+    },
+    {
+      "clip": "2026-10-15_18-22-33",
+      "frame": 941,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 34.44262024361275,
+        "legacy": 33.55306281876985,
+        "fp32": 34.45368630767748,
+        "amp": 34.45021982479211
+      }
+    },
+    {
+      "clip": "2026-10-15_18-22-33",
+      "frame": 1412,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 32.938134418309886,
+        "legacy": 32.21450505353049,
+        "fp32": 32.94715438680486,
+        "amp": 32.94540064101493
+      }
+    },
+    {
+      "clip": "2026-10-15_18-25-36",
+      "frame": 349,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 32.34352463927443,
+        "legacy": 30.775647728355366,
+        "fp32": 32.356192227040516,
+        "amp": 32.35365928501411
+      }
+    },
+    {
+      "clip": "2026-10-15_18-25-36",
+      "frame": 699,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 23.41575503200122,
+        "legacy": 23.341986514096998,
+        "fp32": 23.418529603888224,
+        "amp": 23.419489088815904
+      }
+    },
+    {
+      "clip": "2026-10-15_18-25-36",
+      "frame": 1049,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 29.39936153320877,
+        "legacy": 28.375118107713572,
+        "fp32": 29.407021620135176,
+        "amp": 29.40491157993279
+      }
+    },
+    {
+      "clip": "2026-10-15_18-26-43",
+      "frame": 363,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 36.14258665062061,
+        "legacy": 36.20215254552243,
+        "fp32": 36.093968344895046,
+        "amp": 36.078301767520585
+      }
+    },
+    {
+      "clip": "2026-10-15_18-26-43",
+      "frame": 727,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 25.93883446463147,
+        "legacy": 25.948536667625348,
+        "fp32": 25.939978350224962,
+        "amp": 25.932800793075515
+      }
+    },
+    {
+      "clip": "2026-10-15_18-26-43",
+      "frame": 1091,
+      "input_bit_exact": true,
+      "rgba_bit_exact": true,
+      "graph_cache_addresses": 1,
+      "callback_launched": true,
+      "psnr": {
+        "optimized": 26.16072139976969,
+        "legacy": 26.17504138630613,
+        "fp32": 26.161079317826758,
+        "amp": 26.156494620332637
+      }
+    }
+  ],
+  "ownership": {
+    "native_callback_inflight_rejected": true,
+    "output_reservation_before_decode": true,
+    "two_slot_bound": true,
+    "held_output_preserved": true,
+    "stale_mapping_rejected": true,
+    "close_with_live_lease_rejected": true,
+    "graph_cache_eviction_and_rebind": true,
+    "partial_launch_failure_cleanup": true,
+    "recovery_with_new_decoder": true,
+    "delayed_callback_input_reuse_event": true
+  },
+  "runtime_sha256": "e7c60879b95860d7467e752a0e54615c90bc135928eca87ae6e76b0acb9c1b7f",
+  "script_sha256": "ff53054744df1ed4f8c390d1d03b5c976303fe1a411038f43458d487e0ca1637",
+  "decoder_source_sha256": "be814016d6afab1457f24df67e3e90b402b1456e9f02ef035e611ee996b94028",
+  "native_library_sha256": "d4da738825feb29db1e42e35dc868cf832f5c96631f8fdad5eab3a7b5e394ed2",
+  "surface_source_sha256": "ac54cf9e2dd2333a58c0d4fff199f1401158fe31e17a2a6ed4ae4a3d0383c087",
+  "kernel_sha256": "4c6943ac2b5a7af20575eb7392e44901a04641ff16748a8daa40f7aee631d61e",
+  "output_transform": "float_area_then_round_clip_rgb8",
+  "input_manifest_sha256": "f77a4d56927713580cdbe4c6ce0af267e208e47ac8a8b1893382cfd218915a61",
+  "quality_reference": {
+    "checkpoint_sha256": "2c923e9ba9541cb85006684c0072868b2d71354d665cdd85cd2b0baac6faaabb",
+    "tf32": false,
+    "scope": "Same actual NVDEC RGB input and float Area output for mixed engine, FP32 and AMP. Paired legacy output uses the same engine output. 72 Mac development frames; no test data.",
+    "mean_psnr_loss_limit_db": 0.05,
+    "worst_frame_psnr_loss_limit_db": 0.1
+  },
+  "tickets": {
+    "single_reservation_bound": true,
+    "close_reserved_rejected": true,
+    "decoder_close_reserved_rejected": true,
+    "bypass_decode_rejected": true,
+    "foreign_and_stale_ticket_rejected": true,
+    "producer_thread_enforced": true,
+    "cancellation_reclaims_output": true,
+    "invalid_packet_cancels_without_poison": true,
+    "wrong_context_rejected_before_native_work": true,
+    "context_recovery": true,
+    "delayed_consumer_blocks_reuse": true,
+    "eos_releases_reservation": true
+  },
+  "callback_launches": 104,
+  "cold_launches": 6,
+  "graph_builds": 14,
+  "mean_psnr": {
+    "optimized": 31.916646644111974,
+    "legacy": 31.491510678922687,
+    "fp32": 31.9225709595119,
+    "amp": 31.920832225298152
+  },
+  "quality_deltas": {
+    "legacy": {
+      "mean_delta": 0.42513596518928504,
+      "worst_delta": -0.05956589490182296,
+      "best_delta": 1.5976236462993398,
+      "improved_frames": 64,
+      "regressed_frames": 8
+    },
+    "fp32": {
+      "mean_delta": -0.005924315399927573,
+      "worst_delta": -0.02586067159097638,
+      "best_delta": 0.048618305725561584,
+      "improved_frames": 14,
+      "regressed_frames": 58
+    },
+    "amp": {
+      "mean_delta": -0.004185581186176821,
+      "worst_delta": -0.023497948481633557,
+      "best_delta": 0.06428488310002223,
+      "improved_frames": 16,
+      "regressed_frames": 56
+    }
+  },
+  "quality_gate_passed": true
+}

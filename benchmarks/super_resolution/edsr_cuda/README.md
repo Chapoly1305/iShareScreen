@@ -6,6 +6,17 @@ not a registered desktop renderer backend. See the
 [measurement report](../../../docs/analysis/edsr-cuda/README.md) for results,
 engine identity and limitations.
 
+The runtime now uses float Area resize before final RGB8 rounding/clipping.
+The [adoption report](../../../docs/analysis/edsr-cuda/FLOAT-AREA-RUNTIME.zh-CN.md)
+records the real-NVDEC quality gate and latency reruns. The kernel retains its
+legacy specialization for earlier benchmark scripts; the runtime explicitly
+selects `QUANTIZE_FIRST=False`.
+
+For model versus pipeline timings, the 30 INT8 / 6 FP16 layer map, calibration
+and reviewer questions, read the [审稿式说明](../../../docs/analysis/edsr-cuda/REVIEW.zh-CN.md).
+Historical summary evidence is included there; rebuilding the accepted engine
+still requires the archived inputs and dependencies, not just these runtime checks.
+
 ## Requirements
 
 Use the project environment (`source dev-environment.sh`). The validated stack
@@ -47,6 +58,12 @@ and resize reference using the accepted engine. It also checks mapped-input
 reuse, held outputs, cache eviction, errors after native launch, cancellation,
 wrong contexts, EOS and delayed consumers. Reference pixel downloads happen
 only in correctness checks, outside timing.
+
+For same-input FP32/AMP quality gates, also pass `--reference-checkpoint` with
+the frozen EDSR checkpoint (SHA256
+`2c923e9ba9541cb85006684c0072868b2d71354d665cdd85cd2b0baac6faaabb`).
+All model references then use the same float Area output protocol. Both modes
+record paired PSNR for the engine's new and historical resize protocols.
 
 Then measure the preferred `inline` submission path:
 
@@ -94,6 +111,17 @@ slot and must be submitted once or cancelled. Close all leases/tickets and
 release the input mapping before closing the runtime and decoder.
 
 ## Historical investigation
+
+The optional `compare_resize.py` and `compare_resize_graph.py` experiments
+compare output filters without changing the runtime. See the
+[resize report](../../../docs/analysis/edsr-cuda/RESIZE.zh-CN.md) for the frozen
+inputs, precise filter definitions, environment, commands and raw evidence.
+
+`compare_render_delivery.py` follows the same engine output through the actual
+desktop Renderer into a 1080p offscreen target. Its
+[delivery report](../../../docs/analysis/edsr-cuda/RENDER-DELIVERY.zh-CN.md)
+separates CUDA packing, resident-texture GPU drawing and the current CPU upload
+bridge. No product renderer or CUDA/WGPU interop integration is changed.
 
 Original profiling and engine-builder sources are retained byte for byte in
 the [source archive](../../../research/edsr-source-archive-20261104/README.md).

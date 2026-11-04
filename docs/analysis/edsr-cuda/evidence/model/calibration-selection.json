@@ -1,0 +1,11 @@
+{
+  "source": "research/inference-optimization-20261104/trt/int8-level5/CALIBRATION.json",
+  "source_sha256": "9061acffe2a56213c2ac3eee39e7df3a92b470c89038d545ea9f544f0a9580c8",
+  "extraction": "Summary fields only; raw samples, per-frame records, maxima and telemetry omitted. Historical status fields retained verbatim.",
+  "data": {
+    "source_sha256": "5fefca461bf1f4cb95a454bf20d7d12b87aa5d13b999816d1d73c93527758a3b",
+    "split": "train",
+    "count": 72,
+    "selection": "First three IDs in each language, sorted deterministically; no quality-based selection"
+  }
+}

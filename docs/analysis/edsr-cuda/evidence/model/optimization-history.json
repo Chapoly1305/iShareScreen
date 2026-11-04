@@ -1,0 +1,237 @@
+{
+  "source": "research/inference-optimization-20261104/SUMMARY.json",
+  "source_sha256": "1d4d9398a9fea266f79305488a42e5892073d9224e784426960d5d9b59dbf3d3",
+  "extraction": "Summary fields only; raw samples, per-frame records, maxima and telemetry omitted. Historical status fields retained verbatim.",
+  "data": {
+    "best_quality_accepted": {
+      "label": "TensorRT FP16, level 5",
+      "evidence": "trt/level5/RESULTS.json",
+      "p50_ms": 17.120256423950195,
+      "p95_ms": 17.262511730194092,
+      "samples": 1000,
+      "quality": {
+        "samples": 72,
+        "mean_psnr": {
+          "fp32": 31.503863904856416,
+          "baseline_amp": 31.505155239193495,
+          "optimized": 31.50419517835985
+        },
+        "comparisons": {
+          "fp32": {
+            "mean_delta_db": 0.00033127350343420403,
+            "worst_frame_delta_db": -0.008658556787111138,
+            "max_rgb_error": 2,
+            "mean_abs_rgb": 0.06552816759902264,
+            "accepted": true
+          },
+          "baseline_amp": {
+            "mean_delta_db": -0.0009600608336448602,
+            "worst_frame_delta_db": -0.00513808229068502,
+            "max_rgb_error": 2,
+            "mean_abs_rgb": 0.05064320058870599,
+            "accepted": true
+          }
+        },
+        "accepted": true
+      },
+      "speedup": 3.720250236236224,
+      "reduction_percent": 73.1200877226017
+    },
+    "goal_10ms_achieved": false,
+    "baseline_repeat_p95_ms": 64.22937774658203,
+    "frozen_weights_sha256": "2c923e9ba9541cb85006684c0072868b2d71354d665cdd85cd2b0baac6faaabb",
+    "scope": "Same EDSR16x64 x2 and checkpoint. Batch1 1280x720 input -> 2560x1440 native output. RTX4090 lab. Forward only; warm timing. Mac72 validation, not independent test. No claim of Mac or input-to-display performance.",
+    "rows": [
+      {
+        "label": "PyTorch AMP baseline",
+        "evidence": "confirm/edsr-baseline.json",
+        "p50_ms": 64.18145751953125,
+        "p95_ms": 64.22086334228516,
+        "samples": 1000,
+        "quality": {
+          "samples": 72,
+          "mean_psnr": {
+            "fp32": 31.503863904856416,
+            "baseline_amp": 31.505155239193495,
+            "optimized": 31.505155239193495
+          },
+          "comparisons": {
+            "fp32": {
+              "mean_delta_db": 0.0012913343370790642,
+              "worst_frame_delta_db": -0.008318901531609413,
+              "max_rgb_error": 2,
+              "mean_abs_rgb": 0.04289398514303269,
+              "accepted": true
+            },
+            "baseline_amp": {
+              "mean_delta_db": 0,
+              "worst_frame_delta_db": 0,
+              "max_rgb_error": 0,
+              "mean_abs_rgb": 0,
+              "accepted": true
+            }
+          },
+          "accepted": true
+        },
+        "speedup": 1,
+        "reduction_percent": 0
+      },
+      {
+        "label": "Channels-last",
+        "evidence": "screen/edsr-channels_last.json",
+        "p50_ms": 48.40140914916992,
+        "p95_ms": 48.43535327911377,
+        "samples": 200,
+        "quality": null,
+        "speedup": 1.3259088453883208,
+        "reduction_percent": 24.5800340288756
+      },
+      {
+        "label": "Channels-last + CUDA Graph",
+        "evidence": "edsr-compile/edsr-graph_cl.json",
+        "p50_ms": 48.08495903015137,
+        "p95_ms": 48.11373291015625,
+        "samples": 200,
+        "quality": null,
+        "speedup": 1.3347719966398384,
+        "reduction_percent": 25.080837587437777
+      },
+      {
+        "label": "torch.compile + channels-last",
+        "evidence": "confirm/edsr-compile_cl.json",
+        "p50_ms": 28.869423866271973,
+        "p95_ms": 28.914624881744384,
+        "samples": 1000,
+        "quality": {
+          "samples": 72,
+          "mean_psnr": {
+            "fp32": 31.503863904856416,
+            "baseline_amp": 31.505155239193495,
+            "optimized": 31.50500044767436
+          },
+          "comparisons": {
+            "fp32": {
+              "mean_delta_db": 0.0011365428179423986,
+              "worst_frame_delta_db": -0.007238561767117346,
+              "max_rgb_error": 2,
+              "mean_abs_rgb": 0.03390104122013603,
+              "accepted": true
+            },
+            "baseline_amp": {
+              "mean_delta_db": -0.00015479151913666556,
+              "worst_frame_delta_db": -0.004088430429021628,
+              "max_rgb_error": 2,
+              "mean_abs_rgb": 0.026128114997713767,
+              "accepted": true
+            }
+          },
+          "accepted": true
+        },
+        "speedup": 2.221051236353124,
+        "reduction_percent": 54.97627503443101
+      },
+      {
+        "label": "TensorRT FP16, level 3",
+        "evidence": "trt/level3/RESULTS.json",
+        "p50_ms": 18.996000289916992,
+        "p95_ms": 19.117958736419677,
+        "samples": 1000,
+        "quality": {
+          "samples": 72,
+          "mean_psnr": {
+            "fp32": 31.503863904856416,
+            "baseline_amp": 31.505155239193495,
+            "optimized": 31.505664365859687
+          },
+          "comparisons": {
+            "fp32": {
+              "mean_delta_db": 0.0018004610032704704,
+              "worst_frame_delta_db": -0.008192241332711347,
+              "max_rgb_error": 3,
+              "mean_abs_rgb": 0.0610985725308642,
+              "accepted": true
+            },
+            "baseline_amp": {
+              "mean_delta_db": 0.0005091266661914062,
+              "worst_frame_delta_db": -0.0021702487107262414,
+              "max_rgb_error": 2,
+              "mean_abs_rgb": 0.03702928303255029,
+              "accepted": true
+            }
+          },
+          "accepted": true
+        },
+        "speedup": 3.35919039410544,
+        "reduction_percent": 70.2309222557091
+      },
+      {
+        "label": "TensorRT FP16, level 5",
+        "evidence": "trt/level5/RESULTS.json",
+        "p50_ms": 17.120256423950195,
+        "p95_ms": 17.262511730194092,
+        "samples": 1000,
+        "quality": {
+          "samples": 72,
+          "mean_psnr": {
+            "fp32": 31.503863904856416,
+            "baseline_amp": 31.505155239193495,
+            "optimized": 31.50419517835985
+          },
+          "comparisons": {
+            "fp32": {
+              "mean_delta_db": 0.00033127350343420403,
+              "worst_frame_delta_db": -0.008658556787111138,
+              "max_rgb_error": 2,
+              "mean_abs_rgb": 0.06552816759902264,
+              "accepted": true
+            },
+            "baseline_amp": {
+              "mean_delta_db": -0.0009600608336448602,
+              "worst_frame_delta_db": -0.00513808229068502,
+              "max_rgb_error": 2,
+              "mean_abs_rgb": 0.05064320058870599,
+              "accepted": true
+            }
+          },
+          "accepted": true
+        },
+        "speedup": 3.720250236236224,
+        "reduction_percent": 73.1200877226017
+      },
+      {
+        "label": "TensorRT INT8/FP16",
+        "evidence": "trt/int8-level5/RESULTS.json",
+        "p50_ms": 9.947152137756348,
+        "p95_ms": 9.963300752639771,
+        "samples": 1000,
+        "quality": {
+          "samples": 72,
+          "mean_psnr": {
+            "fp32": 31.503863904856416,
+            "baseline_amp": 31.505155239193495,
+            "optimized": 26.314474583405637
+          },
+          "comparisons": {
+            "fp32": {
+              "mean_delta_db": -5.189389321450779,
+              "worst_frame_delta_db": -9.758387717721895,
+              "max_rgb_error": 136,
+              "mean_abs_rgb": 8.453791650145032,
+              "accepted": false
+            },
+            "baseline_amp": {
+              "mean_delta_db": -5.190680655787858,
+              "worst_frame_delta_db": -9.760665235013526,
+              "max_rgb_error": 136,
+              "mean_abs_rgb": 8.467012058113284,
+              "accepted": false
+            }
+          },
+          "accepted": false
+        },
+        "speedup": 6.445741721213211,
+        "reduction_percent": 84.48588163703555
+      }
+    ]
+  }
+}

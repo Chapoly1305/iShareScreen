@@ -1,0 +1,174 @@
+{
+  "source": "research/edsr-terminal-cache-20261104/SUMMARY.json",
+  "source_sha256": "c9e5cd2521285f5436afee8e13efcc8961217eda7dd2d4024afe65ef9b6e7f50",
+  "extraction": "Summary fields only; raw samples, per-frame records, maxima and telemetry omitted. Historical status fields retained verbatim.",
+  "data": {
+    "status": "All new terminal-INT8 candidates rejected on actual decoder quality. Accepted engine unchanged; goal active.",
+    "device": "lab / Alienware / RTX 4090 / GPU-f3d8b210-4eb5-a38b-a81d-983611f83a6a",
+    "checkpoint_sha256": "2c923e9ba9541cb85006684c0072868b2d71354d665cdd85cd2b0baac6faaabb",
+    "candidates": {
+      "engine-fast": {
+        "engine_sha256": "1690dd9933afea3260b004feb7c161fca77c5a394d721dc2f3b16364dc5c0b90",
+        "quantized_residual_blocks": 16,
+        "correction_code_max": 7,
+        "model_graph_p95_ms": 9.553919792175293,
+        "stored_rgb_quality": {
+          "fp32": {
+            "mean_delta": -0.03063408362314051,
+            "worst_delta": -0.0771976399037726
+          },
+          "baseline_amp": {
+            "mean_delta": -0.031925417960225105,
+            "worst_delta": -0.07918641641083468
+          }
+        },
+        "stored_rgb_passed": true,
+        "actual_nvdec_quality": {
+          "fp32": {
+            "mean_delta": -0.0357871947065469,
+            "worst_delta": -0.11722233497438594
+          },
+          "baseline_amp": {
+            "mean_delta": -0.037078529043631486,
+            "worst_delta": -0.1186597488012282
+          },
+          "optimized": {
+            "mean_delta": -0.005153111083406387,
+            "worst_delta": -0.04982425152036285
+          }
+        },
+        "actual_nvdec_passed": false,
+        "accepted": false
+      },
+      "engine-fine": {
+        "engine_sha256": "2d1e82de2b3eaf862913ff004d112800191a59c952049c7770c999c6d1afb585",
+        "quantized_residual_blocks": 16,
+        "correction_code_max": 127,
+        "model_graph_p95_ms": 9.556991577148438,
+        "stored_rgb_quality": {
+          "fp32": {
+            "mean_delta": -0.05743742984194227,
+            "worst_delta": -0.25411442433933473
+          },
+          "baseline_amp": {
+            "mean_delta": -0.058728764179026866,
+            "worst_delta": -0.2555785328397846
+          }
+        },
+        "stored_rgb_passed": false,
+        "actual_nvdec_quality": {
+          "fp32": {
+            "mean_delta": -0.06061208803297616,
+            "worst_delta": -0.271804434108347
+          },
+          "baseline_amp": {
+            "mean_delta": -0.061903422370060746,
+            "worst_delta": -0.27379321061540907
+          },
+          "optimized": {
+            "mean_delta": -0.003174658191033883,
+            "worst_delta": -0.03718105620713885
+          }
+        },
+        "actual_nvdec_passed": false,
+        "accepted": false
+      }
+    },
+    "actual_nvdec_latency": [
+      {
+        "name": "candidate-first",
+        "p95_ms": 10.195013496559113,
+        "samples": 1000
+      },
+      {
+        "name": "baseline",
+        "p95_ms": 10.550516296643764,
+        "samples": 1000
+      },
+      {
+        "name": "candidate-repeat",
+        "p95_ms": 10.203597333747894,
+        "samples": 1000
+      }
+    ],
+    "unencoded_control": {
+      "engine_sha256": "1b6b04402acf195eaba8e6cf635050f20405fbe915ef2ab26b6d743b6ba2572d",
+      "metrics": {
+        "fp32": {
+          "mean_delta": -0.03362616575594816,
+          "worst_delta": -0.12074233893846298
+        },
+        "baseline_amp": {
+          "mean_delta": -0.03491750009303275,
+          "worst_delta": -0.12220644743891285
+        },
+        "optimized": {
+          "mean_delta": -0.009535630672393294,
+          "worst_delta": -0.0714084376960713
+        }
+      },
+      "passed": false
+    },
+    "current_best": {
+      "engine": "research/edsr-packed-state-20261104/engine-byte-cache/edsr.engine",
+      "engine_sha256": "74f418fb7ad0cd03ae25d6ff701fead1414a6f180e334d13e9281263007dde74",
+      "model_graph_p95_ms": [
+        9.881600379943848,
+        9.932837057113648
+      ],
+      "actual_nvdec_p95_ms": [
+        10.497415601275861,
+        10.542408819310367
+      ]
+    },
+    "finding": "A stored RGB-frame quality gate alone was insufficient. The fast 16-block candidate passed stored RGB but failed when fed actual GPU-decoded frames. The original terminal INT8 engine with full FP16 residual state also fails the actual decoder gate.",
+    "correction_experiment": "Using 255 correction codes plus one FP16 escape per byte passed independent kernel arithmetic checks, but worsened full-model image quality. The cause of that additional full-model degradation is not established; do not claim higher local reconstruction precision guarantees better network quality.",
+    "quality_protocol": "Both FP32 and original AMP reference: mean PSNR loss <= 0.05 dB; worst-frame loss <= 0.10 dB. 24 frozen Mac development clips, 72 frames, 720p/600 Kbps/4:2:0. No test-set selection or retraining.",
+    "scope": "Same trained architecture/checkpoint, but 32 instead of 30 residual convolutions use INT8, and 15 instead of 14 intermediate residual boundaries use byte correction state. This changes numerical precision, not just scheduling.",
+    "timing_scope": "Actual NVDEC runs use the first frozen clip replayed for 1000 serial samples. GPU pixels only; excludes network, demux, pacing, display presentation and encoding.",
+    "verification": {
+      "default_transform": {
+        "passed": true,
+        "default_onnx_sha256": "59e2876981fc5def861a8e085be6f3a2018e7191624051add86f2a28fe62f1d3",
+        "default_boundaries": 14,
+        "scope": "CPU graph transformation only; default 15-block mode matches frozen accepted ONNX bytes."
+      },
+      "default_kernel_full_resolution_bit_exact": true,
+      "default_kernel_cases": 27,
+      "default_kernel_memcheck_errors": 0,
+      "fine_kernel_memcheck_errors": 0,
+      "earlier_default_check": "First full default-kernel harness reported 3 CUDA API diagnostics from PyTorch CUB nonzero used by boolean indexing. Equivalent dense selection removes that helper; the revised check passes with default API reporting enabled. Original log preserved.",
+      "environment_failure": "First transform regression mixed Triton 3.5 with the existing Triton 3.2 entry plugin and failed import. Separate compiler paths fixed the harness; default ONNX bytes match the frozen accepted graph.",
+      "full_engine_limit": "Earlier full TensorRT-engine default CUDA API diagnostics remain unresolved. These independent kernel checks do not establish full-engine sanitizer cleanliness."
+    },
+    "handoff_attribution": {
+      "source": "research/edsr-nv12-fusion-20261104/native-fenced-video.sqlite",
+      "source_sha256": "8528d426596bdeaed2ca890583cf442a4b6ef2e0b352bcc6c15c8e51756cf871",
+      "frames": 25,
+      "metrics": {
+        "hardware_done_to_launch_call_ms": {
+          "mean_ms": 0.26765788,
+          "p95_ms": 0.3739738
+        },
+        "launch_call_duration_ms": {
+          "mean_ms": 0.0092606,
+          "p95_ms": 0.02015079999999997
+        },
+        "launch_call_start_to_gpu_start_ms": {
+          "mean_ms": 0.00931792,
+          "p95_ms": 0.018006599999999973
+        }
+      },
+      "scope": "Prior 25-frame NV12 trace; correlation IDs connect first CUDA work to its driver launch call. Profiler attribution only, not a new timing run.",
+      "limits": [
+        "No NVVIDEO decoder API rows; hardware-done-to-launch delay cannot be assigned to cuvidMapVideoFrame or a specific function without new instrumentation.",
+        "Launch-start-to-GPU-start overlaps the launch call; do not add launch duration to this interval."
+      ]
+    },
+    "remaining": [
+      "Current qualified GPU decode-to-output result is still approximately 10.5 ms, not below 10 ms.",
+      "Desktop viewer still reads decoded planes into CPU bytes and writes textures; optional CUDA input/output API is not yet integrated with presentation.",
+      "RTX 4090 timing does not establish Mac client performance; PSNR gates do not establish OCR/readability equivalence."
+    ]
+  }
+}

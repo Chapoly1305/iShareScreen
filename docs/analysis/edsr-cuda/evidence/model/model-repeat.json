@@ -1,0 +1,74 @@
+{
+  "source": "research/edsr-packed-state-20261104/engine-byte-cache-repeat/RESULTS.json",
+  "source_sha256": "e9e2c2038e6a91986c3971f9e9053901d8eabcf3d5f2e610aa561b62dff465e0",
+  "extraction": "Summary fields only; raw samples, per-frame records, maxima and telemetry omitted. Historical status fields retained verbatim.",
+  "data": {
+    "complete": true,
+    "checkpoint": {
+      "model": "edsr",
+      "epoch": 25,
+      "psnr": 31.50386324844595,
+      "sha256": "2c923e9ba9541cb85006684c0072868b2d71354d665cdd85cd2b0baac6faaabb"
+    },
+    "started": 1793775572.5005877,
+    "gpu_start": "NVIDIA GeForce RTX 4090, GPU-f3d8b210-4eb5-a38b-a81d-983611f83a6a, 595.99.02, 49, 48.77 W, 2520 MHz, 756 MiB",
+    "pid": 3928563,
+    "torch": "2.6.0+cu124",
+    "trt": "11.4.0.106",
+    "script_sha256": "f185f5a2ba6ee9b87b2a752efc1d1d049cbfb9435a44fae1e7ca7e71a12e8698",
+    "grid": [
+      1,
+      1
+    ],
+    "halo": 36,
+    "tile_shape": [
+      720,
+      1280
+    ],
+    "coords": [
+      {
+        "sy": 0,
+        "sx": 0,
+        "dy": 0,
+        "dx": 0,
+        "cy": 0,
+        "cx": 0
+      }
+    ],
+    "pixel_work_ratio": 1,
+    "scope": "Whole 720p resident RGB ->1440p RGB. Includes tile input copies and output stitching, TensorRT (precision determined by the hashed engine/build record), unchanged checkpoint. No decode/display. Graph capture still runs every tile for each call.",
+    "build_s": 4.76837158203125e-7,
+    "engine_sha256": "74f418fb7ad0cd03ae25d6ff701fead1414a6f180e334d13e9281263007dde74",
+    "engine": "research/edsr-packed-state-20261104/engine-byte-cache/edsr.engine",
+    "graph_matches_eager": true,
+    "eager": {
+      "p50_ms": 9.965456008911133,
+      "p95_ms": 10.011648178100586,
+      "p99_ms": 10.020705862045288,
+      "mean_ms": 9.965024861335754,
+      "sample_count": 1000
+    },
+    "eager_wall": {
+      "p50_ms": 9.973219130188227,
+      "p95_ms": 10.019364429172128,
+      "p99_ms": 10.029863335657865,
+      "mean_ms": 9.973393565276638
+    },
+    "graph": {
+      "p50_ms": 9.91539192199707,
+      "p95_ms": 9.932837057113648,
+      "p99_ms": 9.939978351593018,
+      "mean_ms": 9.91757294178009,
+      "sample_count": 1000
+    },
+    "graph_wall": {
+      "p50_ms": 9.923097444698215,
+      "p95_ms": 9.940979850944132,
+      "p99_ms": 9.949349374510348,
+      "mean_ms": 9.925707522081211
+    },
+    "gpu_after": "NVIDIA GeForce RTX 4090, GPU-f3d8b210-4eb5-a38b-a81d-983611f83a6a, 595.99.02, 74, 449.34 W, 2415 MHz, 2306 MiB",
+    "finished": 1793775594.7984269,
+    "gpu_end": "NVIDIA GeForce RTX 4090, GPU-f3d8b210-4eb5-a38b-a81d-983611f83a6a, 595.99.02, 68, 431.32 W, 2460 MHz, 2318 MiB"
+  }
+}

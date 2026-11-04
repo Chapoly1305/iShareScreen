@@ -45,7 +45,10 @@ def normalize_nv12_709_full(X, Y, SH: tl.constexpr, SW: tl.constexpr,
 
 @triton.jit
 def pack_area(X, Y, SC: tl.constexpr, SH: tl.constexpr, SW: tl.constexpr,
-              CHANNELS: tl.constexpr, N: tl.constexpr, BLOCK: tl.constexpr):
+              CHANNELS: tl.constexpr, N: tl.constexpr, BLOCK: tl.constexpr,
+              QUANTIZE_FIRST: tl.constexpr = True):
+    # Keep the legacy specialization for reproducible historical benchmarks.
+    # The runtime selects False: resize floats before clipping/quantizing RGB8.
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     channel = i % CHANNELS
     col = (i // CHANNELS) % 1920
@@ -59,10 +62,12 @@ def pack_area(X, Y, SC: tl.constexpr, SH: tl.constexpr, SW: tl.constexpr,
     b = tl.load(X + offset + SW, mask, 0).to(tl.float32)
     c = tl.load(X + offset + SH, mask, 0).to(tl.float32)
     d = tl.load(X + offset + SH + SW, mask, 0).to(tl.float32)
-    a = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.nearbyint(a * 255), 0), 255)
-    b = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.nearbyint(b * 255), 0), 255)
-    c = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.nearbyint(c * 255), 0), 255)
-    d = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.nearbyint(d * 255), 0), 255)
+    a, b, c, d = a * 255, b * 255, c * 255, d * 255
+    if QUANTIZE_FIRST:
+        a = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.nearbyint(a), 0), 255)
+        b = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.nearbyint(b), 0), 255)
+        c = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.nearbyint(c), 0), 255)
+        d = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.nearbyint(d), 0), 255)
     value = (a * wx + b * (1-wx)) * wy + (c * wx + d * (1-wx)) * (1-wy)
-    value = tl.extra.cuda.libdevice.nearbyint(value)
+    value = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.nearbyint(value), 0), 255)
     tl.store(Y + i, tl.where(channel == 3, 255, value).to(tl.uint8), i < N)

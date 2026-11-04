@@ -25,6 +25,7 @@ from benchmarks.super_resolution.edsr_cuda.common import (
     guard,
     save,
     stats,
+    reference_resize,
 )
 
 
@@ -77,6 +78,8 @@ def main():
         decoder_source_sha256=digest(native_source),
         decoder_binary_sha256=digest(a.native_library),
         kernel_sha256=digest(runtime_source.with_name("cuda_kernels.py")),
+        surface_source_sha256=digest(runtime_source.with_name("cuda_surface.py")),
+        output_transform="float_area_then_round_clip_rgb8",
         scope="Compressed packet submit -> GPU decode/color -> native GPU mapping -> EDSR -> GPU RGBA1080 -> consumer stream handoff/release. No CPU pixels during measurement. Includes mapped-surface release after readers complete. Excludes demux/network/pacing/presentation/encode. Complete HEVC access units explicitly marked end-of-picture. Same-packet output verified by PTS. Separate same-frame PTS-matched age under controlled 30fps arrival; excludes network/demux/presentation.",
     )
     save(a.output, result)
@@ -204,17 +207,12 @@ def main():
                     native = (
                         y[0]
                         .mul(255)
-                        .round()
-                        .clamp(0, 255)
-                        .byte()
                         .permute(1, 2, 0)
                         .contiguous()
                         .cpu()
                         .numpy()
                     )
-                    expected = cv2.resize(
-                        native, (1920, 1080), interpolation=cv2.INTER_AREA
-                    )
+                    expected = reference_resize(native)
                     actual = snapshot.cpu().numpy()
                     assert np.array_equal(actual[:, :, :3], expected) and np.all(
                         actual[:, :, 3] == 255

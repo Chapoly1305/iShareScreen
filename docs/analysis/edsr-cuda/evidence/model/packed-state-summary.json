@@ -1,0 +1,260 @@
+{
+  "source": "research/edsr-packed-state-20261104/SUMMARY.json",
+  "source_sha256": "77772c48e379ed184df4183dcaf461171af44123585e298751af0f7260c511e1",
+  "extraction": "Summary fields only; raw samples, per-frame records, maxima and telemetry omitted. Historical status fields retained verbatim.",
+  "data": {
+    "status": "Model inference is below 10 ms; actual NVDEC-to-GPU-output still exceeds 10 ms. Viewer presentation remains unintegrated. Goal remains active.",
+    "device": "lab / Alienware / RTX 4090 / GPU-f3d8b210-4eb5-a38b-a81d-983611f83a6a",
+    "checkpoint_sha256": "2c923e9ba9541cb85006684c0072868b2d71354d665cdd85cd2b0baac6faaabb",
+    "engine_sha256": "74f418fb7ad0cd03ae25d6ff701fead1414a6f180e334d13e9281263007dde74",
+    "onnx_sha256": "59e2876981fc5def861a8e085be6f3a2018e7191624051add86f2a28fe62f1d3",
+    "scope": "Same trained EDSR architecture/checkpoint, 720p input and x2 output. No retraining. Changes residual activation precision and storage on 14 boundaries.",
+    "coding": "Keep existing INT8 codes q; encode round_even((FP16_state*factor-q)*14) in -7..7 as byte code 0..14. Code 15 reads an original FP16 escape when abs(state*factor-q)>0.5. Only escape locations are read/written in the dense FP16 allocation. Decode FP16((q+(code-7)/14)*(1/factor)).",
+    "layout": "Correction codes are one byte each in CHW32. Physical four-bit packing was slower; it is not used in this candidate.",
+    "quality_gate": "72 frozen Mac development frames, yuv420p 720p / 600 Kbps. Mean PSNR loss <=0.05 dB and worst-frame loss <=0.10 dB against BOTH FP32 and original AMP. No test-set selection; passing does not establish OCR/readability equivalence.",
+    "quality": {
+      "samples": 72,
+      "metrics": {
+        "fp32": {
+          "mean_delta_db": -0.01054694133121946,
+          "worst_delta_db": -0.029861492766123376,
+          "max_rgb": 19
+        },
+        "baseline_amp": {
+          "mean_delta_db": -0.011838275668304052,
+          "worst_delta_db": -0.07984665313667705,
+          "max_rgb": 19
+        }
+      },
+      "passed": true
+    },
+    "actual_decode_quality": {
+      "fp32": {
+        "mean_delta": -0.012353225933723788,
+        "worst_delta": -0.038100755284197874
+      },
+      "baseline_amp": {
+        "mean_delta": -0.01364456027080838,
+        "worst_delta": -0.0372057524360514
+      },
+      "optimized": {
+        "mean_delta": -0.001806284602504328,
+        "worst_delta": -0.0335723787290334
+      }
+    },
+    "latency": {
+      "model_graph_p95_ms": 9.881600379943848,
+      "prior_model_graph_p95_ms": 10.743807792663574,
+      "model_repeat_graph_p95_ms": 9.932837057113648,
+      "model_reduction_percent": 8.025156716862403,
+      "actual_nvdec_p95_ms": [
+        10.497415601275861,
+        10.542408819310367
+      ],
+      "samples_per_run": 1000,
+      "model_scope": "Resident RGB720 -> RGB1440, including same D2D input/output copies as prior model benchmark.",
+      "decode_scope": "Compressed packet submit -> NVDEC/color -> GPU preprocessing -> EDSR -> GPU RGBA1080 -> consumer stream completion. First frozen clip replayed; not 1000 independent clips. Excludes network, demux, pacing, presentation and encoding."
+    },
+    "memory": {
+      "previous_context_bytes": 531578880,
+      "new_context_bytes": 707788800,
+      "additional_mib": 168.046875,
+      "note": "This reduces traffic, not capacity: retaining a dense masked FP16 escape allocation increases reserved engine memory."
+    },
+    "sanitizer": {
+      "independent_kernel_default_errors": 0,
+      "full_engine_default_api_diagnostics": 132,
+      "full_engine_device_access_errors_with_api_diagnostics_disabled": 0,
+      "limitation": "Default full-engine CUDA API diagnostics remain unresolved; do not claim the full engine is sanitizer-clean. Initial nibble harness had four API diagnostics at torch bool inversion; equivalent equality check avoids that helper and final kernel check reports zero errors."
+    },
+    "copy_analysis": {
+      "frames": 25,
+      "wall_ms_per_frame": 10.4389204,
+      "cuda_busy_pct": 93.40403323700025,
+      "transfers": {
+        "Host-to-Device": {
+          "count": 50,
+          "count_per_frame": 2,
+          "bytes_per_frame": 44,
+          "sizes": [
+            8,
+            36
+          ]
+        }
+      },
+      "cuda_runtime_calls": {
+        "cuEventSynchronize": 25,
+        "cuLaunchKernel": 50,
+        "cuEventRecord": 50,
+        "cuStreamWaitEvent": 25,
+        "cudaMemcpyToSymbol_v3020": 50,
+        "cudaLaunchKernel_v7000": 75,
+        "cudaEventRecord_v3020": 100,
+        "cudaEventQuery_v3020": 75,
+        "cudaStreamIsCapturing_v10000": 50,
+        "cudaGraphLaunch_v10000": 25,
+        "cudaStreamWaitEvent_v3020": 25,
+        "cudaEventSynchronize_v3020": 25
+      },
+      "memory_allocation_calls": {},
+      "limitations": [
+        "CUDA trace does not measure NVDEC hardware occupancy or all internal driver transfers.",
+        "Use the detached benchmark for speed claims.",
+        "Final event synchronization belongs to the serial-latency measurement harness; the runtime submit/handoff uses GPU event ordering."
+      ]
+    },
+    "counters_micro": {
+      "gpu__time_duration.sum": {
+        "value": 342.848,
+        "unit": "us"
+      },
+      "dram__bytes_read.sum": {
+        "value": 177.39328,
+        "unit": "Mbyte"
+      },
+      "dram__bytes_write.sum": {
+        "value": 87.090176,
+        "unit": "Mbyte"
+      },
+      "lts__t_sector_hit_rate.pct": {
+        "value": 79.752986,
+        "unit": "%"
+      },
+      "sm__throughput.avg.pct_of_peak_sustained_elapsed": {
+        "value": 59.613618,
+        "unit": "%"
+      },
+      "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed": {
+        "value": 33.337324,
+        "unit": "%"
+      },
+      "sm__inst_executed_pipe_lsu.avg.pct_of_peak_sustained_active": {
+        "value": 60.308484,
+        "unit": "%"
+      },
+      "sm__warps_active.avg.pct_of_peak_sustained_active": {
+        "value": 24.247088,
+        "unit": "%"
+      },
+      "launch__registers_per_thread": {
+        "value": 168,
+        "unit": "register/thread"
+      }
+    },
+    "counters_engine": {
+      "gpu__time_duration.sum": {
+        "value": 324.704,
+        "unit": "us"
+      },
+      "dram__bytes_read.sum": {
+        "value": 177.068672,
+        "unit": "Mbyte"
+      },
+      "dram__bytes_write.sum": {
+        "value": 85.577728,
+        "unit": "Mbyte"
+      },
+      "lts__t_sector_hit_rate.pct": {
+        "value": 79.784013,
+        "unit": "%"
+      },
+      "sm__throughput.avg.pct_of_peak_sustained_elapsed": {
+        "value": 58.926416,
+        "unit": "%"
+      },
+      "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed": {
+        "value": 32.953025,
+        "unit": "%"
+      },
+      "sm__inst_executed_pipe_lsu.avg.pct_of_peak_sustained_active": {
+        "value": 59.717251,
+        "unit": "%"
+      },
+      "sm__warps_active.avg.pct_of_peak_sustained_active": {
+        "value": 24.282226,
+        "unit": "%"
+      },
+      "launch__registers_per_thread": {
+        "value": 168,
+        "unit": "register/thread"
+      }
+    },
+    "microbenchmarks": {
+      "micro-v2": {
+        "triton": "3.2.0",
+        "baseline_before": {
+          "p50_ms": 0.39820799231529236,
+          "p95_ms": 0.3989439904689789,
+          "p99_ms": 0.3993600010871887,
+          "mean_ms": 0.39810932884613676
+        },
+        "baseline_after": {
+          "p50_ms": 0.39905600249767303,
+          "p95_ms": 0.40009599924087524,
+          "p99_ms": 0.40031999349594116,
+          "mean_ms": 0.398585599164168
+        }
+      },
+      "micro-triton35": {
+        "triton": "3.5.1",
+        "baseline_before": {
+          "p50_ms": 0.39640000462532043,
+          "p95_ms": 0.39798559844493864,
+          "p99_ms": 0.3983359932899475,
+          "mean_ms": 0.3966929070154826
+        },
+        "baseline_after": {
+          "p50_ms": 0.3963039964437485,
+          "p95_ms": 0.39795359075069425,
+          "p99_ms": 0.3983359932899475,
+          "mean_ms": 0.39660512099663414
+        }
+      },
+      "micro-byte-triton35": {
+        "triton": "3.5.1",
+        "baseline_before": {
+          "p50_ms": 0.39667201042175293,
+          "p95_ms": 0.39792001247406006,
+          "p99_ms": 0.3983043056726456,
+          "mean_ms": 0.3967503997683525
+        },
+        "baseline_after": {
+          "p50_ms": 0.39635199308395386,
+          "p95_ms": 0.3975360095500946,
+          "p99_ms": 0.39833631336688996,
+          "mean_ms": 0.39666485448678335
+        }
+      },
+      "micro-byte-schedule": {
+        "triton": "3.5.1",
+        "baseline_before": {
+          "p50_ms": 0.3962880074977875,
+          "p95_ms": 0.3973119854927063,
+          "p99_ms": 0.39820959240198134,
+          "mean_ms": 0.3966843745112419
+        },
+        "baseline_after": {
+          "p50_ms": 0.3963199853897095,
+          "p95_ms": 0.39795199036598206,
+          "p99_ms": 0.3983359932899475,
+          "mean_ms": 0.39664202640453977
+        }
+      }
+    },
+    "native_tactics": {
+      "first_byte_candidate": "15 native INT8 convolutions chose tile64x128, tactic 0x214f03e23f252333.",
+      "final_candidate": "A fresh editable-cache build automatically chose tile64x256, tactic 0x9dafb2758560cc1d, on all 15 layers. No manual cache replacement was needed.",
+      "original_byte_model_p95_ms": 10.16707706451416,
+      "editable_cache_saved": true
+    },
+    "preserved_failures": [
+      "Initial corner reference used FP16 overflow; finite 60000 values fixed the test without relaxing equality.",
+      "One quality launch was refused by the GPU occupancy guard while build was still running; successful measurement ran afterward."
+    ],
+    "next_work": [
+      "Investigate the remaining decoder/color and GPU preprocessing overhead without introducing CPU pixel transfers.",
+      "Retest full quality and actual GPU decoder path for any new faster candidate; retain the hashed engine and timing cache.",
+      "GPU surface runtime is implemented; viewer GPU texture presentation is not integrated or measured."
+    ]
+  }
+}

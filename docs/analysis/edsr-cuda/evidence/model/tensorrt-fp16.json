@@ -1,0 +1,52 @@
+{
+  "source": "research/inference-optimization-20261104/trt/level5/RESULTS.json",
+  "source_sha256": "41a50a8f347f2a9cc4c3071dca3f24bcda2fed66e888189d1f98f82f133922ad",
+  "extraction": "Summary fields only; raw samples, per-frame records, maxima and telemetry omitted. Historical status fields retained verbatim.",
+  "data": {
+    "complete": true,
+    "checkpoint": {
+      "model": "edsr",
+      "epoch": 25,
+      "psnr": 31.50386324844595,
+      "sha256": "2c923e9ba9541cb85006684c0072868b2d71354d665cdd85cd2b0baac6faaabb"
+    },
+    "gpu_start": "NVIDIA GeForce RTX 4090, GPU-f3d8b210-4eb5-a38b-a81d-983611f83a6a, 595.99.02, 49, 19.40 W, 2520 MHz, 756 MiB",
+    "started": 1793757062.3146658,
+    "pid": 3578507,
+    "trt": "10.13.3.9",
+    "torch": "2.6.0+cu124",
+    "script_sha256": "beaed10178de206ebcdcf7a56f10e830f4b6a032b6220bafc1109d5a387a1b9e",
+    "optimization_level": 5,
+    "scope": "TensorRT FP16 permitted, TF32 disabled, FP32 input/output, unchanged FP32 checkpoint exported to ONNX. Static batch1 720p -> native1440p, CUDA-event resident forward. No decode/transfer/resize/display.",
+    "onnx_sha256": "87e6fd1186affbb7072693f99137acdf763be3e43cdfba835a2c76eb34b01caa",
+    "build_s": 88.84194540977478,
+    "engine_sha256": "20507c61c8d29ed01b1e9ff38118f8383b4650a547ee43f2db0bc29d715241ee",
+    "network_layers": 129,
+    "reused_engine": null,
+    "nondefault_cuda_stream": true,
+    "forward": {
+      "p50_ms": 17.120256423950195,
+      "p95_ms": 17.262511730194092,
+      "p99_ms": 17.34864896774292,
+      "mean_ms": 17.12245230484009,
+      "sample_count": 1000
+    },
+    "host_wall": {
+      "p50_ms": 17.128258477896452,
+      "p95_ms": 17.274600779637694,
+      "p99_ms": 17.356101360637695,
+      "mean_ms": 17.13064046902582
+    },
+    "gpu_after": "NVIDIA GeForce RTX 4090, GPU-f3d8b210-4eb5-a38b-a81d-983611f83a6a, 595.99.02, 74, 449.65 W, 2205 MHz, 2645 MiB",
+    "quality": {
+      "samples": 72,
+      "mean_psnr": {
+        "fp32": 31.503863904856416,
+        "baseline_amp": 31.505155239193495,
+        "optimized": 31.50419517835985
+      }
+    },
+    "finished": 1793757215.2092478,
+    "gpu_end": "NVIDIA GeForce RTX 4090, GPU-f3d8b210-4eb5-a38b-a81d-983611f83a6a, 595.99.02, 61, 256.22 W, 2655 MHz, 5545 MiB"
+  }
+}

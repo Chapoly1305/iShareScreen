@@ -1,0 +1,150 @@
+{
+  "saved_utc": "2026-11-04T22:35:05.061630+00:00",
+  "experiment": "float-area-runtime-20261104-v1",
+  "quality_frames": 72,
+  "timing_frames": 4000,
+  "timing_order": [
+    "new-first",
+    "new-repeat",
+    "legacy-first",
+    "legacy-repeat"
+  ],
+  "paths_relative_to": "project root",
+  "files": [
+    {
+      "path": "docs/analysis/edsr-cuda/evidence/float-area-runtime/README.md",
+      "bytes": 1317,
+      "sha256": "1018b95666f73167e7ba3a7e0aba2547da8242adb3bb074e5446d8ff5945e8bb"
+    },
+    {
+      "path": "docs/analysis/edsr-cuda/evidence/float-area-runtime/latency-first.json",
+      "bytes": 236011,
+      "sha256": "6553bbc845c4c55eb9118a0e6d5b702745ad8ab29c41fa476e5467c51123c1db"
+    },
+    {
+      "path": "docs/analysis/edsr-cuda/evidence/float-area-runtime/latency-legacy-first.json",
+      "bytes": 235949,
+      "sha256": "7cf3ac1fe8336315908338d5e78197238f1768b4cb61f9042d4df3e06055114c"
+    },
+    {
+      "path": "docs/analysis/edsr-cuda/evidence/float-area-runtime/latency-legacy-repeat.json",
+      "bytes": 235849,
+      "sha256": "8da5e3b34f2952c313b360ed985c4be358deab4545b46f345b63e6bffaaf2ec4"
+    },
+    {
+      "path": "docs/analysis/edsr-cuda/evidence/float-area-runtime/latency-repeat.json",
+      "bytes": 236007,
+      "sha256": "94ae61af3ed9d83be2bbc83bf285d35a3c5fc5e9fdd50284873c963b25bbf3f6"
+    },
+    {
+      "path": "docs/analysis/edsr-cuda/evidence/float-area-runtime/quality.json",
+      "bytes": 29743,
+      "sha256": "0d3d0608fbbee4ea766fed8841527aa2f05ef446e83629adbffbece6b3d5a374"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/float-area-runtime-20261104-v1/before/benchmark.py",
+      "bytes": 12739,
+      "sha256": "c700b9c5c556f47fa1f0da09f710ce25a471c34973f031fb5f269f08cce9b631"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/float-area-runtime-20261104-v1/before/common.py",
+      "bytes": 3670,
+      "sha256": "30fffa9ba31cf0eedcbe759438dc9f38e72d96faafdc27cc78cf4f77000998c2"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/float-area-runtime-20261104-v1/before/cuda_kernels.py",
+      "bytes": 3214,
+      "sha256": "58f5a0a1418d4bc6fc3b3c97fbc4f2f1bde664e27b1586c340e47863021313f1"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/float-area-runtime-20261104-v1/before/cuda_surface.py",
+      "bytes": 14240,
+      "sha256": "7cbb3431ca65706c6ff45ae43c5c80a6df64692f84ecc1796cb1130c62f23b14"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/float-area-runtime-20261104-v1/before/validate.py",
+      "bytes": 6005,
+      "sha256": "355ac68b4000398cad52cb3320149b0ca05ffcdb1bb52b8409648be59cd94381"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/float-area-runtime-20261104-v1/dependency-precheck.log",
+      "bytes": 380,
+      "sha256": "70b479976ba6b6a81f0c0a2a850952a1176a98a7b4f9164911343298f46086e8"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/float-area-runtime-20261104-v1/latency-first.json",
+      "bytes": 236011,
+      "sha256": "6553bbc845c4c55eb9118a0e6d5b702745ad8ab29c41fa476e5467c51123c1db"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/float-area-runtime-20261104-v1/latency-first.log",
+      "bytes": 839,
+      "sha256": "7a8aaf26fef649658f6bdaab12f25133b57d57e213a3c8e33089d4659134673c"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/float-area-runtime-20261104-v1/latency-legacy-first.json",
+      "bytes": 235949,
+      "sha256": "7cf3ac1fe8336315908338d5e78197238f1768b4cb61f9042d4df3e06055114c"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/float-area-runtime-20261104-v1/latency-legacy-first.log",
+      "bytes": 840,
+      "sha256": "4513492c7527e790d7930557e1c2cfb9e5579e4f86be4c81c1f18ebf032bf8ae"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/float-area-runtime-20261104-v1/latency-legacy-repeat.json",
+      "bytes": 235849,
+      "sha256": "8da5e3b34f2952c313b360ed985c4be358deab4545b46f345b63e6bffaaf2ec4"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/float-area-runtime-20261104-v1/latency-legacy-repeat.log",
+      "bytes": 839,
+      "sha256": "6f75a7d8da6b308a576272cb5b596ff9f9c7030a41c597c482e0ec3184c1568d"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/float-area-runtime-20261104-v1/latency-repeat.json",
+      "bytes": 236007,
+      "sha256": "94ae61af3ed9d83be2bbc83bf285d35a3c5fc5e9fdd50284873c963b25bbf3f6"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/float-area-runtime-20261104-v1/latency-repeat.log",
+      "bytes": 839,
+      "sha256": "b2dba60fa6051acdc693476cfad66123c612fde1783b2ef954b44284a85c47ce"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/float-area-runtime-20261104-v1/patches/benchmark.py",
+      "bytes": 12716,
+      "sha256": "0bbd6752386ffe32a8738fc8c1dc67dc3f4ac75fb44cfdd2380b5c5e896bc524"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/float-area-runtime-20261104-v1/patches/common.py",
+      "bytes": 4211,
+      "sha256": "46702be95a57848fe074ee096c5a1495c1e6709beffb2c689acf0bc399d9d551"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/float-area-runtime-20261104-v1/patches/cuda_kernels.py",
+      "bytes": 3521,
+      "sha256": "4c6943ac2b5a7af20575eb7392e44901a04641ff16748a8daa40f7aee631d61e"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/float-area-runtime-20261104-v1/patches/cuda_surface.py",
+      "bytes": 14341,
+      "sha256": "ac54cf9e2dd2333a58c0d4fff199f1401158fe31e17a2a6ed4ae4a3d0383c087"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/float-area-runtime-20261104-v1/patches/validate.py",
+      "bytes": 9713,
+      "sha256": "ff53054744df1ed4f8c390d1d03b5c976303fe1a411038f43458d487e0ca1637"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/float-area-runtime-20261104-v1/quality.json",
+      "bytes": 29743,
+      "sha256": "0d3d0608fbbee4ea766fed8841527aa2f05ef446e83629adbffbece6b3d5a374"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/float-area-runtime-20261104-v1/quality.log",
+      "bytes": 1341,
+      "sha256": "9194029047daf6ca492f93f036ce0333d4e7c098c1f6d6b4423eb1c4fa1f9a42"
+    }
+  ]
+}

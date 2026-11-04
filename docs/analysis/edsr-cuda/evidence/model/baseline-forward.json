@@ -1,0 +1,104 @@
+{
+  "source": "research/inference-optimization-20261104/confirm/edsr-baseline.json",
+  "source_sha256": "61da431338b626c5f54b8477c494bcae21943f056160c73a05d91eb9af8a23fc",
+  "extraction": "Summary fields only; raw samples, per-frame records, maxima and telemetry omitted. Historical status fields retained verbatim.",
+  "data": {
+    "complete": true,
+    "model": "edsr",
+    "variant": "baseline",
+    "checkpoint": {
+      "model": "edsr",
+      "epoch": 25,
+      "psnr": 31.50386324844595,
+      "sha256": "2c923e9ba9541cb85006684c0072868b2d71354d665cdd85cd2b0baac6faaabb"
+    },
+    "host": "Alienware",
+    "gpu_start": "NVIDIA GeForce RTX 4090, GPU-f3d8b210-4eb5-a38b-a81d-983611f83a6a, 595.99.02, 50, 35.91 W, 420 MHz, 342 MiB",
+    "torch": "2.6.0+cu124",
+    "cuda": "12.4",
+    "cudnn": 90100,
+    "script_sha256": "ad462a571be00b84b406ca3ef9a400bbe61d97e4393833b023a76f64fc57c614",
+    "started": 1793756607.4340065,
+    "pid": 3574602,
+    "samples": 1000,
+    "warmup": 50,
+    "input_shape": [
+      1,
+      3,
+      720,
+      1280
+    ],
+    "precision": "AMP FP16; FP32 weights/input; TF32 disabled",
+    "scope": "Resident forward 720p to native1440p, same normalization as published benchmark. Fixed synthetic input. CUDA event timing without profiler.",
+    "setup_and_warmup_s": 3.2141751700546592,
+    "synthetic_vs_baseline_amp": {
+      "max_abs": 0,
+      "mean_abs": 0
+    },
+    "forward": {
+      "p50_ms": 64.18145751953125,
+      "p95_ms": 64.22086334228516,
+      "p99_ms": 64.34847206115722,
+      "mean_ms": 64.18501274108887,
+      "sample_count": 1000
+    },
+    "host_wall": {
+      "p50_ms": 64.19097445905209,
+      "p95_ms": 64.2337697208859,
+      "p99_ms": 64.40557036083192,
+      "mean_ms": 64.19514155830257
+    },
+    "peak_allocated_bytes": 1348980224,
+    "gpu_after": "NVIDIA GeForce RTX 4090, GPU-f3d8b210-4eb5-a38b-a81d-983611f83a6a, 595.99.02, 72, 353.47 W, 2655 MHz, 3118 MiB",
+    "pipeline": {
+      "prepare": {
+        "p50_ms": 2.822675509378314,
+        "p95_ms": 2.9706790461204946,
+        "p99_ms": 3.0302601982839414,
+        "mean_ms": 2.390075698494911
+      },
+      "upload": {
+        "p50_ms": 0.6819779518991709,
+        "p95_ms": 0.7092578569427133,
+        "p99_ms": 0.7172223227098584,
+        "mean_ms": 0.685943947173655
+      },
+      "model": {
+        "p50_ms": 64.22726856544614,
+        "p95_ms": 64.27049613557756,
+        "p99_ms": 64.27831849083304,
+        "mean_ms": 64.22920984914526
+      },
+      "pack_download": {
+        "p50_ms": 1.1702381307259202,
+        "p95_ms": 1.7260028515011072,
+        "p99_ms": 1.7732334416359665,
+        "mean_ms": 1.3319811527617276
+      },
+      "resize": {
+        "p50_ms": 9.046102641150355,
+        "p95_ms": 9.220983867999166,
+        "p99_ms": 9.365211047697812,
+        "mean_ms": 9.061263306066394
+      },
+      "total": {
+        "p50_ms": 77.89857452735305,
+        "p95_ms": 78.17256341222674,
+        "p99_ms": 78.32132883369923,
+        "mean_ms": 77.69847395364195
+      }
+    },
+    "pipeline_scope": "CPU RGB normalization, H2D, forward, finite check, native1440p uint8 packing/D2H, OpenCV area1080p. Synchronized stages, no decode/network/queue/display.",
+    "quality": {
+      "samples": 72,
+      "scope": "72 Mac validation frames; FP32/NCHW vs AMP/NCHW vs optimized. No test data or checkpoint tuning. RGB quantized final1080p PSNR; not SSIM/LPIPS equivalence.",
+      "mean_psnr": {
+        "fp32": 31.503863904856416,
+        "baseline_amp": 31.505155239193495,
+        "optimized": 31.505155239193495
+      }
+    },
+    "finished": 1793756732.1092525,
+    "gpu_end": "NVIDIA GeForce RTX 4090, GPU-f3d8b210-4eb5-a38b-a81d-983611f83a6a, 595.99.02, 54, 166.20 W, 2670 MHz, 3766 MiB"
+  }
+}

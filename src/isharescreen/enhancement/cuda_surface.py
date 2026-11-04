@@ -7,6 +7,7 @@ until consumers release them. A busy runtime rejects submission so the caller
 can replace its pending frame rather than build a latency-producing GPU queue.
 
 This is the inference handoff API, not a renderer or a registered viewer model.
+Output uses float Area resize to 1080p, followed by RGB8 clipping/quantization.
 """
 from __future__ import annotations
 
@@ -164,7 +165,7 @@ class CudaSurfaceEDSR:
         if not self._context.execute_async_v3(self.stream.cuda_stream):
             raise RuntimeError("TensorRT execution failed")
         self._pack[((output.numel()+255)//256,)](self._native,output,*self._native.stride()[1:],
-            self._channels,output.numel(),256,enable_fp_fusion=False)
+            self._channels,output.numel(),256,QUANTIZE_FIRST=False,enable_fp_fusion=False)
 
     def _producer(self):
         if threading.get_ident() != self._thread:

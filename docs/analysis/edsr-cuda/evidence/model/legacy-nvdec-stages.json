@@ -1,0 +1,69 @@
+{
+  "source": "research/edsr-nv12-fusion-20261104/FINAL-VIDEO-ANALYSIS.json",
+  "source_sha256": "4069f4a668764341a38c2014a05de460da90ae14c533593346adb564eb77cd01",
+  "extraction": "Summary fields only; raw samples, per-frame records, maxima and telemetry omitted. Historical status fields retained verbatim.",
+  "data": {
+    "frames": 25,
+    "video_hardware_trace": true,
+    "summaries": {
+      "video_ms": {
+        "mean_ms": 0.20780420000000002,
+        "p95_ms": 0.22395639999999997
+      },
+      "frame_start_to_video_start_ms": {
+        "mean_ms": 0.025985559999999998,
+        "p95_ms": 0.026854199999999998
+      },
+      "video_end_to_first_cuda_start_ms": {
+        "mean_ms": 0.2769758,
+        "p95_ms": 0.38397
+      },
+      "first_cuda_to_normalization_start_ms": {
+        "mean_ms": 0.13730004,
+        "p95_ms": 0.21341619999999992
+      },
+      "normalize_ms": {
+        "mean_ms": 0.007095119999999999,
+        "p95_ms": 0.007264
+      }
+    },
+    "transfers": {
+      "Device-to-Device": {
+        "count": 50,
+        "bytes_per_frame": 1382400,
+        "gpu_duration_ms_per_frame": 0.003881
+      }
+    },
+    "allocation_calls": {},
+    "cuda_api_counts": {
+      "cuCtxPushCurrent_v2": 100,
+      "cuEventSynchronize": 25,
+      "cuCtxPopCurrent_v2": 100,
+      "cuLaunchKernel": 50,
+      "cuEventRecord": 50,
+      "cuStreamQuery": 25,
+      "cuMemcpy2DAsync_v2": 50,
+      "cuPointerGetAttribute": 100,
+      "cuDevicePrimaryCtxGetState": 325,
+      "cuStreamWaitEvent": 25,
+      "cuCtxGetCurrent": 25,
+      "cudaGetDevice_v3020": 1000,
+      "cudaEventRecord_v3020": 125,
+      "cudaEventQuery_v3020": 75,
+      "cudaStreamIsCapturing_v10000": 50,
+      "cudaLaunchKernel_v7000": 50,
+      "cudaGetLastError_v3020": 50,
+      "cudaGraphLaunch_v10000": 25,
+      "cudaDriverGetVersion_v3020": 25,
+      "cudaStreamWaitEvent_v3020": 50,
+      "cudaEventSynchronize_v3020": 25,
+      "cudaEventElapsedTime_v3020": 25
+    },
+    "decoder_api_events": 1,
+    "limits": [
+      "Profiler intervals are attribution evidence, not unprofiled latency results.",
+      "NVDEC hardware workload is traced, but no video decoder API events were captured; the post-decode gap cannot be assigned to one driver call from this trace alone.",
+      "CPU-to-GPU pixel transfers and allocation claims are limited to the captured steady-state interval."
+    ]
+  }
+}

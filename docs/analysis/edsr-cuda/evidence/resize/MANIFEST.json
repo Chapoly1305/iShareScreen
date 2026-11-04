@@ -1,0 +1,295 @@
+{
+  "saved_utc": "2026-11-04T17:42:49.418129+00:00",
+  "experiment": "resize-comparison-20261104-v1",
+  "quality_records": 360,
+  "latency_samples": 25000,
+  "original_crops": 48,
+  "paths_relative_to": "project root",
+  "files": [
+    {
+      "path": "docs/analysis/edsr-cuda/evidence/resize/comparison.json",
+      "bytes": 422986,
+      "sha256": "b163ee697aa5fd8a3469e4ecfef6125add65ff5c2251f1c27c30eb4341e4d212"
+    },
+    {
+      "path": "docs/analysis/edsr-cuda/evidence/resize/graph-timing.json",
+      "bytes": 470834,
+      "sha256": "85c2b9cc4c6e513c466f4ca29d2273b4917db6b36ae717f4a8a49f6068d22e51"
+    },
+    {
+      "path": "docs/analysis/edsr-cuda/evidence/resize/comparison.png",
+      "bytes": 128412,
+      "sha256": "acf4d2821774fa57e1938de8e4224f8988736d083d9c4899a5294433adcadb33"
+    },
+    {
+      "path": "docs/analysis/edsr-cuda/evidence/resize/text-crops.png",
+      "bytes": 397293,
+      "sha256": "f3b7d985b8f41da25af0183b23b22c32348a0d4e328907b9417ea04ffefc56d6"
+    },
+    {
+      "path": "benchmarks/super_resolution/edsr_cuda/compare_resize.py",
+      "bytes": 10986,
+      "sha256": "d92fee6645b946fe6b5f017e9efa1a3aecdd751720006f45d47af061363746b3"
+    },
+    {
+      "path": "benchmarks/super_resolution/edsr_cuda/compare_resize_graph.py",
+      "bytes": 3866,
+      "sha256": "ec50f6f0ac3f385226997b25dbbe49c3f496dbcde307822c234def55b2773024"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/graph-timing.json",
+      "bytes": 440118,
+      "sha256": "00d87e084656ac88fbbe6bb6106849d5569983407e8822d41373d61c5972520b"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/RESULTS.json",
+      "bytes": 427269,
+      "sha256": "4101ea6895f8b648ee7fca53539dfb14dc75a36764e245501141e152726281cb"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-00-clamp_float_area.png",
+      "bytes": 312788,
+      "sha256": "e110df322d55aabb7320345c2a4ed32117a27705824e60a63344caec4b1a5259"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-00-cubic.png",
+      "bytes": 369824,
+      "sha256": "19b1aed94c7e73b117d08835aec90d27140ed470003ab02f9b69656042e3ea98"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-00-float_area.png",
+      "bytes": 312019,
+      "sha256": "83e0556a32157142656ca2a6c8240496d0d469981147afb5de0936022cd6a751"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-00-hr.png",
+      "bytes": 130914,
+      "sha256": "8eed33a0898c94d72900349588b6b11d12055608394ce053f03e10b0ae837064"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-00-lanczos4.png",
+      "bytes": 381388,
+      "sha256": "f0a08bf1cdb19be4f54a8aeae7af034ba686e7c6f443350192d124f07c01125b"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-00-legacy_area.png",
+      "bytes": 307469,
+      "sha256": "0d6a369f89e25dfb62d29912810735b6a33ac167eafabb11d3f8d8f7fd06bcd8"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-03-clamp_float_area.png",
+      "bytes": 194623,
+      "sha256": "d0ecae3d5a37260fa33f0a5a455b347d3a799f54497fe8bfe579e9976ad03ea6"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-03-cubic.png",
+      "bytes": 234775,
+      "sha256": "53900f1780bb24222a9d0a35b83f1fa5123225c56082e037aa65351a169956c5"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-03-float_area.png",
+      "bytes": 195070,
+      "sha256": "0261482a0e16e087ec71574d480fe12bd6c9c8cf0edb746c0953fd67f43d5d11"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-03-hr.png",
+      "bytes": 67369,
+      "sha256": "7a21586973e0e3f9325ba31c8c727c690a9671a0de5176f4f2fb97e7c66e9d0b"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-03-lanczos4.png",
+      "bytes": 241818,
+      "sha256": "5161bccf6d5f8573355b65e4b8b8c53cb3f5357f04d44222e9804523705182e1"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-03-legacy_area.png",
+      "bytes": 221947,
+      "sha256": "4d51be280243b12deffca1eaa9c1d1a44ec4701c9a1bdb376c4e7f8e0aaed553"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-06-clamp_float_area.png",
+      "bytes": 214693,
+      "sha256": "83482c914a3a3454e0d8e8bd3354fd32455735257e3be4ddfe27b6f9e3b5335f"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-06-cubic.png",
+      "bytes": 262921,
+      "sha256": "65f5cd296c0d03c46af4ea7f57eca332a75f723bd4fe22b1e1d3123ffc97f6be"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-06-float_area.png",
+      "bytes": 215352,
+      "sha256": "f0ea7a3d6ce852e7d0163332263d07153dbab2f4a95fedc830d577b1e0ee5fc7"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-06-hr.png",
+      "bytes": 70452,
+      "sha256": "020f485e0f92c5f0c0b4c7a018c155283de6ae8d2613ecfed7d0b5541a2d64e1"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-06-lanczos4.png",
+      "bytes": 270333,
+      "sha256": "2163887f7a8e6d27920d186390856b2479eb68fdb268a5a9cdb6de34186dce6e"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-06-legacy_area.png",
+      "bytes": 248286,
+      "sha256": "45bb29589235757bfcf56bea8fa9b403b8b82499efc512cfb7527be93278637c"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-09-clamp_float_area.png",
+      "bytes": 93214,
+      "sha256": "1c7e40dfd7c1732902123f251dbeda49c40f43360b75434005cfffdcfc1569d0"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-09-cubic.png",
+      "bytes": 102127,
+      "sha256": "715f98f4833e3f14ceed1b606c7775564b7930b2c8572bd2bf6ac98b6121aad9"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-09-float_area.png",
+      "bytes": 91453,
+      "sha256": "dd67c45c4665f138447e7feef5fc5b7db20d179feb7a0e9c3b864521c8ade42e"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-09-hr.png",
+      "bytes": 26738,
+      "sha256": "04fcc7c7197796b39e7d66cb2cc917cb01ae4b053d8de482bad528034ec51ddd"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-09-lanczos4.png",
+      "bytes": 105519,
+      "sha256": "b6e98a64f4737ba2b73f2e2005f6ffbe396271eeda5a38fbbe96d37d83626f9c"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-09-legacy_area.png",
+      "bytes": 123505,
+      "sha256": "424b057764763c469afa152cfb3056452fd9237c39a89c29134198677bfc4265"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-12-clamp_float_area.png",
+      "bytes": 173249,
+      "sha256": "444a97fa6de7fa30e35743e9f2da9193cffdfe24887441a7a83847cd77062157"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-12-cubic.png",
+      "bytes": 206965,
+      "sha256": "0c20bddcdfda17bcc4cb4a699883b9b08598df92c3210f93534a490ae152786a"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-12-float_area.png",
+      "bytes": 173386,
+      "sha256": "2c124508c2707c0d53782803fc4cb99d4f07f642bf12ed590c1a5fcf2fb068ef"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-12-hr.png",
+      "bytes": 39814,
+      "sha256": "dd78a27245efcb5c2f5878ab0eff00ebbf02e907c1f960e5e57b03a7e0f107c9"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-12-lanczos4.png",
+      "bytes": 212397,
+      "sha256": "2fd340964af6c3dbf69e4d83b1ef76dbbfcfef5de5017a564d04101aef2c9ad2"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-12-legacy_area.png",
+      "bytes": 195381,
+      "sha256": "6f4d5bd5993cd04b1e0835d8d806115c83d343e83c6c4ae15bd7b2aa381b03b9"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-15-clamp_float_area.png",
+      "bytes": 158321,
+      "sha256": "c76e49d8265acfa586f2f5a9dca9c04b4cc6f37b06e249f6a1c79e3a892553e6"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-15-cubic.png",
+      "bytes": 189271,
+      "sha256": "a80dc772f2863dc656c3f5e0e81ed25256713b10d96027c18f596fbc29eac692"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-15-float_area.png",
+      "bytes": 158336,
+      "sha256": "18895300d1407f209800e25bd622c8dbd5b5e1d3876140bdc338365a2d594f32"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-15-hr.png",
+      "bytes": 29105,
+      "sha256": "ba4825b320175a4ac8a2e04b169e6b60d909a1891023c33f2b238fa29881f336"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-15-lanczos4.png",
+      "bytes": 195387,
+      "sha256": "4866d6d84fc3bb66a5b9a5017ee6113df193b6c7a9266ca9a0a78b3ab8409bd1"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-15-legacy_area.png",
+      "bytes": 187656,
+      "sha256": "356f234a2648a22e924eecff75a3673d725061cd14bf42a3dcd7f59da07f126c"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-18-clamp_float_area.png",
+      "bytes": 372951,
+      "sha256": "ea481b9e90f6600a021d31e660f9e6fe972bfb506bb1b73a346a8f3bad5c9d31"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-18-cubic.png",
+      "bytes": 423496,
+      "sha256": "e669fa2a4455f0628ea3e11b6687db5b12590de1db729a1b335a4f366eed7166"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-18-float_area.png",
+      "bytes": 374662,
+      "sha256": "dde5a6bbb9bba5f6b1a4f9501d7fac117c9afa2f601f728e04c7293863eddebf"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-18-hr.png",
+      "bytes": 78582,
+      "sha256": "82fa6501cc22a4e2439dd8ada0d50a9023c3b91ff233131323ecd3ca8a7e2160"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-18-lanczos4.png",
+      "bytes": 433512,
+      "sha256": "f2c2061c6e0b31d1852b8485ce280082a458fa3bff615f70c76eef5062cd6111"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-18-legacy_area.png",
+      "bytes": 419320,
+      "sha256": "e3849c16d25cdbdb7e1a896b46ffdc9a712de745191a2e1a28f6459c26989d4a"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-21-clamp_float_area.png",
+      "bytes": 480141,
+      "sha256": "8ed09a92270442c6e2af8178b175d39a56efbf8b4614842ba37f08adb066bb55"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-21-cubic.png",
+      "bytes": 496660,
+      "sha256": "31635d87aefeec4d89fe1b2ffcff9209b4e22a2531ad9210a83e1953b63ea72d"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-21-float_area.png",
+      "bytes": 470713,
+      "sha256": "619b1797640130202e303338374ea250941a15a2ca91a5d4bd412ebdbbb8ed28"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-21-hr.png",
+      "bytes": 117522,
+      "sha256": "afd0e4a6c4fd3dd33526cf151ca83e6661316c56bb3280d8e03a8d4d15f7c8e0"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-21-lanczos4.png",
+      "bytes": 502912,
+      "sha256": "cf384936953b6e3b883d016a9d04e8ea6ba7b355fd4faf781715da3545b0d389"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/crop-21-legacy_area.png",
+      "bytes": 531454,
+      "sha256": "bb01d7d76258042c4b828e401ee6b7cd6ebfd90c3601c0a15d94a245e5f1549a"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/resize-comparison-20261104-v1/run-trt11/preview.png",
+      "bytes": 397293,
+      "sha256": "f3b7d985b8f41da25af0183b23b22c32348a0d4e328907b9417ea04ffefc56d6"
+    }
+  ]
+}

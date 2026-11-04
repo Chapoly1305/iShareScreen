@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import cv2
 import numpy as np
+from PIL import Image
 import torch
 import PyNvVideoCodec as nvc
 from isharescreen.enhancement.cuda_decoder import NvdecDecoder as Decoder
@@ -20,6 +21,7 @@ from benchmarks.super_resolution.edsr_cuda.common import (
     guard,
     save,
     digest,
+    reference_resize,
 )
 
 
@@ -32,6 +34,8 @@ def main():
     parser.add_argument("--validation", type=Path, required=True)
     parser.add_argument("--native-library", type=Path, required=True)
     parser.add_argument("--expected-gpu-uuid", required=True)
+    parser.add_argument("--reference-checkpoint", type=Path,
+                        help="Optional frozen EDSR weights for FP32/AMP quality gates")
     args = parser.parse_args()
     out = args.output
     if out.exists():
@@ -50,6 +54,10 @@ def main():
         script_sha256=digest(Path(__file__)),
         decoder_source_sha256=digest(Path(inspect.getfile(Decoder))),
         native_library_sha256=digest(args.native_library),
+        surface_source_sha256=digest(Path(inspect.getfile(DirectSurfaceEDSR)).with_name("cuda_surface.py")),
+        kernel_sha256=digest(Path(inspect.getfile(DirectSurfaceEDSR)).with_name("cuda_kernels.py")),
+        output_transform="float_area_then_round_clip_rgb8",
+        input_manifest_sha256=digest(root / "INPUTS.json"),
     )
     save(out, result)
     torch.set_num_threads(1)
@@ -62,6 +70,24 @@ def main():
     consumer = torch.cuda.Stream()
     end = torch.cuda.Event()
     reference = Engine(engine)
+    quality_model = None
+    if args.reference_checkpoint is not None:
+        from isharescreen.enhancement.models import Upscaler
+
+        checkpoint_sha = digest(args.reference_checkpoint)
+        assert checkpoint_sha == "2c923e9ba9541cb85006684c0072868b2d71354d665cdd85cd2b0baac6faaabb"
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.benchmark = True
+        quality_model = Upscaler("edsr", device="cuda:0", precision="fp32").model
+        payload = torch.load(args.reference_checkpoint, map_location="cpu", weights_only=True)
+        torch.nn.Module.load_state_dict(quality_model, payload["state_dict"], strict=True)
+        del payload
+        result["quality_reference"] = dict(
+            checkpoint_sha256=checkpoint_sha, tf32=False,
+            scope="Same actual NVDEC RGB input and float Area output for mixed engine, FP32 and AMP. "
+                  "Paired legacy output uses the same engine output. 72 Mac development frames; no test data.",
+            mean_psnr_loss_limit_db=0.05, worst_frame_psnr_loss_limit_db=0.10)
     runs = [
         x
         for x in json.loads((root / "INPUTS.json").read_text())["runs"]
@@ -109,17 +135,12 @@ def main():
                 native = (
                     y[0]
                     .mul(255)
-                    .round()
-                    .clamp(0, 255)
-                    .byte()
                     .permute(1, 2, 0)
                     .contiguous()
                     .cpu()
                     .numpy()
                 )
-                expected = cv2.resize(
-                    native, (1920, 1080), interpolation=cv2.INTER_AREA
-                )
+                expected = reference_resize(native)
                 actual = snapshot.cpu().numpy()
                 assert np.array_equal(expected, actual[:, :, :3]) and np.all(
                     actual[:, :, 3] == 255
@@ -134,6 +155,25 @@ def main():
                         callback_launched=True,
                     )
                 )
+                sample = next(s for s in run["samples"] if s["frame"] == index)
+                assert digest(root / sample["hr"]) == sample["hr_sha256"]
+                hr = np.asarray(Image.open(root / sample["hr"]).convert("RGB"))
+
+                def psnr(pixels):
+                    mse = np.mean((pixels.astype(np.float64)-hr.astype(np.float64))**2)
+                    return float(10*np.log10(255**2/mse))
+
+                scores = dict(optimized=psnr(actual[:, :, :3]),
+                              legacy=psnr(reference_resize(native, quantize_first=True)))
+                if quality_model is not None:
+                    for label in ("fp32", "amp"):
+                        with torch.autocast("cuda", dtype=torch.float16, enabled=label == "amp"):
+                            prediction = quality_model(expected_input*255)
+                        predicted_rgb = prediction[0].float().permute(1,2,0).contiguous().cpu().numpy()
+                        assert np.isfinite(predicted_rgb).all()
+                        scores[label] = psnr(reference_resize(predicted_rgb))
+                        del prediction
+                result["frames"][-1]["psnr"] = scores
             end.record(stream)
             end.synchronize()
             decoder.release(end)
@@ -143,6 +183,7 @@ def main():
         assert runtime.collect_completed() and len(runtime._address_graphs) <= 2
         decoder.close()
         save(out, result)
+        print("validated", len(result["frames"]), "frames", flush=True)
     assert len(result["frames"]) == 72
     from benchmarks.super_resolution.edsr_cuda.ownership import check_ownership
 
@@ -154,8 +195,26 @@ def main():
     result["cold_launches"] = runtime.cold_launches
     result["graph_builds"] = runtime.graph_builds
     runtime.close()
+    scores = result["frames"]
+    result["mean_psnr"] = {key: float(np.mean([row["psnr"][key] for row in scores]))
+                           for key in scores[0]["psnr"]}
+    result["quality_deltas"] = {}
+    for key in scores[0]["psnr"]:
+        if key == "optimized":
+            continue
+        deltas = [row["psnr"]["optimized"]-row["psnr"][key] for row in scores]
+        result["quality_deltas"][key] = dict(mean_delta=float(np.mean(deltas)),
+            worst_delta=min(deltas), best_delta=max(deltas),
+            improved_frames=sum(v > 1e-6 for v in deltas),
+            regressed_frames=sum(v < -1e-6 for v in deltas))
+    if quality_model is not None:
+        result["quality_gate_passed"] = all(
+            result["quality_deltas"][key]["mean_delta"] >= -0.05 and
+            result["quality_deltas"][key]["worst_delta"] >= -0.10 for key in ("fp32", "amp"))
     result["complete"] = True
     save(out, result)
+    if quality_model is not None:
+        assert result["quality_gate_passed"], result["quality_deltas"]
     print("PASS: 72 exact outputs and native-callback ownership checks", flush=True)
 
 

@@ -1,0 +1,281 @@
+{
+  "saved_utc": "2026-11-04T18:00:28.691424+00:00",
+  "experiment": "render-delivery-20261104-v1",
+  "quality_records": 216,
+  "latency_samples": 13200,
+  "raw_gpu_timestamp_pairs": 6000,
+  "formal_crops": 32,
+  "paths_relative_to": "project root",
+  "files": [
+    {
+      "path": "docs/analysis/edsr-cuda/evidence/render-delivery/README.md",
+      "bytes": 1266,
+      "sha256": "5c14d6596b34fe9f83feeb6a6dea27aacfde84dd0aab603ca1582dd60a18ab05"
+    },
+    {
+      "path": "docs/analysis/edsr-cuda/evidence/render-delivery/comparison.json",
+      "bytes": 966639,
+      "sha256": "adf6bc2edad37c612ec026990842569c6648573178a2baecc2f9bf2d6afb1969"
+    },
+    {
+      "path": "docs/analysis/edsr-cuda/evidence/render-delivery/comparison.png",
+      "bytes": 143882,
+      "sha256": "f5f9bf8ee8582c841ab7e3b1e6a29d8dc874186882cdae403ef6b7b6fe429421"
+    },
+    {
+      "path": "docs/analysis/edsr-cuda/evidence/render-delivery/text-crops.png",
+      "bytes": 262693,
+      "sha256": "7fdd0b3520555fac2cd39bf622d8156c9d2c2d7ae825facf96d4193c588191ef"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/RESULTS.json",
+      "bytes": 905761,
+      "sha256": "87ae2e9f403e29328220ae8316b5794d307e6b8b3dbbcdd8a180914b827cc8c1"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-00-float_area1080.png",
+      "bytes": 312019,
+      "sha256": "83e0556a32157142656ca2a6c8240496d0d469981147afb5de0936022cd6a751"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-00-hr.png",
+      "bytes": 130914,
+      "sha256": "8eed33a0898c94d72900349588b6b11d12055608394ce053f03e10b0ae837064"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-00-legacy_area1080.png",
+      "bytes": 307469,
+      "sha256": "0d6a369f89e25dfb62d29912810735b6a33ac167eafabb11d3f8d8f7fd06bcd8"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-00-native1440_linear.png",
+      "bytes": 315309,
+      "sha256": "6f78483bf3887b92b21a7f08c22774ac3fb7c1609d184bd7f1f94e0917405a63"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-03-float_area1080.png",
+      "bytes": 195070,
+      "sha256": "0261482a0e16e087ec71574d480fe12bd6c9c8cf0edb746c0953fd67f43d5d11"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-03-hr.png",
+      "bytes": 67369,
+      "sha256": "7a21586973e0e3f9325ba31c8c727c690a9671a0de5176f4f2fb97e7c66e9d0b"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-03-legacy_area1080.png",
+      "bytes": 221947,
+      "sha256": "4d51be280243b12deffca1eaa9c1d1a44ec4701c9a1bdb376c4e7f8e0aaed553"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-03-native1440_linear.png",
+      "bytes": 223955,
+      "sha256": "026118dc060300a20302805c2390f4049a69924c7a174fff76b46586bc04cdb0"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-06-float_area1080.png",
+      "bytes": 215352,
+      "sha256": "f0ea7a3d6ce852e7d0163332263d07153dbab2f4a95fedc830d577b1e0ee5fc7"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-06-hr.png",
+      "bytes": 70452,
+      "sha256": "020f485e0f92c5f0c0b4c7a018c155283de6ae8d2613ecfed7d0b5541a2d64e1"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-06-legacy_area1080.png",
+      "bytes": 248286,
+      "sha256": "45bb29589235757bfcf56bea8fa9b403b8b82499efc512cfb7527be93278637c"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-06-native1440_linear.png",
+      "bytes": 250115,
+      "sha256": "e7afe0f502930cbfab6b6397a88b65dd27df7ac5f3bdd0fff9d0566e7b469e0c"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-09-float_area1080.png",
+      "bytes": 91453,
+      "sha256": "dd67c45c4665f138447e7feef5fc5b7db20d179feb7a0e9c3b864521c8ade42e"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-09-hr.png",
+      "bytes": 26738,
+      "sha256": "04fcc7c7197796b39e7d66cb2cc917cb01ae4b053d8de482bad528034ec51ddd"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-09-legacy_area1080.png",
+      "bytes": 123505,
+      "sha256": "424b057764763c469afa152cfb3056452fd9237c39a89c29134198677bfc4265"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-09-native1440_linear.png",
+      "bytes": 123660,
+      "sha256": "476ff785b304576658524647f9d253c04b46c377eb832badd2b6fb511d10fbd0"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-12-float_area1080.png",
+      "bytes": 173386,
+      "sha256": "2c124508c2707c0d53782803fc4cb99d4f07f642bf12ed590c1a5fcf2fb068ef"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-12-hr.png",
+      "bytes": 39814,
+      "sha256": "dd78a27245efcb5c2f5878ab0eff00ebbf02e907c1f960e5e57b03a7e0f107c9"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-12-legacy_area1080.png",
+      "bytes": 195381,
+      "sha256": "6f4d5bd5993cd04b1e0835d8d806115c83d343e83c6c4ae15bd7b2aa381b03b9"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-12-native1440_linear.png",
+      "bytes": 197925,
+      "sha256": "fcbb7233578be95acef2a606fa673f67a8e91fc12598f5b10ad74376d3da8070"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-15-float_area1080.png",
+      "bytes": 158336,
+      "sha256": "18895300d1407f209800e25bd622c8dbd5b5e1d3876140bdc338365a2d594f32"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-15-hr.png",
+      "bytes": 29105,
+      "sha256": "ba4825b320175a4ac8a2e04b169e6b60d909a1891023c33f2b238fa29881f336"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-15-legacy_area1080.png",
+      "bytes": 187656,
+      "sha256": "356f234a2648a22e924eecff75a3673d725061cd14bf42a3dcd7f59da07f126c"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-15-native1440_linear.png",
+      "bytes": 188783,
+      "sha256": "0c0ad014a42965a33c2a0dc43203f7bae052c79beaee9f3efb97f342e85071b9"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-18-float_area1080.png",
+      "bytes": 374662,
+      "sha256": "dde5a6bbb9bba5f6b1a4f9501d7fac117c9afa2f601f728e04c7293863eddebf"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-18-hr.png",
+      "bytes": 78582,
+      "sha256": "82fa6501cc22a4e2439dd8ada0d50a9023c3b91ff233131323ecd3ca8a7e2160"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-18-legacy_area1080.png",
+      "bytes": 419320,
+      "sha256": "e3849c16d25cdbdb7e1a896b46ffdc9a712de745191a2e1a28f6459c26989d4a"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-18-native1440_linear.png",
+      "bytes": 418758,
+      "sha256": "090fd249dd3927012c711d786e1b7d9c1106d32599487741851b4e2301c6e6e8"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-21-float_area1080.png",
+      "bytes": 470713,
+      "sha256": "619b1797640130202e303338374ea250941a15a2ca91a5d4bd412ebdbbb8ed28"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-21-hr.png",
+      "bytes": 117522,
+      "sha256": "afd0e4a6c4fd3dd33526cf151ca83e6661316c56bb3280d8e03a8d4d15f7c8e0"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-21-legacy_area1080.png",
+      "bytes": 531454,
+      "sha256": "bb01d7d76258042c4b828e401ee6b7cd6ebfd90c3601c0a15d94a245e5f1549a"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full/crop-21-native1440_linear.png",
+      "bytes": 532644,
+      "sha256": "3f4db9b2ba94b362e18203dae61df065da4cd99710517d9fef205b9a8cf0a626"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/full.log",
+      "bytes": 3476,
+      "sha256": "7845115d042d2bc246ec1ef2e24a5ab63cb8458e9c97dcbdb96f386b27d6d6af"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/smoke/RESULTS.json",
+      "bytes": 3145,
+      "sha256": "1e801b17e3f63aa8b6d946d93edd1ed101f32cb32d17b7d8bfe769f088fe12b3"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/smoke/crop-00-float_area1080.png",
+      "bytes": 312019,
+      "sha256": "83e0556a32157142656ca2a6c8240496d0d469981147afb5de0936022cd6a751"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/smoke/crop-00-hr.png",
+      "bytes": 130914,
+      "sha256": "8eed33a0898c94d72900349588b6b11d12055608394ce053f03e10b0ae837064"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/smoke/crop-00-legacy_area1080.png",
+      "bytes": 307469,
+      "sha256": "0d6a369f89e25dfb62d29912810735b6a33ac167eafabb11d3f8d8f7fd06bcd8"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/smoke/crop-00-native1440_linear.png",
+      "bytes": 315309,
+      "sha256": "6f78483bf3887b92b21a7f08c22774ac3fb7c1609d184bd7f1f94e0917405a63"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/smoke-native-wait/RESULTS.json",
+      "bytes": 15435,
+      "sha256": "b2e73e4a3af1bee18fa52aab4695b62a0a19d06c970e48af2d25f03f06f184ce"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/smoke-native-wait/crop-00-float_area1080.png",
+      "bytes": 312019,
+      "sha256": "83e0556a32157142656ca2a6c8240496d0d469981147afb5de0936022cd6a751"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/smoke-native-wait/crop-00-hr.png",
+      "bytes": 130914,
+      "sha256": "8eed33a0898c94d72900349588b6b11d12055608394ce053f03e10b0ae837064"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/smoke-native-wait/crop-00-legacy_area1080.png",
+      "bytes": 307469,
+      "sha256": "0d6a369f89e25dfb62d29912810735b6a33ac167eafabb11d3f8d8f7fd06bcd8"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/smoke-native-wait/crop-00-native1440_linear.png",
+      "bytes": 315309,
+      "sha256": "6f78483bf3887b92b21a7f08c22774ac3fb7c1609d184bd7f1f94e0917405a63"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/source/common.py",
+      "bytes": 3670,
+      "sha256": "30fffa9ba31cf0eedcbe759438dc9f38e72d96faafdc27cc78cf4f77000998c2"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/source/compare_render_delivery.py",
+      "bytes": 15104,
+      "sha256": "12ff3c2d681b76a1d4bf66be155d9db499b0520b00eb067e888c7ad03611138a"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/source/compare_resize.py",
+      "bytes": 10986,
+      "sha256": "d92fee6645b946fe6b5f017e9efa1a3aecdd751720006f45d47af061363746b3"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/source/cuda_kernels.py",
+      "bytes": 3214,
+      "sha256": "58f5a0a1418d4bc6fc3b3c97fbc4f2f1bde664e27b1586c340e47863021313f1"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/source/failed-smoke-script.py",
+      "bytes": 14885,
+      "sha256": "3acdca07a02dd3432c1b886dffb154bb608045c4b937cb075ba16b282caa576b"
+    },
+    {
+      "path": "benchmarks/super_resolution/experiments/render-delivery-20261104-v1/source/gpu.py",
+      "bytes": 38679,
+      "sha256": "758beccbf63dd43937bdb95fe408683b973411ad38b87c74568a3ea9eabe807d"
+    }
+  ]
+}

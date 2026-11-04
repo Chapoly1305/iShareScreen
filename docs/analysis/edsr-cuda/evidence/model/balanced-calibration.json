@@ -1,0 +1,75 @@
+{
+  "source": "research/edsr-surface-runtime-20261104/int8-balance-terminal-fp16.json",
+  "source_sha256": "8856c006d332be5084a107471c3c119c2ef6c224757d31af307f55953eee72f3",
+  "extraction": "Summary fields only; raw samples, per-frame records, maxima and telemetry omitted. Historical status fields retained verbatim.",
+  "data": {
+    "complete": true,
+    "started": 1793764286.6027038,
+    "gpu": "NVIDIA GeForce RTX 4090, GPU-f3d8b210-4eb5-a38b-a81d-983611f83a6a, 595.99.02, 35, 17.53 W, 210 MHz, 346 MiB",
+    "script_sha256": "ff6d962c7f7fde53af307d223d179db68898e294f382333d8e79dd6006ca86cb",
+    "scope": "Train-only channel balancing before INT8 quantization of the same EDSR.\n\nOnly the 32 residual-block convolutions are quantized. Head, body output,\ntail, additions and activations remain FP16. This is fake quantization for\naccuracy screening, with no timing or hardware-acceleration claim.\n",
+    "quantization": "Per-input-channel balancing, alpha=0.5 or 0.75; static max-absolute INT8 activations; per-output-channel INT8 weights; no retraining",
+    "modes": {
+      "fp16_control": {
+        "mean_psnr": 31.50312067295172,
+        "metrics": {
+          "fp32": {
+            "mean_delta": -0.000743231904695385,
+            "worst_delta": -0.009254492759744437
+          },
+          "baseline_amp": {
+            "mean_delta": -0.0020345662417799756,
+            "worst_delta": -0.009575771552746914
+          }
+        },
+        "passed": true
+      },
+      "int8_alpha_0.75": {
+        "mean_psnr": 31.49237344394175,
+        "metrics": {
+          "fp32": {
+            "mean_delta": -0.011490460914664189,
+            "worst_delta": -0.04743284246900714
+          },
+          "baseline_amp": {
+            "mean_delta": -0.01278179525174878,
+            "worst_delta": -0.048124751018534084
+          }
+        },
+        "passed": true
+      },
+      "int8_alpha_1.0": {
+        "mean_psnr": 31.482214669314626,
+        "metrics": {
+          "fp32": {
+            "mean_delta": -0.02164923554179099,
+            "worst_delta": -0.09722203492346182
+          },
+          "baseline_amp": {
+            "mean_delta": -0.02294056987887558,
+            "worst_delta": -0.0992108114305239
+          }
+        },
+        "passed": true
+      }
+    },
+    "checkpoint": {
+      "model": "edsr",
+      "epoch": 25,
+      "psnr": 31.50386324844595,
+      "sha256": "2c923e9ba9541cb85006684c0072868b2d71354d665cdd85cd2b0baac6faaabb"
+    },
+    "calibration": {
+      "selection_sha256": "9061acffe2a56213c2ac3eee39e7df3a92b470c89038d545ea9f544f0a9580c8",
+      "samples": 72,
+      "split": "train"
+    },
+    "alphas": [
+      0.75,
+      1
+    ],
+    "protect_terminal_block": true,
+    "finished": 1793764348.6059728,
+    "gpu_end": "NVIDIA GeForce RTX 4090, GPU-f3d8b210-4eb5-a38b-a81d-983611f83a6a, 595.99.02, 56, 255.54 W, 2655 MHz, 5037 MiB"
+  }
+}

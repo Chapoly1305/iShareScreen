@@ -27,6 +27,8 @@ for the interactive presentation.
 - [Training](benchmarks/super_resolution/TRAINING.md) and
   [data isolation](benchmarks/super_resolution/CURATION.md): completed campaign.
 - [Viewer setup](docs/video-enhancement.md): runtime installation and behavior.
+- [EDSR inference optimization and reviewer Q&A](docs/analysis/edsr-cuda/REVIEW.zh-CN.md):
+  layer precision, calibration, quality gates, model timings and GPU pipeline boundaries.
 
 This research branch builds on [upstream iShareScreen](https://github.com/renegadelink/iShareScreen).
 The install commands below select this repository's `cs682-video-enhancement`
