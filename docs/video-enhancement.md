@@ -6,6 +6,11 @@ Video enhancement → Display model to select a baseline, an official pretrained
 model, an installed fine-tuned model, or return to Original. Browser playback is
 unchanged.
 
+For the completed research evaluation, see [the independent test results](../results/README.md).
+The runtime setup below includes a fixed-540p viewer evaluation profile. That
+profile is distinct from the offline 720p / 600 Kbps / 4:2:0 test protocol, and
+these instructions do not establish live performance for the reported checkpoints.
+
 ## Installation
 
 For a source checkout, use Python 3.10 or newer:

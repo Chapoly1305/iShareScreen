@@ -1,0 +1,95 @@
+{
+  "schema": "codescan_test_v1",
+  "frozen_before_test_inference": true,
+  "models": [
+    {
+      "model": "quicksrnet",
+      "epoch": 100,
+      "psnr": 29.688957174976807,
+      "sha256": "94845ddc93262a16b99c6956c9c0d9c1a4851db5015b1d823385a1e715195ab2",
+      "official_sha256": "d95d70f1d2366cb9c28d99f8c7aa5bb07e1ffeaf5d7e30d9c66ab0fa28c6d0f8"
+    },
+    {
+      "model": "plainusr",
+      "epoch": 30,
+      "psnr": 29.500211521207092,
+      "sha256": "17524b89fbbd978a207be2ad9a7063297992b62a4bb86834744056a1d46bb7f8",
+      "official_sha256": "8c6c9f82bceaab6b84bacad643443c367bee93e9ecdabb7c7e4cc595dc82df81"
+    },
+    {
+      "model": "rt4ksr",
+      "epoch": 95,
+      "psnr": 28.97456252177133,
+      "sha256": "249617cfb90418aa5a1bccecbfe63fbaa53968ee3d8da4fe97adefbb4e99ee03",
+      "official_sha256": "9ec7500092848a480e058a9c703e4b2254bc0cc97928c076bba272177752124f"
+    },
+    {
+      "model": "efrlfn",
+      "epoch": 100,
+      "psnr": 29.81014116353066,
+      "sha256": "16b750abbd51d53d1ece079f88e90f58aa94072ba39636385bb14550ce45782c",
+      "official_sha256": "fbfd1bb37973d2b8b53493c5b91c0ef106f74d200115250a8a025b8e6a121cb3"
+    },
+    {
+      "model": "imdn",
+      "epoch": 85,
+      "psnr": 31.361765438347998,
+      "sha256": "13a6decaec16c9171f2e4a93d532185b1b5a375b197ac9cb69216c929403eb8e",
+      "official_sha256": "740b39653592bd3f49955a21cd9e16f2d37f2c413368cc09327601b8fbe42ce1"
+    },
+    {
+      "model": "safmn",
+      "epoch": 85,
+      "psnr": 30.80592165013628,
+      "sha256": "a891b4cfec7f7d1422f3b585c48e2a46d28f8a60502d9e4b6ba57eaa87428004",
+      "official_sha256": "baee9b5d24fd718065ca9bbcc88bb32a8e302c9ef00bae7afac48466a4d6dfa7"
+    },
+    {
+      "model": "edsr",
+      "epoch": 25,
+      "psnr": 31.50386324844595,
+      "sha256": "2c923e9ba9541cb85006684c0072868b2d71354d665cdd85cd2b0baac6faaabb",
+      "official_sha256": "1bc9523228fdc3b0a5ddb0d7062001e22b31bbb398ae09cfdefb97e8ee06e171"
+    }
+  ],
+  "source_freeze_sha256": "e09c0bd0d4b8eb218062d085864c4300d75e1215e8c18a9a65bbccc84be473f4",
+  "files_sha256": {
+    "inputs/train.json": "854018a5c0dc9d17e704de208ebcd8629ab8cb7c65444aa84d5860e78c7c793e",
+    "inputs/validation.json": "3ca9dc47c3da43c3a2c25d886ade34d7c9fa84595c1d05c190ff7ce64fbc5b01",
+    "inputs/test.json": "5b9ddf9089c34292adc9553e8be9dd944b6ee8f4409446ff7176661b93bf56bf",
+    "inputs/prior-pair-hashes.json": "642f58170d56684b2a05d559fedcd26d8fded5b4cdef1f4bcb23e027a454720f"
+  },
+  "recipe": {
+    "schema": "codescan_codec_recipe_v1",
+    "display": [
+      1920,
+      1080
+    ],
+    "input": [
+      1280,
+      720
+    ],
+    "fps": 30,
+    "frames": 60,
+    "sample_frame": 45,
+    "bitrate": 600000,
+    "pixel_format": "yuv420p",
+    "encoder": "libx265",
+    "preset": "fast",
+    "tune": "zerolatency",
+    "gop": 60,
+    "vbv": 600000,
+    "color": "full-range BT.709",
+    "rendering": "Aspect-preserving fit to FHD, Lanczos, centered; padding is median corner RGB.",
+    "motion": "Synthetic: first30 frames static, next30 translate vertically 0 to -30 reference pixels, corner-color fill. Not real scrolling.",
+    "sampling": "One aligned P-frame at index45 per source; code-line anchors when valid; no flips or rotations.",
+    "loss_geometry": "LR128 -> native256 -> area192 target; even LR crop origins for exact 3:2 reference alignment.",
+    "ffmpeg_version": "ffmpeg version 8.0.1-3ubuntu2 Copyright (c) 2000-2025 the FFmpeg developers",
+    "runner_sha256": "53178b3c699ac1f9abe3ef3fca7293e3bce3ad8bd9b24173a22eee032f93370d"
+  },
+  "codec_source_sha256": "04f09746c746b15fe31ad5b9c97d0dab19beae02e444d762685295b862b53aae",
+  "evaluator_sha256": "fcd9cd0ac67e5295b87bf8bb91599635e1dfe22ebee5871a896bc1a5d2e7b9b7",
+  "prior_pairs_sha256": "5fefca461bf1f4cb95a454bf20d7d12b87aa5d13b999816d1d73c93527758a3b",
+  "scope": "1200 frozen held-out CodeSCAN screenshots; existing synthetic scrolling recipe; frame45; whole-frame RGB FP32 quality; SR720->1440->1080 area; bicubic720->1080; equal-sample means of PSNR/SSIM/LPIPS. No test tuning, no Mac test claim, no new latency ranking.",
+  "runtime": "lab RTX4090; serial methods; cached official LPIPS AlexNet v0.1; native1080p metrics"
+}

@@ -1,5 +1,11 @@
 # Mac text readability experiment
 
+Historical source-detail experiment (November 2026). This approach was
+retired from the project direction and is excluded from the final receiver-only
+SR results. The current independent CodeSCAN test is documented in
+[the canonical report](../../../results/README.md). The conditions and checkpoint
+below describe this archived experiment only; they are not deployment defaults.
+
 This package contains the source preparation, real Mac VideoToolbox encoding,
 GPU replay, source-detail transport, and fixed OCR evaluation for the November
 2026 text-readability campaign. It is an experimental protocol, not a deployed
@@ -45,7 +51,8 @@ measurements are recorded in the v2 definition.
 Both existing model controls were scored before the candidate. The lower
 full-set document CER selected the trained EDSR; its 13 positive-error groups
 were frozen in `confirmation-v1/COMPARATOR-FROZEN.json`. Candidate settings
-were not tuned on this confirmation set. Historical final test was not opened.
+were not tuned on this confirmation set. The then-reserved final test was not opened during this historical experiment;
+the separate CodeSCAN test evaluation was completed later on 2026-11-03.
 
 OCR preprocessing remains source-box cropping, source-defined dark inversion,
 Lanczos ×3, a 12-pixel white border, Tesseract OEM 1 / PSM 7 / 300 dpi, with

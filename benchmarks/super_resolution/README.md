@@ -7,14 +7,16 @@ its images, summary table, training curves and measurement evidence.
 
 ## Current evaluation
 
-The final campaign trains seven official pretrained ×2 models for 100 epochs
+The completed campaign trained seven official pretrained ×2 models for 100 epochs
 on frozen CodeSCAN training data. Evaluation uses 720p / 600 Kbps / yuv420p
-inputs and final 1080p output. The report explicitly separates FP32 validation
-quality from AMP FP16 forward timing on one RTX 4090. Test data are not used to
-select checkpoints. See the results report for the full protocol and limits.
+inputs and final 1080p output. The report separates FP32 test quality from AMP FP16 forward timing on one
+RTX 4090. The primary results cover 1,200 independent CodeSCAN test samples. Test
+data are not used to select checkpoints or tune parameters. The Mac gallery
+and training curves remain supplementary validation evidence. See the results report for the full protocol and limits.
 
 ## Source map
 
+- `codescan_test.py`: frozen independent test preparation and 15-method evaluation.
 - `codescan_campaign/`: frozen-pair preparation, training and monitoring.
 - `seven_model_gallery.py`: reference, bicubic and pretrained/fine-tuned PNGs.
 - `benchmark_best_latency.py`: repeated resident-forward timing on RTX 4090.
@@ -23,8 +25,8 @@ select checkpoints. See the results report for the full protocol and limits.
 - `text_corpus/`, `low_bandwidth_e2e/`, `mac_readability/`: retained research
   tooling, including historical approaches not used in the final presentation.
 
-Older training and curation procedures remain in [TRAINING.md](TRAINING.md)
-and [CURATION.md](CURATION.md) as technical documentation, not current results.
+[TRAINING.md](TRAINING.md) describes the completed campaign and fixed test
+protocol; [CURATION.md](CURATION.md) describes split isolation.
 The [development notes](DEVELOPMENT.md) describe regression checks.
 
 ## Local research artifacts

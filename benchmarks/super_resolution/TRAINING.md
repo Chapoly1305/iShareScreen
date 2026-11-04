@@ -1,163 +1,74 @@
-# Epoch-based fine-tuning
+# Completed CodeSCAN training and independent evaluation
 
-## Data and decisions
+Status reviewed 2026-11-03. The seven-model 100-epoch campaign and independent
+1,200-sample test evaluation are complete. The canonical report is
+[results/README.md](../../results/README.md); the [static presentation](../../results/index.html)
+contains the primary test table and supplementary Mac validation examples.
 
-EDSR-baseline, IMDN and SAFMN start independently from pinned official
-pretrained x2 weights. They use the same frozen dataset, content folds and
-training recipe. There is one maintained training scheme: true epochs over
-the frozen curated data.
+## Data and training
 
-The current dataset contains 4,155 aligned frame pairs from 24 recordings:
-683 clean baseline anchors and 3,472 curated additions. Twenty-one flagged
-baseline frames are excluded. Recordings and their derivatives stay in their
-assigned content fold; related recordings must share a group. Five-fold
-cross-validation uses four folds for training and one for validation.
+CodeSCAN split-v1 is frozen at 9,600 train / 1,200 validation / 1,200 test
+samples, grouped by source repository and duplicate relationships before
+rendering. Training uses CodeSCAN train only. Mac recordings and CodeSCAN
+validation/test samples are excluded from training. See [data curation](CURATION.md)
+and the [dataset guide](../../datasets/README.md).
 
-Training uses every eligible frame outside the held-out fold. Validation uses
-only its clean baseline anchors; new frames in the held-out fold enter neither
-side. This keeps validation membership fixed while adding training material.
-Separate future evaluation recordings must not enter curation or checkpoint
-selection. The current scores are development validation, not independent tests.
+EDSR, QuickSRNet, IMDN, SAFMN, PlainUSR, RT4KSR and EfRLFN each completed 100
+epochs from official pretrained weights with fresh optimizers. The implementation
+is in `codescan_campaign/`; original configurations, checkpoints and curves
+remain in the local experiment archive. Historical service files describe
+those completed jobs and should not be enabled as a new training queue.
 
-## Recipe
+The codec recipe fits screenshots to 1920×1080, generates 60 frames with a
+static first half and synthetic vertical translation in the second half, and
+encodes complete frames at 720p / 600 Kbps / yuv420p. The aligned sample is frame
+45. `codescan_campaign/data.py` implements the recipe. Black-and-white source
+images are not the low-resolution inputs.
 
-| Setting | Value |
-|---|---|
-| Initialization | Official pretrained weights, independently per model/fold |
-| Optimizer / loss | Adam defaults / normalized RGB L1 |
-| Learning rate | Constant 1e-5 |
-| Batch / crop | Up to 32 paired crops; LR 64x64, HR 128x128 |
-| Precision | FP32; training TF32 enabled, validation TF32 disabled |
-| Sampling | Seeded shuffle without replacement each epoch; retain partial batch |
-| Selection / full validation | Every 10 / 50 epochs, plus the final epoch |
-| Selection rule | Highest fixed-subset equal-recording RGB PSNR, including epoch zero |
-| Metrics | PSNR, SSIM, LPIPS |
-| Recovery save | Every 100 updates and each epoch boundary |
+## Checkpoint selection
 
-Crops reduce memory and computation while preserving paired x2 coordinates.
-Each visit draws a new random crop from a frozen full frame. An epoch means one
-visit to every training frame, not enumeration of every possible patch.
-All architectures receive the same frame order within a fold, not equal compute.
+Mac validation covers 24 clips and 72 fixed frames. Highest equal-clip RGB PSNR
+at epochs 0, 5, …, 100 selects a checkpoint. CodeSCAN validation crops provide
+additional observations; the independent test does not select checkpoints.
 
-L1 is calculated between predicted and reference training patches. Validation
-runs on full held-out frames without gradient updates. Its fixed small subset
-(up to three anchors per recording) selects checkpoints; full validation describes
-quality across the complete held-out inventory.
+| Model | Selected epoch |
+| --- | ---: |
+| EDSR | 25 |
+| IMDN | 85 |
+| SAFMN | 85 |
+| EfRLFN | 100 |
+| QuickSRNet | 100 |
+| PlainUSR | 30 |
+| RT4KSR | 95 |
 
-| Fold | Training frames | Validation frames | Updates/epoch |
-|---|---:|---:|---:|
-| 0 | 3,316 | 143 | 104 |
-| 1 | 3,252 | 150 | 102 |
-| 2 | 3,352 | 139 | 105 |
-| 3 | 3,259 | 138 | 102 |
-| 4 | 3,441 | 113 | 108 |
+The final weights and official initialization hashes were fixed before test
+inference in [the test plan](../../results/evidence/test/PLAN.json). Training
+curves show Mac validation observations, not repeated test evaluations.
 
-The completed campaign started with a 500-epoch ceiling and continued to 1,500.
-All 15 trajectories total 2,344,500 optimizer updates. A ceiling is a budget,
-not a convergence test. There is no automatic early stopping.
+## Independent test
 
-## Prepare frozen data
+`codescan_test.py` evaluates all 1,200 held-out screenshots using the frozen
+codec recipe. It compares direct bicubic resizing and all seven models before
+and after fine-tuning: 15 methods and 18,000 metric records. Complete 1080p
+images are scored with RGB PSNR, RGB SSIM and LPIPS AlexNet v0.1. Model inference
+uses FP32; no test score is used to tune parameters or select a checkpoint.
 
-For new recordings, first run `prepare_video`, then assign content groups with
-`folds` and extract baseline pairs with `training_data`. See each module's
-`--help` and [curation](CURATION.md) for candidate extraction and quality review.
-Freeze only a signed-off pool:
+The runner checks protocol, source, input and weight hashes; split overlap;
+codec bitrate/VBV conditions; and per-method sample coverage. Its `prepare`,
+`evaluate` and `all` commands require a frozen plan and source manifests.
+Use `python -m benchmarks.super_resolution.codescan_test --help` for arguments.
+The GPU guard is bound to the recorded lab RTX 4090. Reproduction requires
+private/local datasets and checkpoint assets; the static presentation does not.
 
-```sh
-python -m benchmarks.super_resolution.freeze_training \
-  --candidates /path/to/candidates.json --proposal /path/to/proposal.json \
-  --pool /path/to/fold-additions.json --qc /path/to/audit.json \
-  --folds /path/to/folds.json --baseline /path/to/baseline/manifest.json \
-  --output /path/to/frozen
+Preserve completed metrics and protocols. A new experiment needs an independent
+output directory and an explicit protocol; do not tune on the final test data.
+Any subsequent development informed by these test scores requires a fresh
+held-out test to support a new final generalization claim.
 
-python -m benchmarks.super_resolution.pack_training \
-  --pairs /path/to/frozen/manifest.json --output /path/to/packed
-```
+## Historical tools
 
-Freezing copies and verifies source pixels, geometry and group assignments.
-Packing changes storage to read-only memory maps, not training pixels.
-`restore_packed` verifies compressed transport copies before use.
-Do not change data or folds in an existing run.
-
-## Train and resume
-
-One command owns one model/fold. It prints a plan unless `--execute` is added:
-
-```sh
-python -m benchmarks.super_resolution.train_epochs \
-  --pairs /path/to/packed/manifest.json --folds /path/to/frozen/folds.json \
-  --output /path/to/runs/imdn-fold-0 --model imdn --fold 0 --epochs 1500 \
-  --batch 32 --patch 64 --lr 0.00001 --validate-every 10 --full-every 50 \
-  --checkpoint-every 100 --selection-per-clip 3 --device cuda \
-  --pixel-metrics cuda --train-tf32
-```
-
-Select GPU visibility explicitly. For Slurm, `slurm_train_epochs.sh` maps indices
-0-4 to EDSR, 5-9 to IMDN and 10-14 to SAFMN. Its header defines required paths;
-set `ISS_TRAIN_EPOCHS` to the desired ceiling. Scheduler defaults are site-specific.
-
-Send SIGUSR1 to the verified worker PID for a safe pause (exit 75), then explicitly
-resume with identical arguments plus `--resume --execute`. Use an output-specific
-`flock` to prevent concurrent writers. A running validation finishes before pause;
-do not infer a stall from a temporarily unchanged update counter.
-Check `status.json`, `progress.jsonl` and stderr. Failed runs are not retried
-automatically.
-
-`last.pt` contains CURRENT weights, Adam, RNG, epoch and within-epoch cursor.
-`best.pt` contains the selected weights. Periodic snapshots contain the actual
-weights at each observation. Resume never combines earlier best weights with
-later optimizer state.
-
-To extend a completed budget, `extend_epochs` requires unchanged sources/data
-and a fresh output. It preserves CURRENT weights, Adam, RNG and the earlier best,
-changing only the cumulative ceiling. Ordinary resume and extension reject source
-drift. For the recognized pre-cleanup epoch campaign, explicitly add
-`--upgrade-sources` to migrate into a fresh output under the current code:
-
-```sh
-python -m benchmarks.super_resolution.extend_epochs \
-  --source /path/to/completed/imdn-fold-0 --output /path/to/continued/imdn-fold-0 \
-  --pairs /path/to/packed/manifest.json --folds /path/to/frozen/folds.json \
-  --home /path/to/model-assets --epochs 2000 --upgrade-sources
-```
-
-The ceiling is cumulative. Migration changes only the ceiling and source binding,
-not weights, Adam, RNG, completed steps, best weights, data or recipe. The original
-checkpoint remains untouched; `EXTENSION.json` and `parent-history/` preserve
-its provenance. Resume the new output with the same recipe, new ceiling and
-`--resume --execute`. Torch/CUDA and metric identities must still match.
-Unknown source maps are rejected even with the upgrade flag. Old source checkouts
-are not required after successful migration.
-
-## Report and select
-
-```sh
-python -m benchmarks.super_resolution.epoch_report \
-  --run /path/to/completed-runs --folds /path/to/frozen/folds.json \
-  --pairs /path/to/packed/manifest.json --output /path/to/fresh-report
-
-python -m benchmarks.super_resolution.epoch_plots \
-  --audit /path/to/fresh-report/audit.json --output /path/to/fresh-plots \
-  --continuation-epoch 500
-```
-
-The report checks all model/fold outputs, source identities, frame membership,
-per-frame scores, update counts and selected weights. It reconstructs summaries
-from saved scores; it does not rerun metric inference.
-Curves show CURRENT snapshots, not a running-best curve. Training-loss curves show
-frame-weighted batch L1 per epoch. Selected epochs can differ by model and fold.
-A five-fold model collection is not a single all-data deployment checkpoint.
-
-## Verification
-
-`ISS_SR_TRAIN_SMOKE=1 python -m pytest` enables cached official-model backpropagation
-and checkpoint round-trip tests in addition to the normal regression suite.
-
-The current runner was also checked on RTX A5000 with PyTorch 2.6.0/CUDA 12.4:
-all three official models completed short runs on real paired crops, full metric
-evaluation, exact mid-epoch recovery, budget extension and report/curve generation.
-All 15 existing 1,500-epoch checkpoints passed migration-state checks. Copies of
-fold 0 for each model continued from update 156,000 to 156,002 with a pause and
-resume between updates, without resetting Adam, RNG or the historical best.
-Original checkpoints and scores were unchanged. These are short functional checks,
-not another training campaign or live-viewer performance measurements.
+`train_epochs.py`, `train_candidates_epochs.py`, `folds.py`, and the Slurm epoch
+scripts belong to earlier recording-based or candidate campaigns. The earlier
+4,155-pair / five-fold / 1,500-epoch procedure is not the recipe for these results.
+Its documentation is retained in Git history and the external materials archive.
+The original data and checkpoints remain unchanged.

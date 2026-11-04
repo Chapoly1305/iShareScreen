@@ -3,8 +3,6 @@
   "requested_on": "2026-10-29",
   "reason": "User explicitly requested no training while materials are transferring",
   "release_condition": "User lifts the training hold",
-  "pending_source": "codescan.zip",
-  "next_model": "EDSR-baseline x2, quality upper-bound comparison",
   "target_input": {
     "width": 1280,
     "height": 720,
@@ -12,7 +10,7 @@
     "chroma": "420"
   },
   "training_started": true,
-  "materials_status": "Null-text compatibility fixed,5 affected sample encodes verified;6291 completed pairs retained; seven-model smoke recheck running before full preparation resumes",
+  "materials_status": "Frozen CodeSCAN train/validation codec pairs prepared; all seven models completed 100 epochs; independent 1200-sample test evaluation completed (18000 records).",
   "source_location_on_h100": "/home/jchen73/iShareScreen/datasets/sources/codescan",
   "source_split_catalog": "/home/jchen73/iShareScreen/datasets/codescan-splits.json",
   "source_split_audit": "/home/jchen73/iShareScreen/datasets/sources/codescan/split-v1/AUDIT.json",
@@ -27,5 +25,10 @@
     "plainusr",
     "rt4ksr",
     "efrlfn"
-  ]
+  ],
+  "campaign_status": "completed",
+  "test_evaluation_status": "completed",
+  "reviewed_on": "2026-11-03",
+  "record_scope": "Historical transfer hold and campaign authorization; status=released is retained for runner compatibility, not an instruction to restart completed jobs.",
+  "results": "results/README.md"
 }

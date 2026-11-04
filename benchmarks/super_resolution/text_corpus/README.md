@@ -1,5 +1,11 @@
 # Desktop text corpus and scratch experiment
 
+Historical scratch-training corpus. This 10,000-view corpus and its split are
+not the CodeSCAN dataset used for the final seven-model results. The current
+training/test protocol is in [TRAINING.md](../TRAINING.md), and the only published
+results are in [results/](../../../results/README.md). The commands below are
+retained for reproducing the archived corpus, not for restarting a current queue.
+
 This pipeline creates **10,000 new FHD desktop views**, not 10,000 independent
 documents. The first source snapshot contains 293 unique local Zotero PDFs and
 5,518 source files from this project and the local Matter SDK. PDFs are read
@@ -159,7 +165,7 @@ It copies completed runs, verifies their prediction/training bindings, scores
 the frozen OCR cases, and reports all three seeds per loss. Failed Slurm tasks
 are recorded; training is never resubmitted by this collector. Local collection
 requires the Mac to keep running, while Slurm training runs independently.
-Current launch IDs, pilot results and file links are recorded in
+Historical launch IDs, pilot results and file links are recorded in
 `artifacts/text-corpus-v1/EXPERIMENT_STATUS.md`.
 
 The October 21 runtime amendment explicitly migrates this campaign to two H100

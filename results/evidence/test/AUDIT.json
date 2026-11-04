@@ -1,0 +1,12 @@
+{
+  "complete": true,
+  "test_samples": 1200,
+  "methods": 15,
+  "records": 18000,
+  "unique_ids_match_frozen_test_pairs": true,
+  "all_aggregate_metrics_recomputed": true,
+  "metric_records_bound_to_frozen_plan": true,
+  "timing_checkpoint_hashes_match_test_checkpoints": true,
+  "train_validation_overlap_checks_passed": true,
+  "source_data_sha256": "dcb35cb1060ce10f1f79d5a6baab65fc8c18e34c3b15cbb2311f35cf58f245be"
+}

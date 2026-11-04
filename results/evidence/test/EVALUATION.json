@@ -1,0 +1,12 @@
+{
+  "plan_sha256": "96a8514af9ff49a72bd36780148b45005b89be47da0c8c0ab70d8abc2757f7a1",
+  "data_sha256": "dcb35cb1060ce10f1f79d5a6baab65fc8c18e34c3b15cbb2311f35cf58f245be",
+  "gpu": "NVIDIA GeForce RTX 4090, GPU-f3d8b210-4eb5-a38b-a81d-983611f83a6a, 595.99.02, 34, 17.69 W, 210 MHz, 342 MiB",
+  "host": "Alienware",
+  "torch": "2.6.0+cu124",
+  "cuda": "12.4",
+  "lpips": {
+    "backbone_sha256": "7be5be791159472b1fbf3c69796f7cb30dca7ad8466c2df70058c37116cdee02",
+    "linear_sha256": "df73285e35b22355a2df87cdb6b70b343713b667eddbda73e1977e0c860835c0"
+  }
+}

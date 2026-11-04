@@ -1,11 +1,14 @@
 # myMain integration review — 2026-10-28
 
+Historical integration record for the revisions named below. It does not describe
+the current research results or an active work queue.
+
 ## Baseline and recovery
 
 The original `myMain` tip was `7eca6ba`. It is preserved locally as
 `backup/myMain-before-integration-20261028`.
 
-Merge `5e2fcaa` retains both branch histories and resolves the tree to current
+Merge `5e2fcaa` retains both branch histories and resolves the tree to the then-current
 `main` (`9ab40d3`). This deliberately replaces older implementations before
 selectively restoring the useful fork changes. The initial merge had 26
 conflicted files; simply preferring the old branch would lose newer AVC

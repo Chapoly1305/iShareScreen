@@ -1,0 +1,133 @@
+{
+  "passed": true,
+  "id": "00953522fe785db9a3a9ab26",
+  "role": "Pipeline correctness only; no checkpoint selection or tuning",
+  "rows": [
+    {
+      "model": "quicksrnet",
+      "variant": "pretrained",
+      "shape": [
+        1080,
+        1920,
+        3
+      ]
+    },
+    {
+      "model": "quicksrnet",
+      "variant": "finetuned",
+      "shape": [
+        1080,
+        1920,
+        3
+      ]
+    },
+    {
+      "model": "plainusr",
+      "variant": "pretrained",
+      "shape": [
+        1080,
+        1920,
+        3
+      ]
+    },
+    {
+      "model": "plainusr",
+      "variant": "finetuned",
+      "shape": [
+        1080,
+        1920,
+        3
+      ]
+    },
+    {
+      "model": "rt4ksr",
+      "variant": "pretrained",
+      "shape": [
+        1080,
+        1920,
+        3
+      ]
+    },
+    {
+      "model": "rt4ksr",
+      "variant": "finetuned",
+      "shape": [
+        1080,
+        1920,
+        3
+      ]
+    },
+    {
+      "model": "efrlfn",
+      "variant": "pretrained",
+      "shape": [
+        1080,
+        1920,
+        3
+      ]
+    },
+    {
+      "model": "efrlfn",
+      "variant": "finetuned",
+      "shape": [
+        1080,
+        1920,
+        3
+      ]
+    },
+    {
+      "model": "imdn",
+      "variant": "pretrained",
+      "shape": [
+        1080,
+        1920,
+        3
+      ]
+    },
+    {
+      "model": "imdn",
+      "variant": "finetuned",
+      "shape": [
+        1080,
+        1920,
+        3
+      ]
+    },
+    {
+      "model": "safmn",
+      "variant": "pretrained",
+      "shape": [
+        1080,
+        1920,
+        3
+      ]
+    },
+    {
+      "model": "safmn",
+      "variant": "finetuned",
+      "shape": [
+        1080,
+        1920,
+        3
+      ]
+    },
+    {
+      "model": "edsr",
+      "variant": "pretrained",
+      "shape": [
+        1080,
+        1920,
+        3
+      ]
+    },
+    {
+      "model": "edsr",
+      "variant": "finetuned",
+      "shape": [
+        1080,
+        1920,
+        3
+      ]
+    }
+  ]
+}

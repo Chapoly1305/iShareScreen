@@ -1,4 +1,4 @@
-# Training and readability experiment code
+# Research code and result maintenance
 
 ## Entry points
 
@@ -10,16 +10,17 @@
 | `mac_readability/` | Native Mac capture/encoding, source-detail transport, SR and independent confirmation |
 | `experiments/` (ignored) | Immutable protocols, data indexes, checkpoints, measurements and reports |
 
-See [the Mac experiment runbook](mac_readability/README.md) for the completed
-independent confirmation and its limitations. These scripts are research tools;
-the source-detail transport is not integrated into the normal Screen Sharing
-client. Training services are historical campaign configurations, not services
-to enable indiscriminately on a new machine. Inspect current GPU ownership and
-the applicable `AGENTS.md` before any new run.
+The final result uses `codescan_campaign/` for training and `codescan_test.py`
+for independent testing. See [the current protocol](TRAINING.md) and
+[the canonical report](../../results/README.md). The Mac source-detail runbook
+is historical; supplement transport is excluded from the final project.
+Training services are completed-campaign configurations, not services to enable
+on a new machine. Inspect GPU ownership and `AGENTS.md` before new runs.
 
 `datasets/split_codescan.py` is source code and belongs in Git. Dataset contents,
 original DVR recordings, model assets, generated videos and captured credentials
-do not. Local exclude rules may hide the splitter even though the repository
+do not. Reviewed static presentation assets and measurement evidence in `results/`
+are the intentional exception for published research outputs. Local exclude rules may hide the splitter even though the repository
 ignore rules explicitly allow it.
 
 ## Regression checks
@@ -39,7 +40,7 @@ macOS, Windows and official-model tests report explicit skips when their
 environment is unavailable. A passing CPU suite does not validate those paths
 on real hardware.
 
-On 2026-11-03 the cleaned tree passed 664 tests, with 57 explicit skips and two
+The recorded pre-presentation cleanup on 2026-11-03 passed 664 tests, with 57 explicit skips and two
 warnings. Compilation, whitespace checks and the selected Ruff error checks
 passed. Detailed local receipts are in
 `experiments/code-review-20261103/VALIDATION.json`, `pytest.log` and `ruff.log`.
@@ -55,7 +56,7 @@ Completed experiments record source hashes, not just model and input hashes.
 Before formatting, source copies and SHA256 receipts were preserved locally in
 `experiments/code-review-20261103/original-source/`. Frozen primary stream
 versions also remain in the experiment's `evidence/stream-v*/` directories.
-The independent confirmation's 232 bound evidence files remain unchanged.
+The historical source-detail confirmation's 232 bound evidence files remain unchanged.
 
 Formatting changes the source hash even when the Python syntax tree is
 identical. Use the recorded original source to reproduce a frozen run; use a
@@ -69,7 +70,8 @@ checkpoints are preserved. These changes do not start or resume training.
 
 [`../../results/`](../../results/README.md) is the only maintained results
 presentation. It is independent of the local experiment archive and can be
-served unchanged by a static file host. The gallery preserves seven scenes,
+served unchanged by a static file host. The primary table covers 1,200 held-out CodeSCAN test samples. The supplementary
+Mac validation gallery preserves seven scenes,
 49 pretrained/fine-tuned pairs and the no-SR controls. Keep limitations and
 failure cases visible when editing it.
 

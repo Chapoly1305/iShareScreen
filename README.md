@@ -9,7 +9,9 @@ available.
 
 The project's single results presentation is **[results/index.html](results/index.html)**.
 It includes seven desktop scenes, interactive pretrained/fine-tuned comparisons,
-a no-SR control, validation PSNR and RTX 4090 inference latency.
+a no-SR control, independent CodeSCAN test PSNR / SSIM / LPIPS and RTX 4090
+inference latency. The seven visual examples are supplementary Mac validation
+scenes; the primary test evaluation covers 1,200 held-out CodeSCAN samples.
 See the [report and evaluation limits](results/README.md).
 
 Download or clone the repository and open `results/index.html` in a browser.
@@ -17,6 +19,18 @@ For static hosting, publish the contents of `results/` as the site root; no buil
 backend, Python environment, model weights or external assets are required.
 GitHub's file view shows HTML source; use the downloaded page or a static host
 for the interactive presentation.
+
+## Documentation
+
+- [Final results and protocol](results/README.md): independent CodeSCAN test;
+  supplementary Mac validation and separate RTX 4090 latency measurements.
+- [Training](benchmarks/super_resolution/TRAINING.md) and
+  [data isolation](benchmarks/super_resolution/CURATION.md): completed campaign.
+- [Viewer setup](docs/video-enhancement.md): runtime installation and behavior.
+
+This research branch builds on [upstream iShareScreen](https://github.com/renegadelink/iShareScreen).
+The install commands below select this repository's `cs682-video-enhancement`
+branch. Static results can be viewed without installing the client.
 
 ## Setup
 
@@ -34,7 +48,7 @@ for the interactive presentation.
    `brew install python`, or `uv python install 3.13`).
 2. Install iShareScreen:
    ```sh
-   pip install git+https://github.com/renegadelink/iShareScreen.git
+   pip install git+https://github.com/Chapoly1305/iShareScreen.git@cs682-video-enhancement
    ```
 
 #### Windows
@@ -43,7 +57,7 @@ for the interactive presentation.
    (the installer includes pip; check "Add python.exe to PATH" during install).
 2. Open PowerShell or cmd and run:
    ```sh
-   pip install git+https://github.com/renegadelink/iShareScreen.git
+   pip install git+https://github.com/Chapoly1305/iShareScreen.git@cs682-video-enhancement
    ```
 
 3. (Optional, only if you want audio) install **libfdk-aac** — Apple's
@@ -86,7 +100,7 @@ for the interactive presentation.
 3. Install iShareScreen (in a venv recommended):
    ```sh
    python3 -m venv ~/.venvs/iss
-   ~/.venvs/iss/bin/pip install git+https://github.com/renegadelink/iShareScreen.git
+   ~/.venvs/iss/bin/pip install git+https://github.com/Chapoly1305/iShareScreen.git@cs682-video-enhancement
    ~/.venvs/iss/bin/iss     # or symlink to ~/.local/bin
    ```
 

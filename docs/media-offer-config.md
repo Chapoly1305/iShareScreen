@@ -141,5 +141,9 @@ pixel formats. Auto retains the existing format bitmap. Auto codec plus 4:4:4
 selects HEVC. H.264 4:4:4 and browser 4:4:4 are rejected because those paths
 are not supported by this client. HEVC 4:2:0 is an advertised preference;
 remote-host negotiation and hardware decoding still require live validation.
-The current HEVC decoder registry retains its conservative 4:4:4 capability
-probes, so requesting 4:2:0 does not guarantee selection of a different GPU.
+The registry includes an explicit Windows `amd-hevc420` hardware path. Other
+HEVC entries retain their 4:4:4 capability probes, so requesting 4:2:0 does not
+guarantee selection of a different GPU. Native 4:2:0 rendering support and
+negotiation preferences do not establish successful live hardware decoding on
+every receiver. The offline test report uses x265 inputs and is a separate
+measurement from this negotiation path.
