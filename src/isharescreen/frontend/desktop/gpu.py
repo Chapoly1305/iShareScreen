@@ -30,6 +30,26 @@ import wgpu
 # throttle, why the overlay did or didn't draw each frame.
 _CURSOR_DEBUG = os.environ.get("ISS_CURSOR_DEBUG") == "1"
 
+# Upscale filter for the video. "sharp" (default) = sharp-bilinear: crisp
+# texel edges when the stream is magnified (pixel-exact at integer ratios such
+# as a 1x host shown on a 2x Retina window). "linear" = plain bilinear (the
+# previous, softer behaviour). No effect at 1:1 or when downscaling.
+_SHARP_UPSCALE = os.environ.get("ISS_SCALE_FILTER", "sharp").lower() != "linear"
+
+
+def _sharpen_amount() -> float:
+    """ISS_SHARPEN: edge sharpening strength, 0 (off, default)
+    to 1 (strongest). ~0.3–0.6 tightens 1x host text shown on a Retina
+    window; higher values also make compression noise more visible."""
+    raw = os.environ.get("ISS_SHARPEN", "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return min(1.0, max(0.0, float(raw)))
+    except ValueError:
+        log.warning("ignoring ISS_SHARPEN=%r (expected a number 0..1)", raw)
+        return 0.0
+
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +78,11 @@ struct Uniforms {
     uv_offset: vec2<f32>,
     chroma_scale: vec2<f32>,
     chroma_offset: vec2<f32>,
+    // Screen px per luma / chroma texel, for sharp_uv. (1,1) = plain bilinear.
+    luma_sharp: vec2<f32>,
+    chroma_sharp: vec2<f32>,
+    // x = edge sharpening amount 0..1 (0 = off); y/zw unused padding.
+    sharpen: vec4<f32>,
 };
 @group(0) @binding(4) var<uniform> U: Uniforms;
 
@@ -86,11 +111,72 @@ fn vs(@builtin(vertex_index) i: u32) -> VsOut {
 @group(0) @binding(2) var v_tex: texture_2d<f32>;
 @group(0) @binding(3) var samp: sampler;
 
+// Sharp-bilinear upscale. `s` = screen pixels per texel on each axis. Inside
+// each texel the sample snaps to the texel centre (exact source value, like
+// nearest); only the outermost ~1 screen pixel at each texel boundary blends
+// to the neighbour (like bilinear). At an exact integer ratio (e.g. a 1x host
+// on a 2x Retina window) every fragment centre lands in a flat region, so the
+// result is pixel-exact nearest; at fractional ratios edges stay crisp without
+// nearest's uneven, shimmering stroke widths. s <= 1 (1:1 or downscale) is a
+// no-op: plain bilinear, identical to the previous behaviour.
+fn sharp_uv(uv: vec2<f32>, dims: vec2<f32>, s: vec2<f32>) -> vec2<f32> {
+    let k = max(s, vec2<f32>(1.0, 1.0));
+    let texel = uv * dims;
+    let d = fract(texel) - 0.5;
+    let region = vec2<f32>(0.5, 0.5) - 0.5 / k;
+    let f = (d - clamp(d, -region, region)) * k + 0.5;
+    return (floor(texel) + f) / dims;
+}
+
+// Edge sharpening on luma: a local contrast stretch at SOURCE texel spacing
+// (so a magnified stream is sharpened once per host pixel). Takes the min/max
+// over a radius-2 cross and pushes the pixel along an S-curve within that
+// range, steepening the grey anti-aliasing ramps of 1x host text toward the
+// adjacent ink/paper. The result never leaves [min, max], so there is no
+// halo/ringing; a low-range gate leaves flat areas and faint compression noise
+// alone. (CAS-style sharpeners skip full-contrast edges, i.e. exactly black
+// text on white, which is why this is not CAS.) `amount` 0 = off; the branch
+// is uniform since U is a uniform buffer.
+fn sharpen_luma(t: texture_2d<f32>, sp: sampler, uv: vec2<f32>, c: f32,
+                amount: f32) -> f32 {
+    if (amount <= 0.0) {
+        return c;
+    }
+    let px = 1.0 / vec2<f32>(textureDimensions(t));
+    let dx = vec2<f32>(px.x, 0.0);
+    let dy = vec2<f32>(0.0, px.y);
+    let a = textureSampleLevel(t, sp, uv - dx, 0.0).r;
+    let b = textureSampleLevel(t, sp, uv + dx, 0.0).r;
+    let d = textureSampleLevel(t, sp, uv - dy, 0.0).r;
+    let e = textureSampleLevel(t, sp, uv + dy, 0.0).r;
+    let a2 = textureSampleLevel(t, sp, uv - 2.0 * dx, 0.0).r;
+    let b2 = textureSampleLevel(t, sp, uv + 2.0 * dx, 0.0).r;
+    let d2 = textureSampleLevel(t, sp, uv - 2.0 * dy, 0.0).r;
+    let e2 = textureSampleLevel(t, sp, uv + 2.0 * dy, 0.0).r;
+    let mn = min(min(min(c, a), min(b, d)), min(min(e, a2), min(b2, min(d2, e2))));
+    let mx = max(max(max(c, a), max(b, d)), max(max(e, a2), max(b2, max(d2, e2))));
+    let range = mx - mn;
+    if (range < 1e-3) {
+        return c;
+    }
+    let x = clamp((c - mn) / range, 0.0, 1.0);
+    let s1 = x * x * (3.0 - 2.0 * x);
+    let s2 = s1 * s1 * (3.0 - 2.0 * s1);
+    // amount 0..0.5 blends toward one smoothstep, 0.5..1 toward two.
+    let k = clamp(amount, 0.0, 1.0) * 2.0;
+    let curve = select(mix(s1, s2, k - 1.0), mix(x, s1, k), k <= 1.0);
+    let gate = smoothstep(0.04, 0.16, range);
+    return mn + mix(x, curve, gate) * range;
+}
+
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    let luv = in.uv * U.uv_scale + U.uv_offset;
-    let cuv = in.uv * U.chroma_scale + U.chroma_offset;
-    let y  = textureSample(y_tex, samp, luv).r;
+    let luv = sharp_uv(in.uv * U.uv_scale + U.uv_offset,
+                       vec2<f32>(textureDimensions(y_tex)), U.luma_sharp);
+    let cuv = sharp_uv(in.uv * U.chroma_scale + U.chroma_offset,
+                       vec2<f32>(textureDimensions(u_tex)), U.chroma_sharp);
+    let y  = sharpen_luma(y_tex, samp, luv,
+                      textureSample(y_tex, samp, luv).r, U.sharpen.x);
     let cb = textureSample(u_tex, samp, cuv).r - 0.5;
     let cr = textureSample(v_tex, samp, cuv).r - 0.5;
     let r = y + 1.5748   * cr;
@@ -119,6 +205,11 @@ struct Uniforms {
     uv_offset: vec2<f32>,
     chroma_scale: vec2<f32>,
     chroma_offset: vec2<f32>,
+    // Screen px per luma / chroma texel, for sharp_uv. (1,1) = plain bilinear.
+    luma_sharp: vec2<f32>,
+    chroma_sharp: vec2<f32>,
+    // x = edge sharpening amount 0..1 (0 = off); y/zw unused padding.
+    sharpen: vec4<f32>,
 };
 @group(0) @binding(3) var<uniform> U: Uniforms;
 
@@ -144,11 +235,72 @@ fn vs(@builtin(vertex_index) i: u32) -> VsOut {
 @group(0) @binding(1) var uv_tex: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
 
+// Sharp-bilinear upscale. `s` = screen pixels per texel on each axis. Inside
+// each texel the sample snaps to the texel centre (exact source value, like
+// nearest); only the outermost ~1 screen pixel at each texel boundary blends
+// to the neighbour (like bilinear). At an exact integer ratio (e.g. a 1x host
+// on a 2x Retina window) every fragment centre lands in a flat region, so the
+// result is pixel-exact nearest; at fractional ratios edges stay crisp without
+// nearest's uneven, shimmering stroke widths. s <= 1 (1:1 or downscale) is a
+// no-op: plain bilinear, identical to the previous behaviour.
+fn sharp_uv(uv: vec2<f32>, dims: vec2<f32>, s: vec2<f32>) -> vec2<f32> {
+    let k = max(s, vec2<f32>(1.0, 1.0));
+    let texel = uv * dims;
+    let d = fract(texel) - 0.5;
+    let region = vec2<f32>(0.5, 0.5) - 0.5 / k;
+    let f = (d - clamp(d, -region, region)) * k + 0.5;
+    return (floor(texel) + f) / dims;
+}
+
+// Edge sharpening on luma: a local contrast stretch at SOURCE texel spacing
+// (so a magnified stream is sharpened once per host pixel). Takes the min/max
+// over a radius-2 cross and pushes the pixel along an S-curve within that
+// range, steepening the grey anti-aliasing ramps of 1x host text toward the
+// adjacent ink/paper. The result never leaves [min, max], so there is no
+// halo/ringing; a low-range gate leaves flat areas and faint compression noise
+// alone. (CAS-style sharpeners skip full-contrast edges, i.e. exactly black
+// text on white, which is why this is not CAS.) `amount` 0 = off; the branch
+// is uniform since U is a uniform buffer.
+fn sharpen_luma(t: texture_2d<f32>, sp: sampler, uv: vec2<f32>, c: f32,
+                amount: f32) -> f32 {
+    if (amount <= 0.0) {
+        return c;
+    }
+    let px = 1.0 / vec2<f32>(textureDimensions(t));
+    let dx = vec2<f32>(px.x, 0.0);
+    let dy = vec2<f32>(0.0, px.y);
+    let a = textureSampleLevel(t, sp, uv - dx, 0.0).r;
+    let b = textureSampleLevel(t, sp, uv + dx, 0.0).r;
+    let d = textureSampleLevel(t, sp, uv - dy, 0.0).r;
+    let e = textureSampleLevel(t, sp, uv + dy, 0.0).r;
+    let a2 = textureSampleLevel(t, sp, uv - 2.0 * dx, 0.0).r;
+    let b2 = textureSampleLevel(t, sp, uv + 2.0 * dx, 0.0).r;
+    let d2 = textureSampleLevel(t, sp, uv - 2.0 * dy, 0.0).r;
+    let e2 = textureSampleLevel(t, sp, uv + 2.0 * dy, 0.0).r;
+    let mn = min(min(min(c, a), min(b, d)), min(min(e, a2), min(b2, min(d2, e2))));
+    let mx = max(max(max(c, a), max(b, d)), max(max(e, a2), max(b2, max(d2, e2))));
+    let range = mx - mn;
+    if (range < 1e-3) {
+        return c;
+    }
+    let x = clamp((c - mn) / range, 0.0, 1.0);
+    let s1 = x * x * (3.0 - 2.0 * x);
+    let s2 = s1 * s1 * (3.0 - 2.0 * s1);
+    // amount 0..0.5 blends toward one smoothstep, 0.5..1 toward two.
+    let k = clamp(amount, 0.0, 1.0) * 2.0;
+    let curve = select(mix(s1, s2, k - 1.0), mix(x, s1, k), k <= 1.0);
+    let gate = smoothstep(0.04, 0.16, range);
+    return mn + mix(x, curve, gate) * range;
+}
+
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    let uv = in.uv * U.uv_scale + U.uv_offset;
-    let y  = textureSample(y_tex, samp, uv).r;
-    let cuv = in.uv * U.chroma_scale + U.chroma_offset;
+    let uv = sharp_uv(in.uv * U.uv_scale + U.uv_offset,
+                      vec2<f32>(textureDimensions(y_tex)), U.luma_sharp);
+    let y  = sharpen_luma(y_tex, samp, uv,
+                      textureSample(y_tex, samp, uv).r, U.sharpen.x);
+    let cuv = sharp_uv(in.uv * U.chroma_scale + U.chroma_offset,
+                       vec2<f32>(textureDimensions(uv_tex)), U.chroma_sharp);
     let c  = textureSample(uv_tex, samp, cuv);
     let cb = c.r - 0.5;
     let cr = c.g - 0.5;
@@ -238,6 +390,8 @@ class Renderer:
         # 4:2:0 (H.264/AVC). draw() multiplies uv_scale by this to get the
         # shader's chroma_scale, so half-res chroma sampled correctly.
         self._chroma_ratio: tuple[float, float] = (1.0, 1.0)
+        # Edge sharpening strength (0 = off), from ISS_SHARPEN.
+        self._sharpen = _sharpen_amount()
 
         self._allocate_canvas(canvas_w, canvas_h)
 
@@ -245,18 +399,20 @@ class Renderer:
             mag_filter=wgpu.FilterMode.linear,
             min_filter=wgpu.FilterMode.linear,
         )
-        # 32-byte uniform, 4× vec2: uv_scale, uv_offset, chroma_scale,
-        # chroma_offset. Updated per-draw. Shared by the planar (reads all four)
+        # 64-byte uniform: 6× vec2 (uv_scale, uv_offset, chroma_scale,
+        # chroma_offset, luma_sharp, chroma_sharp) + vec4 sharpen
+        # (x = sharpen amount). Updated per-draw. Shared by the planar (reads all four)
         # and biplanar (reads uv_scale + uv_offset) pipelines — the shared
         # layout is why offset follows scale rather than trailing the chroma
         # pair. Default = full-content crop from the origin (offsets 0).
         self._uniform_buf = device.create_buffer(
-            size=32,
+            size=64,
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
         )
         device.queue.write_buffer(
             self._uniform_buf, 0,
-            np.array([1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0],
+            np.array([1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0,
+                      1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
                      dtype=np.float32).tobytes(),
         )
         # Optional display crop: a sub-rect of the canvas (in canvas texels) to
@@ -270,7 +426,7 @@ class Renderer:
         }
         uniform_entry = {"visibility": wgpu.ShaderStage.FRAGMENT,
                          "buffer": {"type": wgpu.BufferBindingType.uniform}}
-        uniform_resource = {"buffer": self._uniform_buf, "offset": 0, "size": 32}
+        uniform_resource = {"buffer": self._uniform_buf, "offset": 0, "size": 64}
         # Captured for the lazy nv24 (biplanar) pipeline build — see
         # _ensure_biplanar. It's deferred until the first nv24 tile so platforms
         # that only ever hit the planar yuv444p path (every non-Mac build, where
@@ -683,6 +839,22 @@ class Renderer:
         video zoom); this multiplier (ISS_CURSOR_SCALE) tunes it further."""
         self._cursor_scale = max(0.1, float(scale))
 
+    def _sharp_factors(
+        self, target_w: int, target_h: int, cw: int, ch: int,
+    ) -> "tuple[tuple[float, float], tuple[float, float]]":
+        """Screen px per luma texel and per chroma texel for `sharp_uv`.
+
+        (1, 1) means plain bilinear. Chroma is only sharpened for 4:4:4:
+        4:2:0 chroma is half-res by design, and hard-edging it would draw
+        visible 2x2 colour blocks around coloured text, so it keeps bilinear.
+        """
+        if not _SHARP_UPSCALE or cw <= 0 or ch <= 0:
+            return (1.0, 1.0), (1.0, 1.0)
+        luma = (target_w / cw, target_h / ch)
+        if self._chroma_ratio == (1.0, 1.0):
+            return luma, luma
+        return luma, (1.0, 1.0)
+
     def draw(
         self, target_view: wgpu.GPUTextureView,
         target_w: int, target_h: int,
@@ -718,9 +890,11 @@ class Renderer:
         # both the span and the offset by the ratio lands sampling on the same
         # region of content — the bilinear sampler upsamples to luma res.
         crx, cry = self._chroma_ratio
+        ls, cs = self._sharp_factors(target_w, target_h, cw, ch)
         self._device.queue.write_buffer(
             self._uniform_buf, 0,
-            np.array([ux, uy, ox, oy, ux * crx, uy * cry, ox * crx, oy * cry],
+            np.array([ux, uy, ox, oy, ux * crx, uy * cry, ox * crx, oy * cry,
+                      *ls, *cs, self._sharpen, 0.0, 0.0, 0.0],
                      dtype=np.float32).tobytes(),
         )
         # Fill the whole window (the pre-rework baseline behavior). The window
