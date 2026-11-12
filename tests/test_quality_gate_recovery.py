@@ -119,3 +119,18 @@ def test_unreliable_then_reliable_still_holds():
     clk.advance(0.01)
     g.mark_clean(0)
     assert 0 not in g._keyframe_required          # reliable noise didn't re-hold
+
+
+def test_certain_drop_inside_post_idr_grace_still_requires_a_keyframe():
+    # Live regression: a frame was dropped by the receiver 111 ms after a
+    # keyframe; the grace period swallowed it and no keyframe was requested
+    # for 25 s while the tile's reference chain stayed broken.
+    g, clk = _gate()
+    g.mark_idr_observed(0)
+    clk.advance(0.1)
+
+    g.mark_decode_error(0)                      # ordinary post-IDR noise
+    assert 0 not in g.bad_tiles
+
+    g.mark_decode_error(0, certain=True)        # the receiver dropped the AU
+    assert 0 in g.bad_tiles

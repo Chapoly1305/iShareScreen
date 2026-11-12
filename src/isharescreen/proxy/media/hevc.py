@@ -268,6 +268,9 @@ class HevcDecoder:
         self._next_pts = 0
         self._pts_to_tile: dict[int, int] = {}
         self._pts_submit_t: dict[int, float] = {}
+        # pts -> DONL of a slice whose references were all present when fed;
+        # becomes the LTR ack only once that frame decodes cleanly.
+        self._pts_donl: dict[int, int] = {}
         self._decode_latency_ms: float = 0.0
         self._eagain_streak = 0
         # Session-wide IDR seen since last decoder reset. Cross-tile DPB
@@ -436,6 +439,7 @@ class HevcDecoder:
         cascade FIRs. Dropping is silent + free, and we'll resume
         feeding once a fresh IDR arrives.
         """
+        ack_donl: Optional[int] = None
         if len(nalu) >= 1:
             nal_unit_type = (nalu[0] >> 1) & 0x3F
             # Tally per-tile NALU-type histogram for diagnostics.
@@ -458,12 +462,6 @@ class HevcDecoder:
                 # post-decode `decode_error_flags` path is the
                 # authoritative concealment signal anyway.
                 self._rps_tracker.commit_decoded()
-                # Record this frame's DONL for the LTRP ack when the slice's
-                # references are all present (best available pre-decode "this
-                # frame is good" signal). Post-decode concealment is still
-                # caught by decode_error_flags.
-                if not missing and donl is not None and 0 <= tile_idx < len(self.last_clean_donl):
-                    self.last_clean_donl[tile_idx] = donl
                 if missing:
                     # Mark for FIR but DO feed the slice. Feeding a
                     # slice with truly-missing refs produces a
@@ -473,8 +471,12 @@ class HevcDecoder:
                     # fill. Apple responds to the FIR with a fresh
                     # IDR within ~200 ms which closes the window.
                     self._gate.mark_decode_error(tile_idx)
+                else:
+                    # LTRP ack candidate: recorded only once this frame
+                    # decodes cleanly (see _store_frame), never on receipt.
+                    ack_donl = donl
         if self._sync_decode_mode:
-            self._decode_one(nalu, tile_idx)
+            self._decode_one(nalu, tile_idx, ack_donl)
             return
         if self._queue is None or self._worker is None or not self._worker.is_alive():
             self._start_worker()
@@ -490,7 +492,7 @@ class HevcDecoder:
         if q is None:
             return
         try:
-            q.put_nowait((nalu, tile_idx))
+            q.put_nowait((nalu, tile_idx, ack_donl))
         except queue.Full:
             # Queue overflow — drop. DIAGNOSTIC: a dropped slice that a
             # later P-frame references (Apple uses refs ≤8 back) is a
@@ -626,7 +628,7 @@ class HevcDecoder:
 
     # -- internals: decode --------------------------------------------
 
-    def _decode_one(self, nalu: bytes, tile_idx: int) -> None:
+    def _decode_one(self, nalu: bytes, tile_idx: int, donl: Optional[int] = None) -> None:
         """Wrap one NALU in an `av.Packet`, attach a fresh PTS, run through
         the shared codec, and dispatch any output frames back to per-tile
         slots via the PTS map."""
@@ -724,11 +726,14 @@ class HevcDecoder:
         self._pts_to_tile[pts] = tile_idx
         import time as _time
         self._pts_submit_t[pts] = _time.monotonic()
+        if donl is not None:
+            self._pts_donl[pts] = donl
         self._next_pts += 1
         if len(self._pts_to_tile) > _PTS_MAP_SOFT_MAX:
             cutoff = pts - _PTS_MAP_PRUNE_KEEP
             self._pts_to_tile = {k: v for k, v in self._pts_to_tile.items() if k > cutoff}
             self._pts_submit_t = {k: v for k, v in self._pts_submit_t.items() if k > cutoff}
+            self._pts_donl = {k: v for k, v in self._pts_donl.items() if k > cutoff}
 
         try:
             with self._codec_lock:
@@ -787,6 +792,7 @@ class HevcDecoder:
 
         ti = self._pts_to_tile.pop(frame.pts, None)
         submit_t = self._pts_submit_t.pop(frame.pts, None)
+        donl = self._pts_donl.pop(frame.pts, None)
         if ti is None:
             # PTS aged out of the map (rare on healthy streams; can happen
             # if libavcodec reordered output and our prune fired between).
@@ -808,11 +814,11 @@ class HevcDecoder:
         if self._amd_only:
             if not self._pending_downloads:
                 self._pending_since = time.perf_counter()
-            self._pending_downloads.append((ti, frame, had_error))
+            self._pending_downloads.append((ti, frame, had_error, donl))
             if len(self._pending_downloads) >= min(self.num_tiles, _AMD_DOWNLOAD_BATCH_MAX):
                 self._flush_downloads()
             return
-        self._prepare_frame(ti, frame, had_error)
+        self._prepare_frame(ti, frame, had_error, donl)
 
     def _flush_downloads(self) -> None:
         # Submit several decode operations before waiting on their readbacks.
@@ -820,10 +826,13 @@ class HevcDecoder:
         # CPU-owned bytes only. Do not hold a codec/lifecycle lock while joining
         # this producer during shutdown.
         pending, self._pending_downloads = self._pending_downloads, []
-        for ti, frame, had_error in pending:
-            self._prepare_frame(ti, frame, had_error)
+        for ti, frame, had_error, donl in pending:
+            self._prepare_frame(ti, frame, had_error, donl)
 
-    def _prepare_frame(self, ti: int, frame: av.VideoFrame, had_error: bool) -> None:
+    def _prepare_frame(
+        self, ti: int, frame: av.VideoFrame, had_error: bool,
+        donl: Optional[int] = None,
+    ) -> None:
         # Run on the decode producer, before notifying the display thread.
         # Non-AMD backends publish immediately; they do not inherit AMD's
         # hardware-specific batching delay.
@@ -835,10 +844,11 @@ class HevcDecoder:
             log.exception("HEVC frame preparation failed for tile %d", ti)
             return
         if tile is not None:
-            self._store_frame(ti, tile, had_error or conversion_error)
+            self._store_frame(ti, tile, had_error or conversion_error, donl)
 
     def _store_frame(
         self, ti: int, frame: TileFrame, had_error: bool,
+        donl: Optional[int] = None,
     ) -> None:
         slot = self._tiles[ti]
         with slot.lock:
@@ -847,6 +857,14 @@ class HevcDecoder:
             slot.good_count += 1
             if not had_error:
                 slot.clean_count += 1
+        # Ack decoded output only: the host may re-reference an acked frame
+        # instead of sending a keyframe, so it must be one we really hold —
+        # not a concealed frame, nor one decoded while the tile's reference
+        # chain is known to be broken.
+        if (donl is not None and not had_error
+                and 0 <= ti < len(self.last_clean_donl)
+                and ti not in self._gate.bad_tiles):
+            self.last_clean_donl[ti] = donl
 
         if self._on_frame_published is not None:
             try:
@@ -1064,9 +1082,9 @@ class HevcDecoder:
                 continue
             if item is None:
                 break
-            nalu, tile_idx = item
+            nalu, tile_idx, donl = item
             try:
-                self._decode_one(nalu, tile_idx)
+                self._decode_one(nalu, tile_idx, donl)
                 if self._pending_downloads and time.perf_counter() - self._pending_since >= _AMD_DOWNLOAD_WAIT_S:
                     self._flush_downloads()
             except Exception as e:
@@ -1174,6 +1192,7 @@ class HevcDecoder:
         self._next_pts = 0
         self._pts_to_tile = {}
         self._pts_submit_t = {}
+        self._pts_donl = {}
         self._decode_latency_ms = 0.0
         log.info("HEVC decoder: shared context (%s)", hw_name or "software")
         # NALU dump diagnostic: prepend VPS+SPS+all-PPSes (Annex-B) so a
@@ -1252,6 +1271,7 @@ class HevcDecoder:
         self._next_pts = 0
         self._pts_to_tile = {}
         self._pts_submit_t = {}
+        self._pts_donl = {}
         self._decode_latency_ms = 0.0
         self._dpb_has_idr = False
         self._tiles_await_idr.clear()

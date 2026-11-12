@@ -868,6 +868,13 @@ Media RTCP is rtcp-muxed onto each media port (§10.4). Observed native-client f
 
 A client without a live feedback loop (e.g. replaying a capture) cannot recover from a lost reference picture; a live client relies on FIR/NACK/LTR to keep the shared decoder synchronized.
 
+**Observed loss-recovery behavior (macOS host, HEVC tiled stream, 2026-11-12; empirical, not derived from the binary):**
+
+- **Generic NACK is not answered.** Over 1500 generic NACKs (PT 205, FMT 1) for packets that later arrived on their own produced zero duplicate packets, and packets discarded locally at the receiver (so the host certainly held them) were never retransmitted — on the control port or on the video rtcp-mux port, alone or compounded with an RR. A receiver MUST NOT assume a missing packet can be repaired; loss recovery is FIR/PLI and LTR only.
+- **`rtx_enabled = true` in the video offer (field 11) stalls the stream**: the host answers the offer and reports an encoder canvas but sends no video RTP. Retransmission therefore needs further negotiation that is a **revision gap**; the field SHOULD be left unset.
+- **Tile decode order.** The tiles of one frame share one RTP timestamp and are consecutive pictures of a single POC sequence, in tile order; a tile whose content did not change emits no picture and consumes no POC. A receiver that decodes all tiles in one context MUST feed access units in (timestamp, tile) order across SSRCs. Because each emitted picture advances POC by exactly one, a POC jump identifies a picture that has not arrived yet.
+- **Reordering vs. loss.** Over a tunnelled path (Cloudflare WARP/MASQUE) most multi-packet access units arrived out of order, but displaced packets landed within 30 ms (99% within 12 ms). A receiver SHOULD hold an incomplete access unit, or the successor of a missing picture, for a short reorder window rather than request repair.
+
 ### 10.9 Dynamic Resolution in Media Mode
 
 The media canvas geometry is **not** fixed for the lifetime of a media session. A viewer changes the resolution mid-session **in-band on the existing connection** — no TCP reconnect, no re-authentication, no record-layer rekey, and the UDP media flow is never torn down. A native resize capture is a single TCP stream over its lifetime with zero additional SYN/RST and continuous UDP video; a runtime trace of the native client shows one RSA operation and one record-layer key setup for the whole session; and an independent client reproduces the exchange live.

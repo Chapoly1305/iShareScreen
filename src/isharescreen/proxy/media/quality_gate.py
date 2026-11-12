@@ -227,7 +227,9 @@ class FrameQualityGate:
 
     # -- decoder-error path (the only escalation source) ----------------
     @_locked
-    def mark_decode_error(self, tile_idx: int, *, reliable: bool = True) -> None:
+    def mark_decode_error(
+        self, tile_idx: int, *, reliable: bool = True, certain: bool = False,
+    ) -> None:
         """Trusted signal that libavcodec concealed / failed for this
         tile. Adds the tile to `keyframe_required` (sticky) — the
         session's tx-tick will FIR for it now and again every
@@ -244,6 +246,13 @@ class FrameQualityGate:
             which is the ONLY signal that fires during a silent gray (the
             decoder emits gray frames with no per-frame error flag). This
             is the signal the `_RECOVERY_QUIET_S` window must wait out.
+
+        `certain=True` is for a break the caller knows is real and follows
+        the last keyframe in decode order — the receiver itself dropped or
+        discarded that tile's access unit. It bypasses the post-IDR grace:
+        that grace exists for stale pre-IDR frames erroring against a fresh
+        DPB, and applying it to a real drop leaves the tile broken with no
+        keyframe requested until some later, unrelated error.
         """
         if tile_idx < 0 or tile_idx >= self._num_tiles:
             return
@@ -263,7 +272,7 @@ class FrameQualityGate:
         # almost always in-flight pre-IDR P-frames decoding against
         # the freshly-reset DPB. Suppress them so they don't trigger
         # an immediate re-FIR cycle.
-        if (self._idr_observed_at[tile_idx] > 0
+        if (not certain and self._idr_observed_at[tile_idx] > 0
                 and now - self._idr_observed_at[tile_idx]
                     < self._POST_IDR_GRACE_S):
             log.debug(

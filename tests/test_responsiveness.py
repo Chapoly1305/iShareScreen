@@ -79,9 +79,10 @@ def test_packet_group_duplicate_bookkeeping_does_not_scan_list():
 
 def test_hevc_repair_holds_dependent_other_tile_until_reference_arrives():
     s = Session.__new__(Session)
-    s._video_codec = 'hevc'
-    s._pending_groups = {}; s._group_arrival = {}; s._recently_flushed = {}
-    s._group_repair_deadline = {}; s._last_group_marker_seq = {1: 9}
+    s._video_codec = 'hevc'; s._reset_group_state(); s._decoder = None
+    s._last_group_marker_seq = {1: 9}
+    s._ssrc_to_tile = {1: 0, 2: 1}
+    s._max_seq = {1: 12, 2: 30}
     flushed = []
     def flush(key):
         flushed.append(key)
@@ -275,9 +276,10 @@ def test_reconfigure_does_not_consume_old_decoded_frame():
 
 def test_hevc_whole_missing_au_retransmission_precedes_later_arrival():
     s = Session.__new__(Session)
-    s._video_codec = 'hevc'; s._pending_groups = {}; s._group_arrival = {}
-    s._recently_flushed = {}; s._group_repair_deadline = {}
-    s._last_group_marker_seq = {1: 9}
+    s._video_codec = 'hevc'; s._reset_group_state(); s._decoder = None
+    s._last_group_marker_seq = {1: 9, 2: 29}
+    s._ssrc_to_tile = {1: 0, 2: 1}
+    s._max_seq = {1: 13, 2: 31}
     flushed = []
     def flush(key):
         flushed.append(key)
@@ -286,13 +288,16 @@ def test_hevc_whole_missing_au_retransmission_precedes_later_arrival():
         s._group_repair_deadline.pop(key, None)
         s._last_group_marker_seq[key[0]] = next(p[0] for p in grp if p[1])
     s._flush_group = flush
+    # Tile 0 of frame 100 was wholly lost; frame 200 exposes the gap, so its
+    # tile-1 sibling and frame 200 must wait for the retransmission.
     s._queue_video_group_packet(1, 200, 13, True, b'later')
-    s._queue_video_group_packet(2, 200, 30, True, b'dependent sibling')
+    s._queue_video_group_packet(2, 100, 30, True, b'sibling')
+    s._queue_video_group_packet(2, 200, 31, True, b'later sibling')
     assert not flushed
     s._queue_video_group_packet(1, 100, 10, False, b'retransmit first')
     s._queue_video_group_packet(1, 100, 11, False, b'middle')
     s._queue_video_group_packet(1, 100, 12, True, b'end')
-    assert flushed == [(1, 100), (1, 200), (2, 200)]
+    assert flushed == [(1, 100), (2, 100), (1, 200), (2, 200)]
 
 
 def test_force_all_recovery_is_atomic_across_decoder_and_feedback_threads():

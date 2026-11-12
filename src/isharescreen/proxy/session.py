@@ -22,6 +22,7 @@ calls `connect()` again.
 """
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import queue
@@ -47,6 +48,8 @@ from .media.aac_eld import AacEldDecoder, make_aac_eld_decoder
 from .media.hevc import HevcDecoder
 from .media.avc import AvcDecoder
 from .media.nalu import first_donl, reassemble_group
+from .media.bitstream import remove_emulation_prevention
+from .media.hevc_rps import IRAP_RANGE, parse_slice_header_for_rps
 from .media.avc_nalu import (
     APPLE_CONFIG_MARKER, parse_avc_config, reassemble_h264,
 )
@@ -176,7 +179,24 @@ _PENDING_GROUP_TTL_S = 0.2
 # milliseconds; 75 ms gives generous headroom without adding latency to
 # healthy frames, which still flush immediately.
 _AVC_RTP_REPAIR_WAIT_S = 0.075
-_HEVC_RTP_REPAIR_WAIT_S = 0.012
+# HEVC: how long an incomplete AU, or a picture missing from the decode order,
+# is waited for. Measured against a macOS host over a Cloudflare WARP (MASQUE)
+# tunnel: the path reorders heavily (most multi-packet frames arrive out of
+# order) but 99% of displaced packets land within 12 ms and all within 30 ms.
+# The host does not retransmit on generic NACK (no reply to >1500 requests,
+# nor to locally discarded packets, on either RTCP port), so anything still
+# missing after this window is lost for good and waiting longer only freezes
+# every tile before the inevitable drop.
+_HEVC_RTP_REPAIR_WAIT_S = 0.03
+
+# HEVC: a marker-less AU whose packets stop arriving has lost its tail. Tiles
+# share one decode order, so it would block every tile until
+# _PENDING_GROUP_TTL_S; give up after this much silence instead.
+_HEVC_TAIL_QUIET_S = 2 * _HEVC_RTP_REPAIR_WAIT_S
+
+# Longest forward sequence gap that is NACKed and counted as loss; larger
+# jumps are a stream discontinuity.
+_NACK_MAX_GAP = 256
 
 # How long a completed (marker-flushed) (SSRC, ts) key stays in the dedup
 # set so we drop late retransmits of already-processed packets without
@@ -375,23 +395,7 @@ class Session:
         # Separate interval clock for the pass-through (browser) snapshot path.
         self._last_passthrough_t: float = 0.0
 
-        # Per-(SSRC, ts) accumulating groups + their first-arrival time
-        # for TTL eviction. `_recently_flushed` dedupes late retransmits of
-        # already-processed groups; entries TTL out after _FLUSHED_DEDUP_TTL_S.
-        self._pending_groups: dict[tuple[int, int], list[_PktTuple]] = {}
-        self._group_arrival: dict[tuple[int, int], float] = {}
-        self._recently_flushed: dict[tuple[int, int], float] = {}
-        self._group_repair_deadline: dict[tuple[int, int], float] = {}
-        # Marker sequence of the last consumed AU per SSRC. This catches a
-        # packet missing at the *start* of the next AU, which an internal-only
-        # gap check cannot see.
-        self._last_group_marker_seq: dict[int, int] = {}
-        self._last_group_evict_t: float = 0.0
-
-        # Per-SSRC sequence tracking for NACK detection + receiver reports.
-        self._max_seq: dict[int, int] = {}
-        self._roc: dict[int, int] = {}
-        self._nack_pending: dict[int, set[int]] = defaultdict(set)
+        self._reset_group_state()
         # Cumulative packet-loss tracking. Lets consumers report a
         # real loss rate instead of guessing concealment is loss-driven.
         self._received_pkts: int = 0
@@ -674,6 +678,38 @@ class Session:
     @property
     def last_received_clipboard_text(self) -> Optional[str]:
         return self._last_received_clipboard_text
+
+    def _reset_group_state(self) -> None:
+        """(Re)initialise RTP group reassembly, NACK and HEVC ordering state."""
+        # Per-(SSRC, ts) accumulating groups + their first-arrival time
+        # for TTL eviction. `_recently_flushed` dedupes late retransmits of
+        # already-processed groups; entries TTL out after _FLUSHED_DEDUP_TTL_S.
+        self._pending_groups: dict[tuple[int, int], list[_PktTuple]] = {}
+        self._group_arrival: dict[tuple[int, int], float] = {}
+        self._recently_flushed: dict[tuple[int, int], float] = {}
+        self._group_repair_deadline: dict[tuple[int, int], float] = {}
+        # Marker sequence of the last consumed AU per SSRC. This catches a
+        # packet missing at the *start* of the next AU, which an internal-only
+        # gap check cannot see.
+        self._last_group_marker_seq: dict[int, int] = {}
+        self._last_group_evict_t: float = 0.0
+        # HEVC decode-order cursor: (RTP timestamp, tile) of the last tile AU
+        # fed to the decoder. None until the first live group.
+        self._hevc_feed_pos: Optional[tuple[int, int]] = None
+        # POC LSB of the last fed picture. Apple numbers emitted pictures
+        # consecutively across tiles, so a jump means a picture is missing.
+        # `_hevc_poc_slack` counts pictures deliberately dropped since.
+        self._hevc_last_poc: Optional[int] = None
+        self._hevc_poc_slack = 0
+        # True while pictures of a new POC epoch arrive without their keyframe
+        # (it was lost); nothing is fed until the next keyframe.
+        self._hevc_keyframe_lost = False
+        self._hevc_poc_cache: dict[tuple[int, int], Optional[tuple[int, bool]]] = {}
+
+        # Per-SSRC sequence tracking for NACK detection + receiver reports.
+        self._max_seq: dict[int, int] = {}
+        self._roc: dict[int, int] = {}
+        self._nack_pending: dict[int, set[int]] = defaultdict(set)
 
     def request_fir(self, tile_idx: Optional[int] = None) -> None:
         """Externally trigger an FIR (forces a fresh IDR). Without args,
@@ -1595,15 +1631,7 @@ class Session:
         self._srtcp_dec = None
         self._srtcp_enc = None
         self._ssrc_to_tile = {}
-        self._pending_groups = {}
-        self._group_arrival = {}
-        self._recently_flushed = {}
-        self._group_repair_deadline = {}
-        self._last_group_marker_seq = {}
-        self._last_group_evict_t = 0.0
-        self._max_seq = {}
-        self._roc = {}
-        self._nack_pending = defaultdict(set)
+        self._reset_group_state()
         self._server_sr = {}
         self._runtime_canvas_w = 0
         self._runtime_canvas_h = 0
@@ -2280,7 +2308,10 @@ class Session:
         q = self._video_q
         while not self._stop_evt.is_set():
             try:
-                timeout = 0.005 if self._group_repair_deadline else _UDP_RECV_TIMEOUT_S
+                # HEVC tiles held behind a missing decode-order slot carry no
+                # repair deadline, so poll whenever any group is buffered.
+                timeout = (0.005 if self._group_repair_deadline or self._pending_groups
+                           else _UDP_RECV_TIMEOUT_S)
                 pkt = q.get(timeout=timeout)
             except queue.Empty:
                 self._evict_stale_groups()
@@ -2347,9 +2378,19 @@ class Session:
         # packet of this AU. Compare it with the last AU marker once an anchor
         # is available. The first observed AU is intentionally self-anchoring.
         previous_marker = getattr(self, "_last_group_marker_seq", {}).get(key[0])
-        return (
-            previous_marker is None
-            or packets[0][0] == ((previous_marker + 1) & 0xFFFF)
+        expected_first = (packets[0][0] - 1) & 0xFFFF
+        if previous_marker is None or previous_marker == expected_first:
+            return True
+        if self._video_codec == "avc":
+            return False
+        # HEVC holds tiles for cross-SSRC decode order, so this SSRC's previous
+        # AU may still be buffered behind another tile. It is contiguous if a
+        # buffered predecessor's marker immediately precedes it; the decode
+        # cursor still feeds that predecessor first.
+        return any(
+            other != key and other[0] == key[0]
+            and any(seq == expected_first and marker for seq, marker, _ in grp_other)
+            for other, grp_other in self._pending_groups.items()
         )
 
     def _ordered_group_keys(self, ssrc: int) -> list[tuple[int, int]]:
@@ -2408,6 +2449,7 @@ class Session:
             grp = self._pending_groups[key] = _PacketGroup(grp)
         grp.add_packet(seq, marker, payload)
         if not grp.has_marker:
+            grp.last_rx = time.monotonic()
             return
         if self._video_codec != "avc":
             now = time.monotonic()
@@ -2421,11 +2463,7 @@ class Session:
                 deadlines.setdefault(key, now + _HEVC_RTP_REPAIR_WAIT_S)
             else:
                 deadlines.pop(key, None)
-            if deadlines:
-                self._flush_hevc_ready_groups()
-            else:
-                self._flush_group(key)
-                self._flush_hevc_ready_groups()
+            self._flush_hevc_ready_groups()
             return
 
         now = time.monotonic()
@@ -2455,32 +2493,178 @@ class Session:
         self._flush_group(key)
         self._flush_ready_groups(ssrc)
 
-    def _flush_hevc_ready_groups(self) -> None:
-        # All HEVC tiles share references. Hold later groups across SSRCs,
-        # while allowing an older missing AU's NACK retransmission to precede
-        # the group whose marker originally exposed that loss.
-        blocked = self._group_repair_deadline
-        while True:
-            cutoff = min((self._group_arrival.get(k, float("inf")) for k in blocked),
-                         default=float("inf"))
-            for key in list(self._pending_groups):
-                if self._group_arrival.get(key, 0) > cutoff:
-                    ordered = self._ordered_group_keys(key[0])
-                    position = ordered.index(key)
-                    repairs_predecessor = any(
-                        other[0] == key[0] and other in ordered
-                        and position < ordered.index(other) for other in blocked)
-                    if not repairs_predecessor:
+    @staticmethod
+    def _hevc_ts_delta(ts: int, base_ts: int) -> int:
+        """Signed, wrap-aware RTP timestamp distance `ts - base_ts`."""
+        delta = (ts - base_ts) & 0xFFFFFFFF
+        return delta - 0x100000000 if delta >= 0x80000000 else delta
+
+    def _arm_tile_recovery(self, ti: int, trigger: str) -> None:
+        """Mark a tile's reference chain broken and wake the FIR sender."""
+        if self._decoder is None:
+            return
+        mark_broken = getattr(self._decoder, "mark_reference_chain_broken", None)
+        if callable(mark_broken):
+            mark_broken(trigger)
+        try:
+            # We dropped this AU ourselves, so the break is real even inside
+            # the gate's post-keyframe grace period.
+            self._decoder._gate.mark_decode_error(ti, certain=True)
+        except Exception:
+            pass
+        wake = getattr(self, "_tx_wakeup", None)
+        if wake is not None:
+            wake.set()
+
+    def _hevc_tile_has_gap(self, ssrc: int) -> bool:
+        """True when this SSRC has received packets past its last consumed AU
+        but not the very next one: an AU (possibly one ordered before the
+        current head) is still in flight or awaiting NACK repair."""
+        anchor = self._last_group_marker_seq.get(ssrc)
+        newest = self._max_seq.get(ssrc)
+        if anchor is None or newest is None or newest == anchor:
+            return False
+        if ((newest - anchor) & 0xFFFF) >= 0x8000:
+            return False  # Anchor is ahead (late packet); nothing outstanding.
+        expected = (anchor + 1) & 0xFFFF
+        return not any(
+            key[0] == ssrc and any(seq == expected for seq, _m, _p in grp)
+            for key, grp in self._pending_groups.items()
+        )
+
+    def _hevc_sps(self):
+        """SPS of the live HEVC stream, or None before one is known."""
+        return getattr(getattr(self._decoder, "_rps_tracker", None), "sps", None)
+
+    def _hevc_group_poc(self, key: tuple[int, int]) -> Optional[tuple[int, bool]]:
+        """(POC LSB, is_irap) of a complete buffered HEVC AU; None if the SPS
+        or slice header is unavailable."""
+        cache = self._hevc_poc_cache
+        if key in cache:
+            return cache[key]
+        result = None
+        sps = self._hevc_sps()
+        grp = self._pending_groups.get(key)
+        if sps is not None and grp:
+            payloads = [p for _seq, _m, p in self._sorted_group_packets(grp)]
+            try:
+                for nalu in reassemble_group(payloads):
+                    if len(nalu) < 3 or (nalu[0] >> 1) & 0x3F >= 32:
                         continue
-                grp = self._pending_groups[key]
-                if self._group_complete(key, grp):
-                    blocked.pop(key, None)
+                    nal_type = (nalu[0] >> 1) & 0x3F
+                    if nal_type in IRAP_RANGE:
+                        result = (0, True)
+                    else:
+                        # Only the slice header is needed, not the payload.
+                        parsed = parse_slice_header_for_rps(
+                            nal_type, remove_emulation_prevention(bytes(nalu[2:98])), sps)
+                        if parsed is not None:
+                            result = (parsed[0], False)
+                    break
+            except Exception:
+                result = None
+        cache[key] = result
+        return result
+
+    def _flush_hevc_ready_groups(self) -> None:
+        # Apple encodes the tiles of one frame as consecutive pictures in a
+        # single POC sequence and stamps them with one RTP timestamp, so decode
+        # order is (timestamp, tile); an unchanged tile emits no picture.
+        # Feeding out of order makes libav invent a gray reference and then
+        # reject the real picture as a "Duplicate POC". Feed the earliest
+        # buffered AU once nothing earlier can still arrive (consecutive POC,
+        # or the reorder window has passed); anything ordered at or before the
+        # last fed AU is too late to decode and is discarded.
+        tiles = self._ssrc_to_tile
+        while True:
+            now = time.monotonic()
+            mapped: list[tuple[tuple[int, int], int]] = []
+            for key in list(self._pending_groups):
+                tile = tiles.get(key[0])
+                if tile is not None:
+                    mapped.append((key, tile))
+                elif self._group_complete(key, self._pending_groups[key]):
+                    # Unsubscribed SSRC: _flush_group only consumes it.
                     self._flush_group(key)
                     if key in self._pending_groups:
                         return  # Decoder teardown can race the receive loop.
-                    break  # Marker advancement can unblock an earlier dict key.
-            else:
+            if not mapped:
                 return
+            cursor = self._hevc_feed_pos
+            base_ts = (cursor[0] if cursor is not None else
+                       min(mapped, key=lambda kt: self._group_arrival.get(kt[0], now))[0][1])
+            head = None
+            head_pos = (0, 0)
+            for key, tile in mapped:
+                pos = (self._hevc_ts_delta(key[1], base_ts), tile)
+                if cursor is not None and pos <= (0, cursor[1]):
+                    self._discard_hevc_group(
+                        key, tile, now, "arrived after later tiles were decoded")
+                    continue
+                if head is None or pos < head_pos:
+                    head, head_pos = key, pos
+            if head is None or not self._group_complete(head, self._pending_groups[head]):
+                return  # The head's own repair deadline / TTL bounds this wait.
+            waiting = now - self._group_arrival.get(head, now) < _HEVC_RTP_REPAIR_WAIT_S
+            poc = self._hevc_group_poc(head)
+            last_poc = self._hevc_last_poc
+            sps = self._hevc_sps()
+            if poc is not None and last_poc is not None and not poc[1] and sps is not None:
+                max_lsb = 1 << sps.log2_max_pic_order_cnt_lsb
+                missing = (poc[0] - last_poc - 1) % max_lsb
+                if missing >= max_lsb // 2:
+                    # POC went backwards with no keyframe in between: the
+                    # keyframe that restarted the count was lost. These
+                    # pictures reference it and would collide with the old
+                    # sequence still in the decoder ("Duplicate POC").
+                    self._discard_hevc_group(
+                        head, head_pos[1], now,
+                        "follows a lost keyframe", quiet=self._hevc_keyframe_lost)
+                    self._hevc_keyframe_lost = True
+                    continue
+                if self._hevc_poc_slack < missing:
+                    # A picture between the last fed one and the head has not
+                    # arrived; it is usually just reordered behind the head.
+                    if waiting:
+                        return
+                    log.debug("HEVC picture(s) before POC %d never arrived; "
+                              "continuing without them", poc[0])
+            elif poc is None and waiting and any(
+                    ssrc != head[0] and self._hevc_tile_has_gap(ssrc) for ssrc in tiles):
+                return  # POC unknown: fall back to per-SSRC sequence gaps.
+            self._hevc_feed_pos = (head[1], head_pos[1])
+            if poc is not None:
+                self._hevc_last_poc = poc[0]
+                self._hevc_poc_slack = 0
+                self._hevc_keyframe_lost = False
+                self._hevc_poc_cache.pop(head, None)
+            self._flush_group(head)
+            if head in self._pending_groups:
+                return  # Decoder teardown can race the receive loop.
+
+    def _discard_hevc_group(
+        self, key: tuple[int, int], tile: int, now: float, why: str,
+        *, quiet: bool = False,
+    ) -> None:
+        """Consume a complete tile AU that can no longer be decoded and request
+        recovery. `quiet` skips the log and re-arm for a repeat of a condition
+        already reported."""
+        grp = self._pending_groups.pop(key, None)
+        self._group_arrival.pop(key, None)
+        self._group_repair_deadline.pop(key, None)
+        self._recently_flushed[key] = now
+        self._hevc_poc_cache.pop(key, None)
+        marker_seqs = [seq for seq, marker, _payload in grp or () if marker]
+        anchor = self._last_group_marker_seq.get(key[0])
+        if marker_seqs and (anchor is None
+                            or ((marker_seqs[-1] - anchor) & 0xFFFF) < 0x8000):
+            # Consumed as a hole: the SSRC's next AU starts after it.
+            self._last_group_marker_seq[key[0]] = marker_seqs[-1]
+        if quiet:
+            return
+        trigger = f"HEVC tile {tile} AU {why}"
+        log.warning("%s — discarding and requesting fresh intra", trigger)
+        self._arm_tile_recovery(tile, trigger)
 
     def _flush_ready_groups(self, ssrc: int) -> None:
         """Drain complete buffered groups for one SSRC in decode order."""
@@ -2737,24 +2921,17 @@ class Session:
             # internally complete AU establish a new transport anchor.
             self._last_group_marker_seq.pop(ssrc, None)
         ti = self._ssrc_to_tile.get(ssrc)
+        if ti is not None and self._video_codec != "avc":
+            # The dropped picture leaves an expected hole in the POC sequence.
+            self._hevc_poc_slack += 1
+            self._hevc_poc_cache.pop(key, None)
         if ti is not None and self._decoder is not None:
             trigger = (
                 f"RTP access unit incomplete after repair window ({reason}; "
                 f"packets={len(grp)} age={(now - started) * 1000:.1f}ms)"
             )
             log.warning("%s — dropping frame and requesting fresh intra", trigger)
-            mark_broken = getattr(
-                self._decoder, "mark_reference_chain_broken", None,
-            )
-            if callable(mark_broken):
-                mark_broken(trigger)
-            try:
-                self._decoder._gate.mark_decode_error(ti)
-            except Exception:
-                pass
-            wake = getattr(self, "_tx_wakeup", None)
-            if wake is not None:
-                wake.set()
+            self._arm_tile_recovery(ti, trigger)
         return ssrc
 
     def _evict_stale_groups(self) -> None:
@@ -2762,15 +2939,27 @@ class Session:
         now = time.monotonic()
         unblocked_ssrcs: set[int] = set()
         for key, deadline in list(self._group_repair_deadline.items()):
+            grp = self._pending_groups.get(key)
+            if (now >= deadline and grp is not None
+                    and self._video_codec != "avc" and self._group_complete(key, grp)):
+                # Completed, or chained behind a buffered predecessor; the
+                # decode cursor is what still holds it.
+                self._group_repair_deadline.pop(key, None)
+                continue
             if now >= deadline:
                 ssrc = self._drop_incomplete_group(
                     key, reason="NACK/reorder timeout", now=now,
                 )
                 if ssrc is not None:
                     unblocked_ssrcs.add(ssrc)
+        hevc = self._video_codec != "avc"
         for key, started in list(self._group_arrival.items()):
-            if (key not in self._group_repair_deadline
-                    and now - started > _PENDING_GROUP_TTL_S):
+            if key in self._group_repair_deadline:
+                continue
+            grp = self._pending_groups.get(key)
+            tail_lost = (hevc and grp is not None and not any(p[1] for p in grp)
+                         and now - getattr(grp, "last_rx", now) > _HEVC_TAIL_QUIET_S)
+            if now - started > _PENDING_GROUP_TTL_S or tail_lost:
                 ssrc = self._drop_incomplete_group(
                     key, reason="RTP marker timeout", now=now,
                 )
@@ -2812,12 +3001,15 @@ class Session:
             self._nack_pending[ssrc].discard(seq)
             return
         # Forward jump → record any skipped seqs as NACK candidates.
-        # Do not mark the decoder broken yet: this may be ordinary UDP reorder,
-        # and the short group repair window gives NACK a chance to fill it.
+        # Do not mark the decoder broken yet: this is usually ordinary UDP
+        # reorder, which the short group repair window absorbs. (The NACK is
+        # sent for hosts that honour it; the macOS host observed so far never
+        # retransmits — see _HEVC_RTP_REPAIR_WAIT_S.)
         # Only `_drop_incomplete_group` escalates after that window expires.
         tile_idx = self._ssrc_to_tile.get(ssrc)
         had_loss = False
-        for missed in range(1, min(diff, 32)):
+        # A jump past _NACK_MAX_GAP is a discontinuity (e.g. sender restart).
+        for missed in range(1, diff if diff <= _NACK_MAX_GAP + 1 else 1):
             lost = (prev + missed) & 0xFFFF
             self._nack_pending[ssrc].add(lost)
             self._lost_pkts += 1
@@ -2874,21 +3066,27 @@ class Session:
         # from TWO different broadcast groups when Apple is double-
         # publishing — the resulting Frankenstein map decodes some tiles
         # correctly and silently drops the others. Build runs of
-        # consecutive SSRCs and adopt the first complete run. (want=1 → a
-        # single-SSRC single-picture stream; want=4 → the tiled stream.)
+        # consecutive SSRCs. (want=1 → a single-SSRC single-picture stream;
+        # want=4 → the tiled stream.)
+        # Several unknown groups can have accumulated packets — earlier encoder
+        # generations that have since gone quiet as well as the live one — so
+        # adopt the complete run containing the SSRC that just arrived, never
+        # simply the numerically lowest: each dead group adopted costs a full
+        # stall interval of black screen before the next attempt.
         new_group: list[int] | None = None
+        runs: list[list[int]] = []
         run = [candidates[0]]
-        if want == 1:
-            new_group = run
-        else:
-            for s in candidates[1:]:
-                if s - run[-1] <= 1 and len(run) < want:
-                    run.append(s)
-                    if len(run) == want:
-                        new_group = run
-                        break
-                else:
-                    run = [s]
+        for s_ in candidates[1:]:
+            if s_ - run[-1] <= 1 and len(run) < want:
+                run.append(s_)
+            else:
+                runs.append(run)
+                run = [s_]
+        runs.append(run)
+        for run in runs:
+            if len(run) == want and ssrc in run:
+                new_group = run
+                break
         if new_group is None:
             return  # no consecutive run of `want` yet — wait for more data
         new_map = {s: i for i, s in enumerate(new_group)}
@@ -2898,9 +3096,19 @@ class Session:
             "adopting fresh SSRC group: %s",
             [f"0x{s:08x}" for s in new_group],
         )
+        # The burst installs its group directly, without an adoption. A first
+        # live encoder generation must not inherit that burst group's DPB:
+        # the old POCs can collide with the new group's POCs even when the
+        # transition happens inside the normal HEVC restart debounce.
+        first_adoption = not self._ssrc_blacklist
         # Blacklist the previously-adopted group so we never go back.
         self._ssrc_blacklist.update(self._ssrc_to_tile.keys())
         self._ssrc_to_tile = new_map
+        # The new generation's timestamps and POCs are unrelated to the old.
+        self._hevc_feed_pos = None
+        self._hevc_last_poc = None
+        self._hevc_poc_slack = 0
+        self._hevc_keyframe_lost = False
         # Keep the authoritative tile count in step with the adopted
         # group so num_tiles (and the frontend's per-tile loops) track a
         # mid-session tile-count change rather than the connect-time value.
@@ -2936,15 +3144,16 @@ class Session:
                 # keyframe gate, so new-generation P-slices are dropped until
                 # the FIR response re-roots the context.
                 #
-                # Keep the rapid-restart guard for tiled HEVC. Apple can emit
-                # two HEVC groups within 2 s at curtain start, and a second
-                # teardown there discards IDRs still in flight for the first
+                # Reset on the first burst-to-live HEVC generation change.
+                # Keep the rapid-restart guard for later HEVC adoptions: Apple
+                # can emit two live groups within 2 s at curtain start, and a
+                # second teardown discards IDRs still in flight for the first
                 # group's FIR.
                 # AVC must always reset on a generation change. Only the
-                # HEVC path is debounced; claim its timestamp atomically with
-                # watchdog restarts from the transmit thread.
+                # later HEVC adoptions are debounced; claim the timestamp
+                # atomically with watchdog restarts from the transmit thread.
                 must_restart = self._claim_restart(
-                    now, 0.0 if self._video_codec == "avc" else 3.0)
+                    now, 0.0 if self._video_codec == "avc" or first_adoption else 3.0)
                 if must_restart:
                     if self._video_codec == "avc":
                         log.info(
@@ -4528,13 +4737,29 @@ class Session:
     @staticmethod
     def _bind_udp(host: str, port: int) -> socket.socket:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # No SO_REUSEADDR: with it, a second iss on this machine binds the
+        # same media ports and the kernel delivers each datagram to only one
+        # socket, so both sessions' streams mix in one client and it decodes
+        # one session's frames with the other's parameters (smeared, repeated
+        # rows). UDP has no TIME_WAIT, so a reconnect that closes first
+        # rebinds fine without it.
         # Big rmem so the burst doesn't get dropped before we drain it.
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
         except OSError:
             pass
-        s.bind((host, port))
+        try:
+            s.bind((host, port))
+        except OSError as e:
+            s.close()
+            if e.errno == errno.EADDRINUSE:
+                raise RuntimeError(
+                    f"UDP port {port} is already in use — another iss session "
+                    "(or screen-sharing client) on this machine is connected. "
+                    "Close it first, or set ISS_UDP_BIND_HOST to a different "
+                    "local interface address."
+                ) from e
+            raise
         return s
 
     @staticmethod

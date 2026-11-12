@@ -12,11 +12,9 @@ from isharescreen.proxy.session import Session
 def _group_session() -> Session:
     session = Session.__new__(Session)
     session._video_codec = "avc"
-    session._pending_groups = {}
-    session._group_arrival = {}
-    session._recently_flushed = {}
-    session._group_repair_deadline = {}
-    session._last_group_marker_seq = {}
+    session._reset_group_state()
+    session._ssrc_to_tile = {}
+    session._decoder = None
     return session
 
 
@@ -188,3 +186,68 @@ def test_sequence_gap_wakes_nack_without_immediate_decoder_failure():
     assert session._nack_pending[0x1000] == {11}
     assert gate._keyframe_required == set()
     assert session._tx_wakeup.is_set()
+
+
+def _nack_session() -> Session:
+    session = Session.__new__(Session)
+    session._ssrc_to_tile = {0x1000: 0}
+    session._max_seq = {0x1000: 10}
+    session._roc = {0x1000: 0}
+    session._nack_pending = __import__("collections").defaultdict(set)
+    session._received_pkts = 0
+    session._lost_pkts = 0
+    session._lost_pkts_per_tile = [0]
+    session._last_video_pkt_t = 0.0
+    session._tx_wakeup = threading.Event()
+    return session
+
+
+def test_long_burst_gap_nacks_every_missing_packet():
+    session = _nack_session()
+
+    session._track_seq(0x1000, 10 + 60)
+
+    assert session._nack_pending[0x1000] == set(range(11, 70))
+
+
+def test_discontinuity_is_not_nacked():
+    session = _nack_session()
+
+    session._track_seq(0x1000, 10 + 5000)
+
+    assert not session._nack_pending[0x1000]
+
+
+def _hevc_tile_session() -> Session:
+    session = Session.__new__(Session)
+    session._video_codec = "hevc"
+    session._reset_group_state()
+    session._ssrc_to_tile = {0x1000: 0}
+    session._decoder = types.SimpleNamespace(
+        _gate=FrameQualityGate(1),
+        mark_reference_chain_broken=lambda _trigger: None,
+    )
+    session._tx_wakeup = threading.Event()
+    session._last_group_marker_seq[0x1000] = 9
+    return session
+
+
+def test_lost_tail_on_silent_tile_is_dropped_without_waiting_for_the_ttl():
+    # The frame's last packet (the marker) is lost and the tile then sends
+    # nothing more. Tiles share one decode order, so holding this AU for the
+    # full TTL would freeze every tile.
+    from isharescreen.proxy import session as session_mod
+    session = _hevc_tile_session()
+    key = (0x1000, 100)
+    session._queue_video_group_packet(*key, 10, False, b"a")
+    session._queue_video_group_packet(*key, 11, False, b"b")
+
+    session._evict_stale_groups()
+    assert key in session._pending_groups          # may still be arriving
+
+    session._pending_groups[key].last_rx -= session_mod._HEVC_TAIL_QUIET_S + 0.001
+    session._evict_stale_groups()
+
+    assert key not in session._pending_groups
+    assert 0 in session._decoder._gate.bad_tiles
+

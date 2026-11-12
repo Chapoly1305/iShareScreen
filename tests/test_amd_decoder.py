@@ -48,10 +48,10 @@ def test_amd_quiet_partial_batch_is_published(monkeypatch):
                           on_frame_published=lambda _: ready.set())
     decoder._hw_verified = decoder._dpb_has_idr = True
     monkeypatch.setattr(decoder, "_decode_one",
-                        lambda _, ti: _publish_test_frame(decoder, 0, ti))
+                        lambda _, ti, donl=None: _publish_test_frame(decoder, 0, ti))
     decoder._start_worker()
     try:
-        decoder._queue.put((b"frame", 0))
+        decoder._queue.put((b"frame", 0, None))
         assert ready.wait(1), "partial batches must flush without another tile arriving"
         assert decoder.get_frame(0) is tile
     finally:
@@ -106,9 +106,9 @@ def test_amd_shutdown_waits_for_download_before_releasing_codec(monkeypatch):
 
     monkeypatch.setattr(hevc, "_av_frame_to_tile", convert)
     monkeypatch.setattr(decoder, "_decode_one",
-                        lambda _, ti: _publish_test_frame(decoder, 0, ti))
+                        lambda _, ti, donl=None: _publish_test_frame(decoder, 0, ti))
     decoder._start_worker()
-    decoder._queue.put((b"frame", 0))
+    decoder._queue.put((b"frame", 0, None))
     closer = threading.Thread(target=lambda: (decoder.close(), closed.set()))
     try:
         assert entered.wait(1)
