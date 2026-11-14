@@ -184,7 +184,8 @@ def _make_parser() -> argparse.ArgumentParser:
         help=(
             "video decoder to use. 'auto' (default) picks the best available "
             "decoder for the negotiated codec; or force one by name — "
-            "vt-hevc444 / libav-hevc444 / qsv-hevc444 / libav-avc420 (legacy "
+            "vt-hevc444 / libav-hevc444 / qsv-hevc444 / libav-hevc420 / "
+            "amd-hevc420 / libav-avc420 (legacy "
             "aliases vt / qsv / libav also accepted). Run --list-decoders to "
             "see the matrix and which are available on this machine."
         ),
@@ -195,7 +196,8 @@ def _make_parser() -> argparse.ArgumentParser:
         "--codec", choices=["auto", "hevc", "avc"], default=None,
         help=(
             "video codec: 'auto' (default) probes GPU capability and picks "
-            "HEVC 4:4:4 when available, else H.264 4:2:0; 'hevc' forces "
+            "HEVC 4:4:4 when hardware-decodable, else HEVC 4:2:0 when "
+            "hardware-decodable, else H.264 4:2:0; 'hevc' forces "
             "HEVC; 'avc' forces H.264 (hardware-decodable on Windows/Linux "
             "where 4:4:4 isn't)"
         ),
@@ -479,16 +481,24 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
     WebCodecs, H.264 pass-through) since every machine has a browser; the
     native wgpu/desktop viewer stays available via --frontend desktop."""
     if args.frontend == "desktop":
-        # Auto codec ladder: offer HEVC when this machine has a HEVC 4:4:4
-        # hardware decoder (VideoToolbox / generic HW / QSV), else fall back to
-        # H.264 (libav-avc420, HW with SW floor). Only force AVC here — when
-        # HEVC HW is present we leave ISS_VIDEO_CODEC unset so the proven
-        # "both"-bank offer (Apple-byte-identical → server sends HEVC) is
-        # unchanged. An explicit --codec / --decoder still wins (env already set).
+        # Auto codec ladder: HEVC 4:4:4 when this machine has a 4:4:4
+        # hardware decoder (VideoToolbox / generic HW / QSV), else HEVC 4:2:0
+        # when the GPU hardware-decodes HEVC Main (generic libav hwaccel), else
+        # H.264 (libav-avc420, HW with SW floor). With 4:4:4 HW we leave
+        # ISS_VIDEO_CODEC unset so the proven "both"-bank offer
+        # (Apple-byte-identical → server sends HEVC 4:4:4) is unchanged. An
+        # explicit --codec / --decoder still wins (env already set); an
+        # explicit --chroma restricts which HEVC format auto may pick.
         if args.codec in (None, "auto") and "ISS_VIDEO_CODEC" not in os.environ:
-            from .proxy.media.registry import resolve_codec
-            if resolve_codec("auto") == "avc":
+            from .proxy.media.registry import resolve_video_format
+            codec, chroma = resolve_video_format("auto")
+            if codec == "avc":
                 os.environ["ISS_VIDEO_CODEC"] = "avc"
+            elif chroma == "420":
+                # Same offer as the explicit 4:2:0 path: HEVC bank only,
+                # 4:2:0 pixel formats.
+                os.environ["ISS_VIDEO_CODEC"] = "hevc"
+                os.environ["ISS_VIDEO_CHROMA"] = "420"
         from isharescreen.frontend.desktop.app import run as run_desktop
         # --display: default (omitted) auto-opens one window per host monitor if
         # the host has more than one; a single-monitor host stays one window with
@@ -563,9 +573,11 @@ def _apply_video_overrides(args: argparse.Namespace) -> None:
     decoder_id = registry.normalize_override(effective_decoder, "hevc")
     if effective_chroma == "444" and any(spec.name == decoder_id and spec.codec == "avc" for spec in registry.all_specs()):
         raise ValueError("4:4:4 requires an HEVC decoder; choose Auto or an HEVC decoder")
-    if decoder_id == "amd-hevc420":
+    if any(spec.name == decoder_id and spec.codec == "hevc" and spec.chroma == "420"
+           for spec in registry.all_specs()):
+        # 4:2:0-only HEVC decoders (amd-hevc420, libav-hevc420[-sw]) pin the offer.
         if args.frontend == "browser" or effective_codec == "avc" or effective_chroma == "444":
-            raise ValueError("AMD HEVC requires Desktop, HEVC/Auto codec and 4:2:0/Auto chroma")
+            raise ValueError("HEVC 4:2:0 decoders require Desktop, HEVC/Auto codec and 4:2:0/Auto chroma")
         chroma = "420"
         effective_codec = "hevc"
         args.codec = "hevc"

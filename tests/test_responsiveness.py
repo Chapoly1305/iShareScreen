@@ -162,7 +162,7 @@ def test_startup_probe_requires_params_and_complete_reference(monkeypatch):
     class Decryptor:
         def decrypt(self, packet): return packet
         def get_primary_ssrc_group(self, **kwargs): return {1}
-    monkeypatch.setattr(burst, 'reassemble_group', lambda payloads: payloads)
+    monkeypatch.setattr(burst, 'reassemble_group', lambda payloads, **_: payloads)
     probe = burst.BurstReadiness(Decryptor(), 'hevc', tile_group_size=1)
     def packet(seq, nalu, marker=True, ts=None):
         return struct.pack('>BBHII', 0x80, 0x80 if marker else 0, seq,
@@ -243,7 +243,7 @@ def test_startup_probe_waits_for_every_negotiated_tile(monkeypatch):
     class Decryptor:
         def decrypt(self, packet): return packet
         def get_primary_ssrc_group(self, **kwargs): return {1, 2, 3, 4}
-    monkeypatch.setattr(burst, 'reassemble_group', lambda payloads: payloads)
+    monkeypatch.setattr(burst, 'reassemble_group', lambda payloads, **_: payloads)
     probe = burst.BurstReadiness(Decryptor(), 'hevc', tile_group_size=4)
     def packet(ssrc, seq, nt):
         return struct.pack('>BBHII', 0x80, 0x80, seq, seq, ssrc), bytes([nt << 1, 1])

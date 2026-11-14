@@ -301,8 +301,10 @@ def _launch(values: dict) -> None:
             or (frontend == "browser" and codec == "hevc")):
         _emit("log", "[gui] invalid video settings; browser viewing requires H.264 or Auto")
         return
-    if decoder == "amd-hevc420" and (chroma == "444" or frontend == "browser"):
-        _emit("log", "[gui] AMD HEVC requires Desktop and 4:2:0/Auto chroma")
+    if (any(spec.name == normalized and spec.codec == "hevc" and spec.chroma == "420"
+            for spec in all_specs())
+            and (chroma == "444" or frontend == "browser")):
+        _emit("log", "[gui] HEVC 4:2:0 decoders require Desktop and 4:2:0/Auto chroma")
         return
     effective_codec = "hevc" if chroma == "444" and codec == "auto" else codec
     if effective_codec != "auto" and normalized is not None:
@@ -597,6 +599,8 @@ _DECODER_LABELS = {
     "libav-hevc444":    "HEVC — Generic GPU (d3d11va / vaapi / cuda)",
     "qsv-hevc444":      "HEVC — Intel Quick Sync",
     "libav-hevc444-sw": "HEVC — Software (CPU)",
+    "libav-hevc420":    "HEVC — Generic GPU (4:2:0)",
+    "libav-hevc420-sw": "HEVC — Software (CPU, 4:2:0)",
     "libav-avc420":     "H.264",
 }
 
@@ -658,7 +662,7 @@ def _decoder_options_html() -> str:
             if not _spec_offerable(s, probe_ready):
                 continue
             label = _DECODER_LABELS.get(s.name, f"{s.codec.upper()} — {s.name}")
-            opts.append(f'<option value="{_h.escape(s.name, quote=True)}" data-codec="{s.codec}">'
+            opts.append(f'<option value="{_h.escape(s.name, quote=True)}" data-codec="{s.codec}" data-chroma="{s.chroma}">'
                         f'{_h.escape(label)}</option>')
     except Exception:
         pass  # registry unavailable → just offer Auto

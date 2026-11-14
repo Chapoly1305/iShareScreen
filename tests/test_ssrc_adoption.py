@@ -103,3 +103,22 @@ def test_adoption_picks_the_group_that_is_sending_not_the_lowest_ssrc(monkeypatc
 
     assert session._ssrc_to_tile == {0x5000 + i: i for i in range(4)}
 
+
+def test_single_picture_hevc420_later_ssrc_resets_inside_restart_guard(monkeypatch):
+    from isharescreen.proxy.protocol.media_config import MediaOfferConfig, PixelFormat
+
+    monkeypatch.setenv("ISS_TILES_PER_FRAME", "1")
+    session = _session("hevc")
+    session._media_offer_config = MediaOfferConfig()
+    session._media_offer_config.video.pixel_formats = (
+        PixelFormat.YUV420_8_FULL | PixelFormat.YUV420_8_VIDEO)
+    session._media_offer_config.video.tiles_per_frame = 1
+    session._note_unknown_ssrc(0x2000)
+
+    session._video_decryptor.ssrc_counts[0x3000] = _DYNAMIC_SSRC_PACKET_THRESHOLD
+    session._last_publish_t = time.monotonic() - _SSRC_ADOPT_STALL_S - 0.1
+    session._note_unknown_ssrc(0x3000)
+
+    assert session._ssrc_to_tile == {0x3000: 0}
+    assert session._decoder.restart_calls == 2
+    assert session.fir_calls == 2

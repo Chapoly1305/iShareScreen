@@ -17,6 +17,7 @@ import uuid
 import zlib
 from typing import Optional
 
+from .audio_negotiation import audio_answer_fields
 from .media_config import MediaOfferConfig
 from .protobuf import field_bytes as _field_bytes, field_varint as _field_varint, varint as _varint
 
@@ -135,7 +136,12 @@ def _build_mediablob(
     if mode == 7:
         desc_field = _field_bytes(5, config.video.to_protobuf(session_id))
     elif mode == 8:
-        desc_field = _field_bytes(3, config.audio.to_protobuf(session_id, enabled=audio_enabled))
+        audio = config.audio
+        payload_flags = audio.payload_flags if audio.payload_flags is not None else (
+            24191 if audio_enabled else 1000)
+        log.info("audio offer: F3.f4=0x%x F3.f5=0x%x (capability mapping provisional)",
+                 payload_flags, audio.secondary_flags)
+        desc_field = _field_bytes(3, audio.to_protobuf(session_id, enabled=audio_enabled))
     else:
         raise ValueError(f"unsupported negotiation mode {mode}")
     return (
@@ -235,7 +241,7 @@ def extract_canvas_dims(answer_msg: bytes) -> tuple[int, int, int]:
         if idx < 0:
             return 0, 0, 0
         plist_obj = None
-        for end in range(idx + 1, len(answer_msg) + 1, 2):
+        for end in range(idx + 1, len(answer_msg) + 1):
             try:
                 plist_obj = plistlib.loads(answer_msg[idx:end])
                 break
@@ -253,7 +259,14 @@ def extract_canvas_dims(answer_msg: bytes) -> tuple[int, int, int]:
         except Exception:
             idx += 6
             continue
+        audio = audio_answer_fields(dec)
+        if audio is not None:
+            log.info("audio answer: %s (capability mapping provisional)",
+                     " ".join(f"F3.f{n}=0x{v:x}" for n, v in sorted(audio.items())
+                              if n != 1))
         cw = ch = ct = 0
+        selected_payloads: list[int] = []
+        selected_formats: Optional[int] = None
         pos = 0
         while pos < len(dec):
             tag, pos = _read_varint(dec, pos)
@@ -282,8 +295,19 @@ def extract_canvas_dims(answer_msg: bytes) -> tuple[int, int, int]:
                                 # field 7 = ltrpEnabled (negotiated result).
                                 # Diagnostic: did the server accept LTRP?
                                 log.info("negotiated ltrpEnabled (answer F5.f7) = %d", v)
+                            elif sf == 8:
+                                selected_formats = v
                         elif sw == 2:
                             sl, sp = _read_varint(sub, sp)
+                            if sf == 3 and sl:
+                                # Selected codec bank; its F1 is the RTP payload type.
+                                bank = sub[sp:sp + sl]
+                                try:
+                                    pt_tag, pp = _read_varint(bank, 0)
+                                    if pt_tag == 8 and pp < len(bank):
+                                        selected_payloads.append(_read_varint(bank, pp)[0])
+                                except (IndexError, ValueError):
+                                    pass
                             sp += sl
                         elif sw == 1:
                             sp += 8
@@ -299,6 +323,9 @@ def extract_canvas_dims(answer_msg: bytes) -> tuple[int, int, int]:
             else:
                 break
         if cw and ch:
+            log.info("video answer: canvas=%dx%d tiles=%d payload types=%s pixel-format bitmap=%s",
+                     cw, ch, ct, selected_payloads,
+                     "missing" if selected_formats is None else hex(selected_formats))
             return cw, ch, ct
         idx += 6
 

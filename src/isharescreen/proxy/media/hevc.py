@@ -177,6 +177,7 @@ class HevcDecoder:
         *,
         prefer_hwaccel: bool = True,
         amd_only: bool = False,
+        hw_only_420: bool = False,
         enable_quality_gate: bool = True,
         on_frame_published: Optional[Callable[[int], None]] = None,
     ) -> None:
@@ -185,6 +186,10 @@ class HevcDecoder:
         self.num_tiles = num_tiles
         self._prefer_hwaccel = prefer_hwaccel
         self._amd_only = amd_only
+        # Generic HEVC 4:2:0 hardware path: disable libav's silent software
+        # fallback inside the hwaccel so a decoded frame proves the GPU did
+        # it. A failed HW context still falls back to our own SW context.
+        self._hw_only_420 = hw_only_420
         # At most four GPU outputs; only the decode producer owns this.
         self._pending_downloads: list[tuple[int, av.VideoFrame, bool]] = []
         self._pending_since = 0.0
@@ -789,6 +794,9 @@ class HevcDecoder:
                     "decoding in software", self._hw_name, frame.format.name,
                 )
                 self._hw_name = None
+            elif self._hw_name is not None and self._hw_only_420:
+                log.info("HEVC 4:2:0 hardware decode confirmed: %s (output=%s)",
+                         self._hw_name, frame.format.name)
 
         ti = self._pts_to_tile.pop(frame.pts, None)
         submit_t = self._pts_submit_t.pop(frame.pts, None)
@@ -1125,6 +1133,11 @@ class HevcDecoder:
             if self._amd_only:
                 from .amd import hardware_accel
                 hw = hardware_accel(defer_download=True)
+            elif self._hw_only_420:
+                try:
+                    hw = HWAccel(device_type=hw_type, allow_software_fallback=False)
+                except TypeError:
+                    hw = HWAccel(device_type=hw_type)
             else:
                 hw = HWAccel(device_type=hw_type)
             c = av.CodecContext.create("hevc", "r", hwaccel=hw)
@@ -1148,6 +1161,11 @@ class HevcDecoder:
                 # must not inflate surface demand on this low-delay path.
                 c.thread_count = 1
                 c.options = {"extra_hw_frames": "16"}
+            elif self._hw_only_420:
+                # D3D11VA's fixed pool (~20 surfaces by default) exhausted in
+                # upstream's live HEVC 4:2:0 trial during an encoder
+                # generation change; leave room for refs + frames in flight.
+                c.options = {"extra_hw_frames": "32"}
             c.flags = _CODEC_FLAG_LOW_DELAY
             c.flags2 = _CODEC_FLAG2_FAST
             c.open()

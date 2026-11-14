@@ -253,6 +253,14 @@ class VideoSettings:
     foveation_supported: bool | None = None
 
     @property
+    def decoder_chroma(self) -> str:
+        """Chroma the decoder must expect: 4:2:0 unless any 4:4:4 bit is offered."""
+        if self.codec == "avc":
+            return "420"
+        yuv444 = PixelFormat.YUV444_8_FULL | PixelFormat.YUV444_8_VIDEO | PixelFormat.YUV444_10_FULL
+        return "444" if int(self.pixel_formats) & int(yuv444) else "420"
+
+    @property
     def effective_tiles_per_frame(self) -> int:
         return self.tiles_per_frame if self.tiles_per_frame is not None else (1 if self.codec == "avc" else 4)
 
@@ -299,6 +307,18 @@ class VideoSettings:
             + _optional_bool(12, "black_frame_on_clear_screen_enabled", self.black_frame_on_clear_screen_enabled)
             + _optional_bool(13, "foveation_supported", self.foveation_supported)
         )
+
+
+def _parse_audio_payload_flags(raw: str) -> int:
+    """Parse the experimental ISS_AUDIO_F4 mask (decimal or 0x-prefixed hex)."""
+    text = raw.strip()
+    try:
+        value = int(text, 16 if text.lower().startswith("0x") else 10)
+    except ValueError:
+        value = -1
+    if not 0 <= value <= 0xFFFFFFFF:
+        raise ValueError("ISS_AUDIO_F4 must be an unsigned 32-bit decimal or hex value")
+    return value
 
 
 @dataclass
@@ -368,7 +388,7 @@ class MediaOfferConfig:
             except ValueError:
                 pass
         if "ISS_AUDIO_F4" in os.environ:
-            config.audio.payload_flags = int(os.environ["ISS_AUDIO_F4"])
+            config.audio.payload_flags = _parse_audio_payload_flags(os.environ["ISS_AUDIO_F4"])
         bitrate = os.environ.get("ISS_VIDEO_BITRATE_BPS")
         if bitrate is not None:
             config.set_video_bitrate(int(bitrate))
