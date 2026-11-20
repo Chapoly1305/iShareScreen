@@ -40,7 +40,8 @@ faulthandler.enable()
 
 from . import __version__
 from .proxy.protocol.negotiation import AdvertiseDims
-from .proxy.session import Session, SessionConfig
+from .proxy.config import SessionConfig
+from .runtime_options import add_arguments, apply_arguments
 
 
 log = logging.getLogger("iss.cli")
@@ -283,6 +284,7 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    add_arguments(p)
     return p
 
 
@@ -445,6 +447,8 @@ _DEFAULT_SMOKE_DURATION_S = 10
 
 def _run_smoke(config: SessionConfig, args: argparse.Namespace) -> int:
     """Connect, decode for N seconds, report frame counts per tile."""
+    from .proxy.session import Session
+
     duration = args.auto_quit_secs or _DEFAULT_SMOKE_DURATION_S
     log.info("headless smoke test against %s for %ds", config.host, duration)
     deadline = time.monotonic() + duration
@@ -593,6 +597,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = _make_parser()
     args = parser.parse_args(argv)
     _setup_logging(args)
+    apply_arguments(args)
     if args.list_decoders:
         from .proxy.media import registry
         print(registry.describe())
