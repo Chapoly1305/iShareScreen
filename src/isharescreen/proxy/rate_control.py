@@ -22,7 +22,7 @@ viewer->server video SRTCP key, the same context as RRs and LTR acks):
                                 windowed loss, whole percent
     u16 bwe                     bandwidth estimate, kbps
 
-Opt-in: ISS_RCTL=1 turns it on (Session); ISS_RCTL_BWE=<kbps> pins the
+Enabled by default; ISS_RCTL=0 turns it off (Session). ISS_RCTL_BWE=<kbps> pins the
 estimate instead of the adaptive one below.
 
 This module is transport-agnostic: `RateControl.note_packet` is fed from

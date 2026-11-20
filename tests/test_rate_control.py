@@ -259,8 +259,11 @@ def test_rctl_env_toggle(monkeypatch):
     monkeypatch.delenv("ISS_RCTL", raising=False)
     monkeypatch.delenv("ISS_RCTL_BWE", raising=False)
     s = Session(SessionConfig(host="192.0.2.19", username="u", password="p"))
-    assert s._rctl_enabled is False       # opt-in
+    assert s._rctl_enabled is True        # enabled by default
     assert s._rctl_pinned_bwe is None
+    monkeypatch.setenv("ISS_RCTL", "0")
+    s = Session(SessionConfig(host="192.0.2.19", username="u", password="p"))
+    assert s._rctl_enabled is False
     monkeypatch.setenv("ISS_RCTL", "1")
     monkeypatch.setenv("ISS_RCTL_BWE", "20000")
     s = Session(SessionConfig(host="192.0.2.19", username="u", password="p"))

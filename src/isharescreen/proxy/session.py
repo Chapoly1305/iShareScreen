@@ -461,11 +461,10 @@ class Session:
         self._log_ltr_acks = os.environ.get("ISS_LOG_LTR") == "1"
         # Receiver rate-control feedback (RTCP APP "RCTL", see rate_control.py):
         # the host's encoder targets the bandwidth estimate it carries; without
-        # it the host holds a flat ~20-30 Mbps on a busy screen. Opt-in
-        # (ISS_RCTL=1): the higher rate it unlocks only pays off when this
-        # client can process it. ISS_RCTL_BWE=<kbps> pins the estimate instead
-        # of the adaptive one.
-        self._rctl_enabled = os.environ.get("ISS_RCTL", "0") == "1"
+        # it the host holds a flat ~20-30 Mbps on a busy screen. Enabled by
+        # default; ISS_RCTL=0 disables it. ISS_RCTL_BWE=<kbps> pins the
+        # estimate instead of the adaptive one.
+        self._rctl_enabled = os.environ.get("ISS_RCTL", "1") == "1"
         _pin = os.environ.get("ISS_RCTL_BWE", "").strip()
         self._rctl_pinned_bwe: Optional[int] = (
             min(int(_pin), 0xFFFF) if _pin.isdigit() else None
