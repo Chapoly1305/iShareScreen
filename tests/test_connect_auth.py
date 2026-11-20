@@ -37,8 +37,8 @@ def test_gui_passes_auth_options_and_keeps_secrets_out_of_argv_and_profile(monke
                    auth="kerberos", krb_realm="EXAMPLE.COM", krb_service="vnc/mac.local@EXAMPLE.COM",
                    remember_password="on", decoder="libav-avc420", bandwidth_mbps=bandwidth))
     cmd, kwargs = launched[0]
-    assert kwargs["env"].get("ISS_VIDEO_BITRATE_BPS") == (
-        str(int(bandwidth) * 1_000_000) if bandwidth != "0" else None)
+    assert "ISS_VIDEO_BITRATE_BPS" not in kwargs["env"]
+    assert cmd[cmd.index("--video-bitrate-bps") + 1] == str(int(bandwidth) * 1_000_000)
     assert "secret-value" not in repr(cmd) + repr(kwargs["env"])
     assert stream.contents == "secret-value\n"
     assert cmd[cmd.index("--auth") + 1] == "kerberos"

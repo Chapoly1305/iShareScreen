@@ -374,12 +374,11 @@ def _launch(values: dict) -> None:
     env = dict(os.environ)
     # Auto explicitly restores protocol defaults, including after a prior cap.
     env.pop("ISS_VIDEO_BITRATE_BPS", None)
-    if bandwidth_mbps:
-        env["ISS_VIDEO_BITRATE_BPS"] = str(bandwidth_mbps * 1_000_000)
+    cmd += ["--video-bitrate-bps", str(bandwidth_mbps * 1_000_000)]
     if _GUI_PORT:
         # iss POSTs here (blocking) to ask share-vs-alt when a different user is
         # at the console; the /session-choice handler answers from the modal.
-        env["ISS_SESSION_CHOICE_URL"] = f"http://127.0.0.1:{_GUI_PORT}/session-choice"
+        cmd += ["--session-choice-url", f"http://127.0.0.1:{_GUI_PORT}/session-choice"]
     proc = subprocess.Popen(
         cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, env=env,
