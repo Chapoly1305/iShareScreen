@@ -126,7 +126,9 @@ frequent updates at the cost of additional GPU work.
 Runtime settings are available as command-line parameters; see `iss --help`
 and [the option reference](docs/runtime-options.md). RCTL is enabled by default;
 use `--no-rctl` to disable it or `--rctl-bwe 30000` for a fixed 30 Mbps estimate.
-Legacy `ISS_*` environment variables remain supported; explicit parameters win.
+Low-level diagnostics and experiments use `--dev-option NAME=VALUE` rather than
+individual flags. Legacy environment variables remain supported; explicit
+parameters win.
 
 The test suite uses deterministic protocol and queue tests by default. On
 macOS, `ISS_NATIVE_TESTS=1 pytest` also checks that decoded pixel planes remain
