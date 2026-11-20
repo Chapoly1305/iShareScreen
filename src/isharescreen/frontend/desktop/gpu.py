@@ -192,7 +192,7 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 # native VideoToolbox decoder and libav's nv24 path both emit it). Texel
 # .r = Cb (U), .g = Cr (V). Deinterleaving here — a free GPU texture fetch —
 # instead of on the CPU removes the single biggest cost in the live decode
-# pipeline (~half a core at 4-tile/60fps; see hevc.py _LEGACY_CHROMA). Same
+# pipeline (~half a core at 4-tile/60fps). Same
 # BT.709 full-range matrix and uv_scale crop as the planar shader.
 WGSL_BIPLANAR = """
 struct VsOut {

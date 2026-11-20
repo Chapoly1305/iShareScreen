@@ -68,15 +68,6 @@ log = logging.getLogger(__name__)
 
 # ── constants ────────────────────────────────────────────────────────
 
-# nv24 (Apple's HW VideoToolbox 4:4:4 biplanar output) is delivered to the GPU
-# as a passthrough TileFrame (raw interleaved UV, `v is None`) and deinterleaved
-# in the fragment shader from an rg8unorm texture. Set ISS_LEGACY_CHROMA=1 to
-# fall back to the old CPU-side strided deinterleave (one full UV gather per
-# tile per frame — ~half a core at 4-tile/60fps; the passthrough path is ~49×
-# cheaper). The escape hatch exists in case the rg8 sampling misbehaves on a
-# given GPU; both the decoder and renderer honour it.
-_LEGACY_CHROMA = os.environ.get("ISS_LEGACY_CHROMA") == "1"
-
 # Mid-stream wedge recovery granularity. Default (ON): mark ONLY the
 # gate-flagged broken tiles (`bad_streak > 0`) as awaiting re-root — the
 # healthy tiles keep decoding + publishing from their intact history, and
