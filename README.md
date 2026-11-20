@@ -117,11 +117,16 @@ rare gray patch the auto-recovery doesn't catch), **r** reconnect,
 **d** disconnect, **Ctrl-B** save a bug-report snapshot, **q** quit.
 
 The native desktop viewer uses immediate presentation on macOS to keep display
-buffer waits off the input path. Set `ISS_VSYNC=1` to restore display
-synchronization if needed. `ISS_PRESENT_FPS` controls the desktop redraw limit
+buffer waits off the input path. Use `--vsync` to restore display
+synchronization if needed. `--present-fps` controls the desktop redraw limit
 (default 120); input processing and decoding continue independently of that
-limit. For example, `ISS_PRESENT_FPS=240 iss --frontend desktop` favors more
+limit. For example, `iss --frontend desktop --present-fps 240` favors more
 frequent updates at the cost of additional GPU work.
+
+Runtime settings are available as command-line parameters; see `iss --help`
+and [the option reference](docs/runtime-options.md). RCTL is enabled by default;
+use `--no-rctl` to disable it or `--rctl-bwe 30000` for a fixed 30 Mbps estimate.
+Legacy `ISS_*` environment variables remain supported; explicit parameters win.
 
 The test suite uses deterministic protocol and queue tests by default. On
 macOS, `ISS_NATIVE_TESTS=1 pytest` also checks that decoded pixel planes remain
